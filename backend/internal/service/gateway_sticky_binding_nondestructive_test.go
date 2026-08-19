@@ -69,6 +69,41 @@ func TestGatewayStickyBindingDuringSelectionIsNonDestructive(t *testing.T) {
 		require.NoError(t, svc.bindGatewayStickySessionDuringSelection(ctx, &groupID, "absent", fallbackID))
 		require.NotContains(t, cache.sessionBindings, "absent", "主号因报错被排除时，回退账号不得建立绑定")
 	})
+
+	// 确定性不兼容 ≠ 临时不可用：既有绑定根本不能服务本次请求时必须让位，
+	// 否则会话会被永久钉在上一个模型/平台的账号上（与上游 eager 绑定行为一致）。
+	t.Run("model routing excluding the bound account allows rebind", func(t *testing.T) {
+		cache := &schedulerTestGatewayCache{sessionBindings: map[string]int64{sessionHash: primaryID}}
+		svc := &GatewayService{cache: cache}
+		ctx := withStickyRequestScope(context.Background(), []int64{fallbackID})
+		require.NoError(t, svc.bindGatewayStickySessionDuringSelection(ctx, &groupID, sessionHash, fallbackID))
+		require.Equal(t, fallbackID, cache.sessionBindings[sessionHash],
+			"模型路由把原账号排除在外时，绑定应更新为路由选中的账号")
+	})
+
+	t.Run("routing set containing the bound account still protects it", func(t *testing.T) {
+		cache := &schedulerTestGatewayCache{sessionBindings: map[string]int64{sessionHash: primaryID}}
+		svc := &GatewayService{cache: cache}
+		ctx := withStickyRequestScope(context.Background(), []int64{primaryID, fallbackID})
+		require.NoError(t, svc.bindGatewayStickySessionDuringSelection(ctx, &groupID, sessionHash, fallbackID))
+		require.Equal(t, primaryID, cache.sessionBindings[sessionHash],
+			"原账号仍在路由集合内说明只是临时不可用，绑定必须保留")
+	})
+
+	t.Run("stale marker allows rebind only for the marked account", func(t *testing.T) {
+		cache := &schedulerTestGatewayCache{sessionBindings: map[string]int64{sessionHash: primaryID}}
+		svc := &GatewayService{cache: cache}
+		other := preserveStickyBindingForFailover(context.Background(), 0, nil)
+		require.NoError(t, svc.bindGatewayStickySessionDuringSelection(
+			markStickyBindingStale(other, fallbackID), &groupID, sessionHash, fallbackID))
+		require.Equal(t, primaryID, cache.sessionBindings[sessionHash],
+			"标记的是别的账号时不得放行改绑")
+
+		require.NoError(t, svc.bindGatewayStickySessionDuringSelection(
+			markStickyBindingStale(context.Background(), primaryID), &groupID, sessionHash, fallbackID))
+		require.Equal(t, fallbackID, cache.sessionBindings[sessionHash],
+			"选号现场判定原账号不支持该模型后应放行改绑")
+	})
 }
 
 // OpenAI 侧同分组主号回退共享同一约束（粘性键带 openai: 前缀）。
