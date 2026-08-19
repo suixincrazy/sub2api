@@ -130,6 +130,28 @@ func TestUpstreamModelMismatchDoesNotCollapseDifferentModels(t *testing.T) {
 	}
 }
 
+func TestUpstreamModelMismatchUsesAccountResponseAliasMapping(t *testing.T) {
+	account := &Account{Credentials: map[string]any{
+		"upstream_response_model_mapping": map[string]any{
+			"MaaS_Cl_Opus_4.8_20260528_cache":         "claude-opus-4-8",
+			"anthropic/claude-opus-4-8-ps-gcp-dst": "claude-opus-4-8",
+		},
+	}}
+
+	for _, responseModel := range []string{
+		"MaaS_Cl_Opus_4.8_20260528_cache",
+		"anthropic/claude-opus-4-8-ps-gcp-dst",
+	} {
+		mismatch := upstreamModelMismatchForAccount(account, "claude-opus-4-8", responseModel)
+		require.NotNil(t, mismatch)
+		require.False(t, *mismatch)
+	}
+
+	unmapped := upstreamModelMismatchForAccount(account, "claude-opus-4-8", "claude-opus-5")
+	require.NotNil(t, unmapped)
+	require.True(t, *unmapped)
+}
+
 func TestObserveOpenAISSEBodyIgnoresMalformedPayload(t *testing.T) {
 	observer := &upstreamResponseModelObserver{}
 	observeOpenAISSEBody(observer, "data: not-json\n\ndata: {\"type\":\"response.completed\",\"response\":{\"model\":\"gpt-5.4\"}}\n\n")
