@@ -10,6 +10,7 @@ import (
 const (
 	upstreamResponseModelObserverContextKey = "upstream_response_model_observer"
 	upstreamResponseModelMaxLength          = 200
+	upstreamResponseModelMappingKey         = "upstream_response_model_mapping"
 )
 
 // upstreamResponseModelObserver tracks one forwarding attempt (or one WS turn).
@@ -192,6 +193,51 @@ func canonicalGrokBuildRuntimeModel(model string) string {
 	default:
 		return ""
 	}
+}
+
+// upstreamModelMismatchForAccount treats explicitly configured upstream
+// deployment names as aliases of the public model sent to the provider. The
+// observed response model is still stored verbatim for auditing.
+func upstreamModelMismatchForAccount(account *Account, sentModel, responseModel string) *bool {
+	mismatch := upstreamModelMismatch(sentModel, responseModel)
+	if mismatch == nil || !*mismatch || account == nil {
+		return mismatch
+	}
+
+	mappedModel := accountUpstreamResponseModelMapping(account, responseModel)
+	if mappedModel != "" && strings.EqualFold(strings.TrimSpace(sentModel), mappedModel) {
+		matched := false
+		return &matched
+	}
+	return mismatch
+}
+
+func accountUpstreamResponseModelMapping(account *Account, responseModel string) string {
+	if account == nil || account.Credentials == nil {
+		return ""
+	}
+	responseModel = strings.TrimSpace(responseModel)
+	if responseModel == "" {
+		return ""
+	}
+
+	switch mapping := account.Credentials[upstreamResponseModelMappingKey].(type) {
+	case map[string]string:
+		for alias, model := range mapping {
+			if strings.EqualFold(strings.TrimSpace(alias), responseModel) {
+				return strings.TrimSpace(model)
+			}
+		}
+	case map[string]any:
+		for alias, rawModel := range mapping {
+			if !strings.EqualFold(strings.TrimSpace(alias), responseModel) {
+				continue
+			}
+			model, _ := rawModel.(string)
+			return strings.TrimSpace(model)
+		}
+	}
+	return ""
 }
 
 func upstreamSentModel(requestedModel, upstreamModel string) string {
