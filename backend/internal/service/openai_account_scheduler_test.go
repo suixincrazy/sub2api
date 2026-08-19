@@ -1135,6 +1135,70 @@ func TestOpenAIGatewayService_SelectAccountWithScheduler_StickyWeightedSessionIn
 	}
 }
 
+func TestOpenAIGatewayService_SelectAccountWithScheduler_ExcludedStickyFailoverPreservesPrimary(t *testing.T) {
+	resetOpenAIAdvancedSchedulerSettingCacheForTest()
+
+	ctx := context.Background()
+	groupID := int64(1010711)
+	sessionHash := "primary-recovery-after-failover"
+	accounts := []Account{
+		{
+			ID:          7,
+			Platform:    PlatformOpenAI,
+			Type:        AccountTypeAPIKey,
+			Status:      StatusActive,
+			Schedulable: true,
+			Concurrency: 1,
+			Priority:    0,
+			GroupIDs:    []int64{groupID},
+		},
+		{
+			ID:          5,
+			Platform:    PlatformOpenAI,
+			Type:        AccountTypeAPIKey,
+			Status:      StatusActive,
+			Schedulable: true,
+			Concurrency: 1,
+			Priority:    10,
+			GroupIDs:    []int64{groupID},
+		},
+	}
+	cache := &schedulerTestGatewayCache{sessionBindings: map[string]int64{
+		"openai:" + sessionHash: 7,
+	}}
+	svc := &OpenAIGatewayService{
+		accountRepo:        schedulerGroupAwareOpenAIAccountRepo{schedulerTestOpenAIAccountRepo{accounts: accounts}},
+		cache:              cache,
+		cfg:                &config.Config{},
+		rateLimitService:   newOpenAIAdvancedSchedulerRateLimitService("true"),
+		concurrencyService: NewConcurrencyService(schedulerTestConcurrencyCache{}),
+	}
+
+	excluded := map[int64]struct{}{7: {}}
+	fallback, _, err := svc.SelectAccountWithScheduler(
+		ctx, &groupID, "", sessionHash, "gpt-5.6-sol", excluded, OpenAIUpstreamTransportAny, false,
+	)
+	require.NoError(t, err)
+	require.NotNil(t, fallback)
+	require.NotNil(t, fallback.Account)
+	require.Equal(t, int64(5), fallback.Account.ID)
+	if fallback.ReleaseFunc != nil {
+		fallback.ReleaseFunc()
+	}
+	require.Equal(t, int64(7), cache.sessionBindings["openai:"+sessionHash])
+
+	recovered, _, err := svc.SelectAccountWithScheduler(
+		ctx, &groupID, "", sessionHash, "gpt-5.6-sol", nil, OpenAIUpstreamTransportAny, false,
+	)
+	require.NoError(t, err)
+	require.NotNil(t, recovered)
+	require.NotNil(t, recovered.Account)
+	require.Equal(t, int64(7), recovered.Account.ID)
+	if recovered.ReleaseFunc != nil {
+		recovered.ReleaseFunc()
+	}
+}
+
 func TestOpenAIGatewayService_SelectAccountWithScheduler_StickyWeightedPreviousRequiresMovableContext(t *testing.T) {
 	resetOpenAIAdvancedSchedulerSettingCacheForTest()
 

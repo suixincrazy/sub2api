@@ -1223,6 +1223,17 @@ func TestOpenAISelectAccountForModelWithExclusions_StickyExcludedFallback(t *tes
 	if acc == nil || acc.ID != 2 {
 		t.Fatalf("expected account 2")
 	}
+	if got := cache.sessionBindings["openai:"+sessionHash]; got != 1 {
+		t.Fatalf("fallback account must not replace sticky primary: got %d, want 1", got)
+	}
+
+	recovered, err := svc.SelectAccountForModelWithExclusions(context.Background(), nil, sessionHash, "gpt-4", nil)
+	if err != nil {
+		t.Fatalf("SelectAccountForModelWithExclusions after recovery error: %v", err)
+	}
+	if recovered == nil || recovered.ID != 1 {
+		t.Fatalf("expected recovered primary account 1, got %#v", recovered)
+	}
 }
 
 func TestOpenAISelectAccountForModelWithExclusions_StickyNonOpenAI(t *testing.T) {

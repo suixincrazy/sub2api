@@ -1394,6 +1394,24 @@ type GatewaySchedulingConfig struct {
 	// 默认 false，保持原有「优先级 → 负载率 → LRU」行为不变。
 	PreferSoonestReset bool `mapstructure:"prefer_soonest_reset"`
 
+	// StickyPriorityReclaimEnabled 开启后，粘性会话在命中副号（优先级数值更大）时，
+	// 若更高优先级账号已恢复可调度，则主动放弃粘性绑定并回落到负载感知选择，
+	// 使会话切回主号。默认 true：主号冷却恢复后长会话必须能切回，
+	// 否则一次临时 safeguards 报错会把整个会话永久钉在副号上。
+	StickyPriorityReclaimEnabled bool `mapstructure:"sticky_priority_reclaim_enabled"`
+
+	// StickySamePriorityRotateInterval 粘性会话在同优先级账号之间的强制轮换间隔。
+	// 粘性账号距上次使用超过该间隔、且同优先级存在更久未使用的账号时，
+	// 放弃绑定回落到 LRU 选择，避免同优先级多副号只有一个被反复使用。
+	// 0 表示禁用同优先级轮换。
+	StickySamePriorityRotateInterval time.Duration `mapstructure:"sticky_same_priority_rotate_interval"`
+
+	// RotateLastUsedBucket 决定两个账号的 LastUsedAt 相差多少以内算「同一排序组」，
+	// 组内会随机打散，用于让多个同优先级账号之间随机轮换而不是永远先挑最旧那个。
+	// 窗口之外仍按 LastUsedAt 先后排序，LRU 主序不变。
+	// 0 表示回到旧行为（要求精确到同一秒，实际等于关闭随机打散）。
+	RotateLastUsedBucket time.Duration `mapstructure:"rotate_last_used_bucket"`
+
 	// 负载计算
 	LoadBatchEnabled    bool `mapstructure:"load_batch_enabled"`
 	LoadBatchCacheTTLMS int  `mapstructure:"load_batch_cache_ttl_ms"`
@@ -2408,6 +2426,9 @@ func setDefaults() {
 	viper.SetDefault("gateway.scheduling.fallback_max_waiting", 100)
 	viper.SetDefault("gateway.scheduling.fallback_selection_mode", "last_used")
 	viper.SetDefault("gateway.scheduling.prefer_soonest_reset", false)
+	viper.SetDefault("gateway.scheduling.sticky_priority_reclaim_enabled", true)
+	viper.SetDefault("gateway.scheduling.sticky_same_priority_rotate_interval", 5*time.Minute)
+	viper.SetDefault("gateway.scheduling.rotate_last_used_bucket", time.Minute)
 	viper.SetDefault("gateway.scheduling.load_batch_enabled", true)
 	viper.SetDefault("gateway.scheduling.load_batch_cache_ttl_ms", 200)
 	viper.SetDefault("gateway.scheduling.snapshot_mget_chunk_size", 128)

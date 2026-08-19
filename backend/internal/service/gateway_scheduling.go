@@ -139,6 +139,7 @@ func (s *GatewayService) SelectAccountWithLoadAwareness(ctx context.Context, gro
 			stickySource = "cache"
 		}
 	}
+	ctx = preserveStickyBindingForFailover(ctx, stickyAccountID, excludedIDs)
 
 	// [DEBUG-STICKY] 调度器入口日志
 	slog.Info("sticky.scheduler_entry",
@@ -343,7 +344,19 @@ func (s *GatewayService) SelectAccountWithLoadAwareness(ctx context.Context, gro
 					if stickyAccount, ok := accountByID[stickyAccountID]; ok {
 						var stickyCacheMissReason string
 
-						gatePass := s.isAccountSchedulableForSelection(stickyAccount) &&
+						// 粘性抢占：主号恢复要能切回，同优先级多副号要能轮询。
+						// 本分支（模型路由命中）与下方 Layer 1.5 是两条独立的粘性路径，
+						// 只在 Layer 1.5 挂钩子的话，凡是配了 model_routing 的分组抢占全是死代码。
+						// 抢占候选限定在路由候选池内，避免把请求推给一个不在路由列表里的账号。
+						preempted := s.maybePreemptGatewayStickyAmong(ctx, groupID, sessionHash, stickyAccount, routingCandidates,
+							stickyPreemptionConfigFromScheduling(cfg))
+						if preempted {
+							// 绑定已删除，放弃这次粘性命中，落到下方负载感知选择（优先级 → 负载率 → LRU）。
+							stickyCacheMissReason = "preempted"
+						}
+
+						gatePass := !preempted &&
+							s.isAccountSchedulableForSelection(stickyAccount) &&
 							s.isGatewayAccountProfitEligible(ctx, stickyAccount) &&
 							s.isAccountAllowedForPlatform(stickyAccount, platform, useMixed) &&
 							(requestedModel == "" || s.isModelSupportedByAccountWithContext(ctx, stickyAccount, requestedModel)) &&
@@ -398,7 +411,9 @@ func (s *GatewayService) SelectAccountWithLoadAwareness(ctx context.Context, gro
 							}
 							// 粘性账号槽位满且等待队列已满，继续使用负载感知选择
 						} else if !gatePass {
-							stickyCacheMissReason = "gate_check"
+							if stickyCacheMissReason == "" {
+								stickyCacheMissReason = "gate_check"
+							}
 						} else {
 							stickyCacheMissReason = "rpm_red"
 						}
@@ -523,6 +538,14 @@ func (s *GatewayService) SelectAccountWithLoadAwareness(ctx context.Context, gro
 						"session", shortSessionHash(sessionHash),
 					)
 					_ = s.cache.DeleteSessionAccountID(ctx, derefGroupID(groupID), sessionHash)
+				}
+
+				// 粘性抢占：主号恢复要能切回，同优先级多副号要能轮询。
+				// 命中即无条件返回会让绑定 + TTL 续期把长会话永久钉在副号上。
+				if !clearSticky && s.maybePreemptGatewaySticky(ctx, groupID, sessionHash, account, accounts,
+					isExcluded, platform, useMixed, requestedModel,
+					stickyPreemptionConfigFromScheduling(cfg)) {
+					clearSticky = true
 				}
 
 				// 注意：不再检查 isAccountInGroup，因为 accountByID 已经从按分组过滤的
@@ -1750,7 +1773,30 @@ func sameAccountGroup(a, b *Account) bool {
 	return sameLastUsedAt(a.LastUsedAt, b.LastUsedAt)
 }
 
-// sameLastUsedAt 判断两个 LastUsedAt 是否相同（精度到秒）
+// lastUsedGroupTolerance 决定两个账号的 LastUsedAt 相差多少以内算「同一排序组」，
+// 从而在组内随机打散（见 shuffleWithinSortGroups / shuffleWithinPriorityAndLastUsed）。
+//
+// 原实现要求两者精确到同一秒（a.Unix() == b.Unix()）。线上账号的 LastUsedAt 是
+// 毫秒级真实时间戳，几乎不可能落在同一秒，于是分组恒为单元素、两个 shuffle 函数
+// 实际上从不生效，Layer 2 退化成完全确定性的 LRU：同优先级里永远先挑最旧那一个。
+// 表现就是「多个同优先级账号只有一个在被使用」。
+//
+// 放宽成一个时间窗口后：
+//   - 窗口之外仍按 LastUsedAt 先后排序，LRU 主序和公平性不变；
+//   - 窗口之内（即「同样久没被用过」的那些同级账号）随机打散，流量不再钉在某一个号上。
+//
+// 由 gateway.scheduling.rotate_last_used_bucket 配置，0 表示回到「同一秒」的旧行为。
+var lastUsedGroupTolerance = time.Minute
+
+// SetLastUsedGroupTolerance 设置同组判定的时间窗口，由配置加载时调用。
+func SetLastUsedGroupTolerance(d time.Duration) {
+	if d < 0 {
+		d = 0
+	}
+	lastUsedGroupTolerance = d
+}
+
+// sameLastUsedAt 判断两个 LastUsedAt 是否落在同一排序组（相差不超过 lastUsedGroupTolerance）
 func sameLastUsedAt(a, b *time.Time) bool {
 	switch {
 	case a == nil && b == nil:
@@ -1758,7 +1804,14 @@ func sameLastUsedAt(a, b *time.Time) bool {
 	case a == nil || b == nil:
 		return false
 	default:
-		return a.Unix() == b.Unix()
+		if lastUsedGroupTolerance <= 0 {
+			return a.Unix() == b.Unix()
+		}
+		d := a.Sub(*b)
+		if d < 0 {
+			d = -d
+		}
+		return d <= lastUsedGroupTolerance
 	}
 }
 

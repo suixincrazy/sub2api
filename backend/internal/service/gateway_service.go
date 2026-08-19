@@ -812,6 +812,11 @@ func NewGatewayService(
 ) *GatewayService {
 	userGroupRateTTL := resolveUserGroupRateCacheTTL(cfg)
 	modelsListTTL := resolveModelsListCacheTTL(cfg)
+	// 同排序组时间窗口是包级变量（两条网关路径共用同一份调度排序代码），
+	// 在网关服务构造时由配置注入一次即可。
+	if cfg != nil {
+		SetLastUsedGroupTolerance(cfg.Gateway.Scheduling.RotateLastUsedBucket)
+	}
 
 	svc := &GatewayService{
 		accountRepo:           accountRepo,
@@ -937,12 +942,49 @@ func (s *GatewayService) BindStickySession(ctx context.Context, groupID *int64, 
 	return s.cache.SetSessionAccountID(ctx, derefGroupID(groupID), sessionHash, accountID, stickySessionTTL)
 }
 
+// stickyFailoverBindingCtxKey marks the original sticky account when it was
+// excluded for the current request after an upstream failure. A fallback
+// account may serve that request, but must not replace the original binding.
+type stickyFailoverBindingCtxKey struct{}
+
+func preserveStickyBindingForFailover(ctx context.Context, stickyAccountID int64, excludedIDs map[int64]struct{}) context.Context {
+	if stickyAccountID <= 0 || excludedIDs == nil {
+		return ctx
+	}
+	if _, excluded := excludedIDs[stickyAccountID]; !excluded {
+		return ctx
+	}
+	return context.WithValue(ctx, stickyFailoverBindingCtxKey{}, stickyAccountID)
+}
+
+func stickyBindingProtectedForFailover(ctx context.Context, accountID int64) bool {
+	protectedID, _ := ctx.Value(stickyFailoverBindingCtxKey{}).(int64)
+	return protectedID > 0 && protectedID != accountID
+}
+
 // bindGatewayStickySessionDuringSelection preserves the normal eager sticky
 // behavior unless a profit gate is installed. Profit-controlled requests bind
 // only after the terminal post-slot check, otherwise a rejected candidate could
 // overwrite a healthy pre-existing sticky binding.
 func (s *GatewayService) bindGatewayStickySessionDuringSelection(ctx context.Context, groupID *int64, sessionHash string, accountID int64) error {
-	if gatewayProfitControlGateActive(ctx) {
+	if gatewayProfitControlGateActive(ctx) || stickyBindingProtectedForFailover(ctx, accountID) {
+		return nil
+	}
+	if sessionHash == "" || accountID <= 0 || s.cache == nil {
+		return nil
+	}
+	// 非破坏性绑定：主号临时不可用（gate_check/rpm/槽位/会话限制）时会回退到副号，
+	// 绝不能用副号覆盖仍然存在的原始粘性绑定，否则主号冷却恢复后会话再也切不回。
+	// 账号被永久清理时走 account_cleared 分支先删除绑定，届时 existing=0 可正常改绑。
+	existingAccountID, err := s.cache.GetSessionAccountID(ctx, derefGroupID(groupID), sessionHash)
+	if err != nil && !errors.Is(err, ErrStickySessionNotFound) {
+		// 读失败只记日志，仍然继续绑定：真正的「回退不覆盖主号」场景由
+		// stickyBindingProtectedForFailover 的 ctx 标记单独兜住，
+		// 这里放弃绑定会让缓存抖动期间整段会话彻底失去粘性，代价更大。
+		slog.Warn("sticky_binding_read_failed_during_selection", "group_id", derefGroupID(groupID), "account_id", accountID, "error", err)
+		existingAccountID = 0
+	}
+	if existingAccountID > 0 && existingAccountID != accountID {
 		return nil
 	}
 	return s.BindStickySession(ctx, groupID, sessionHash, accountID)

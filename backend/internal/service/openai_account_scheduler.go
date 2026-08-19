@@ -408,7 +408,7 @@ func (s *defaultOpenAIAccountScheduler) Select(
 			decision.StickyPreviousHit = true
 			decision.SelectedAccountID = selection.Account.ID
 			decision.SelectedAccountType = selection.Account.Type
-			if req.SessionHash != "" {
+			if req.SessionHash != "" && !req.PreserveStickyBinding {
 				_ = s.service.bindOpenAIStickySessionDuringSelection(ctx, req.GroupID, req.SessionHash, selection.Account.ID)
 			}
 			return selection, decision, nil
@@ -490,7 +490,16 @@ func (s *defaultOpenAIAccountScheduler) selectBySessionHash(
 		_ = s.service.deleteStickySessionAccountID(ctx, req.GroupID, sessionHash)
 		return nil, false, nil
 	}
-	if !s.isAccountRequestCompatible(ctx, account, req) {
+	if compatible, reason := s.isAccountRequestCompatibleReason(ctx, account, req); !compatible {
+		// 绑定账号服务不了这次请求。原因分两类：
+		//   - 确定性不匹配（模型/能力/渠道限制）：该账号对这个会话形态永远不可用，
+		//     必须删除绑定，否则非破坏性绑定守卫会挡住改绑，会话永远钉在一个
+		//     服务不了它的账号上（bindOpenAIStickySessionDuringSelection）。
+		//   - 瞬时不可用（限流暂停 / 运行时封锁 / 母号不健康 / 利润门）：保留绑定，
+		//     本次回退到别的账号，恢复后仍切回原账号。
+		if stickyBindingDeterministicallyIncompatible(reason) {
+			_ = s.service.deleteStickySessionAccountID(ctx, req.GroupID, sessionHash)
+		}
 		return nil, false, nil
 	}
 	if !s.isAccountTransportCompatible(account, req.RequiredTransport) {
@@ -1717,6 +1726,21 @@ func (s *defaultOpenAIAccountScheduler) lookupShadowParentAccount(ctx context.Co
 	return account
 }
 
+// stickyBindingDeterministicallyIncompatible 判断 isAccountRequestCompatibleReason
+// 给出的否决原因是否属于「该账号对这个请求形态永远不可用」。
+//
+// 只有确定性原因才允许删除粘性绑定：瞬时原因（限流暂停、运行时封锁、母号不健康、
+// 利润门否决）都会自行恢复，删绑定会白丢粘性收益；而确定性原因不删就会与
+// 非破坏性绑定守卫互锁，让会话永久钉死在一个服务不了它的账号上。
+func stickyBindingDeterministicallyIncompatible(reason string) bool {
+	switch reason {
+	case "account_nil", "model_not_supported", "capability_mismatch", "channel_upstream_restricted":
+		return true
+	default:
+		return false
+	}
+}
+
 func (s *defaultOpenAIAccountScheduler) isAccountRequestCompatible(ctx context.Context, account *Account, req OpenAIAccountScheduleRequest) bool {
 	compatible, _ := s.isAccountRequestCompatibleReason(ctx, account, req)
 	return compatible
@@ -2231,6 +2255,10 @@ func (s *OpenAIGatewayService) selectAccountWithSchedulerOnce(
 			stickyAccountID = accountID
 		}
 	}
+	preserveStickyBinding := false
+	if stickyAccountID > 0 {
+		_, preserveStickyBinding = excludedIDs[stickyAccountID]
+	}
 	stickyWeighted := s.isOpenAIAdvancedSchedulerStickyWeightedEnabled(ctx)
 	subscriptionPriority := s.isOpenAIAdvancedSchedulerSubscriptionPriorityEnabled(ctx)
 	stickyPreviousAccountID := int64(0)
@@ -2246,6 +2274,7 @@ func (s *OpenAIGatewayService) selectAccountWithSchedulerOnce(
 		StickyPreviousAccountID: stickyPreviousAccountID,
 		StickyWeighted:          stickyWeighted,
 		SubscriptionPriority:    subscriptionPriority,
+		PreserveStickyBinding:   preserveStickyBinding,
 		PreviousResponseID:      previousResponseID,
 		PreviousResponseCanMove: previousResponseCanMove,
 		UseUpstreamTokenCost:    useUpstreamTokenCost,

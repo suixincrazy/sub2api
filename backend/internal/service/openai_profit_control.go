@@ -339,10 +339,24 @@ func (s *OpenAIGatewayService) ProfitControlVetoLatest(ctx context.Context, sele
 
 // bindOpenAIStickySessionDuringSelection preserves the official eager binding
 // behavior for requests without a profit gate. Profit-controlled requests bind
-// only after the terminal post-slot check, so an account rejected after a rate
-// refresh cannot become the new sticky target.
+// only after the terminal post-slot check, and a fallback selected after the
+// current sticky account failed must not replace that primary binding.
 func (s *OpenAIGatewayService) bindOpenAIStickySessionDuringSelection(ctx context.Context, groupID *int64, sessionHash string, accountID int64) error {
-	if gatewayProfitControlGateActive(ctx) {
+	if gatewayProfitControlGateActive(ctx) || stickyBindingProtectedForFailover(ctx, accountID) {
+		return nil
+	}
+	if sessionHash == "" || accountID <= 0 {
+		return nil
+	}
+	// 非破坏性绑定：主号临时不可用回退到副号时，不得用副号覆盖仍存在的原始绑定，
+	// 否则主号恢复后会话切不回。账号永久失效由清理路径先删除绑定，existing=0 时可改绑。
+	existingAccountID, err := s.getStickySessionAccountID(ctx, groupID, sessionHash)
+	if err != nil && !errors.Is(err, ErrStickySessionNotFound) {
+		// 同 gateway 侧：读失败继续绑定，避免缓存抖动导致整段会话失去粘性。
+		slog.Warn("sticky_binding_read_failed_during_selection", "group_id", derefGroupID(groupID), "account_id", accountID, "error", err)
+		existingAccountID = 0
+	}
+	if existingAccountID > 0 && existingAccountID != accountID {
 		return nil
 	}
 	return s.BindStickySession(ctx, groupID, sessionHash, accountID)

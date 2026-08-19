@@ -2322,6 +2322,52 @@ func TestGatewayService_SelectAccountWithLoadAwareness(t *testing.T) {
 		require.Equal(t, int64(2), result.Account.ID, "不应选择被排除的账号")
 	})
 
+	t.Run("failover排除粘性主账号-备用成功后保留原绑定", func(t *testing.T) {
+		repo := &mockAccountRepoForPlatform{
+			accounts: []Account{
+				{ID: 5, Platform: PlatformAnthropic, Priority: 1, Status: StatusActive, Schedulable: true, Concurrency: 5},
+				{ID: 6, Platform: PlatformAnthropic, Priority: 2, Status: StatusActive, Schedulable: true, Concurrency: 5},
+			},
+			accountsByID: map[int64]*Account{},
+		}
+		for i := range repo.accounts {
+			repo.accountsByID[repo.accounts[i].ID] = &repo.accounts[i]
+		}
+
+		cache := &mockGatewayCacheForPlatform{
+			sessionBindings: map[string]int64{"sticky-failover": 5},
+		}
+		cfg := testConfig()
+		cfg.Gateway.Scheduling.LoadBatchEnabled = true
+		concurrencyCache := &mockConcurrencyCache{}
+		svc := &GatewayService{
+			accountRepo:        repo,
+			cache:              cache,
+			cfg:                cfg,
+			concurrencyService: NewConcurrencyService(concurrencyCache),
+		}
+
+		failed := map[int64]struct{}{5: {}}
+		fallback, err := svc.SelectAccountWithLoadAwareness(ctx, nil, "sticky-failover", "claude-3-5-sonnet-20241022", failed, "", int64(0))
+		require.NoError(t, err)
+		require.NotNil(t, fallback)
+		require.NotNil(t, fallback.Account)
+		require.Equal(t, int64(6), fallback.Account.ID, "当前请求应切换到备用账号")
+		if fallback.ReleaseFunc != nil {
+			fallback.ReleaseFunc()
+		}
+		require.Equal(t, int64(5), cache.sessionBindings["sticky-failover"], "failover 备用账号不得覆盖原粘性主账号")
+
+		recovered, err := svc.SelectAccountWithLoadAwareness(ctx, nil, "sticky-failover", "claude-3-5-sonnet-20241022", nil, "", int64(0))
+		require.NoError(t, err)
+		require.NotNil(t, recovered)
+		require.NotNil(t, recovered.Account)
+		require.Equal(t, int64(5), recovered.Account.ID, "下一次正常请求应重新命中主账号")
+		if recovered.ReleaseFunc != nil {
+			recovered.ReleaseFunc()
+		}
+	})
+
 	t.Run("粘性命中-不调用GetByID", func(t *testing.T) {
 		repo := &mockAccountRepoForPlatform{
 			accounts: []Account{
