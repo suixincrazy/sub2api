@@ -962,6 +962,53 @@ func stickyBindingProtectedForFailover(ctx context.Context, accountID int64) boo
 	return protectedID > 0 && protectedID != accountID
 }
 
+// stickyRequestScopeCtxKey 记录本次选号的请求维度（模型路由集合），供选号期非破坏性
+// 绑定区分「既有绑定确定性不兼容」与「主号只是临时不可用」两种情况。
+type stickyRequestScopeCtxKey struct{}
+
+// stickyStaleBindingCtxKey 由已经持有账号对象的选号现场写入：该账号确定性地不能服务
+// 本次请求（不支持所请求的模型）。这里不做账号查询，上游明确要求粘性账号缺失时
+// 不得回退到 GetByID。
+type stickyStaleBindingCtxKey struct{}
+
+type stickyRequestScope struct {
+	routingAccountIDs []int64
+}
+
+func withStickyRequestScope(ctx context.Context, routingAccountIDs []int64) context.Context {
+	if len(routingAccountIDs) == 0 {
+		return ctx
+	}
+	return context.WithValue(ctx, stickyRequestScopeCtxKey{}, stickyRequestScope{
+		routingAccountIDs: routingAccountIDs,
+	})
+}
+
+func markStickyBindingStale(ctx context.Context, accountID int64) context.Context {
+	if accountID <= 0 {
+		return ctx
+	}
+	return context.WithValue(ctx, stickyStaleBindingCtxKey{}, accountID)
+}
+
+// stickyBindingDeterministicallyStale 判断既有粘性绑定是否确定性地无法服务本次请求：
+// 模型路由把它排除在外，或选号现场已判定它不支持所请求的模型。这类情况必须让位给本次
+// 选中的账号（与上游 eager 绑定行为一致），否则会话会被永久钉在上一个模型的账号上。
+// RPM/配额/槽位/会话数这类临时不可用一律返回 false，保持非破坏性绑定，等主号恢复。
+func stickyBindingDeterministicallyStale(ctx context.Context, existingAccountID int64) bool {
+	if existingAccountID <= 0 {
+		return false
+	}
+	if staleID, _ := ctx.Value(stickyStaleBindingCtxKey{}).(int64); staleID == existingAccountID {
+		return true
+	}
+	scope, ok := ctx.Value(stickyRequestScopeCtxKey{}).(stickyRequestScope)
+	if !ok || len(scope.routingAccountIDs) == 0 {
+		return false
+	}
+	return !containsInt64(scope.routingAccountIDs, existingAccountID)
+}
+
 // bindGatewayStickySessionDuringSelection preserves the normal eager sticky
 // behavior unless a profit gate is installed. Profit-controlled requests bind
 // only after the terminal post-slot check, otherwise a rejected candidate could
@@ -976,6 +1023,7 @@ func (s *GatewayService) bindGatewayStickySessionDuringSelection(ctx context.Con
 	// 非破坏性绑定：主号临时不可用（gate_check/rpm/槽位/会话限制）时会回退到副号，
 	// 绝不能用副号覆盖仍然存在的原始粘性绑定，否则主号冷却恢复后会话再也切不回。
 	// 账号被永久清理时走 account_cleared 分支先删除绑定，届时 existing=0 可正常改绑。
+	// 确定性不兼容（模型路由排除、账号不支持该模型）不属于「临时不可用」，必须放行改绑。
 	existingAccountID, err := s.cache.GetSessionAccountID(ctx, derefGroupID(groupID), sessionHash)
 	if err != nil && !errors.Is(err, ErrStickySessionNotFound) {
 		// 读失败只记日志，仍然继续绑定：真正的「回退不覆盖主号」场景由
@@ -984,7 +1032,7 @@ func (s *GatewayService) bindGatewayStickySessionDuringSelection(ctx context.Con
 		slog.Warn("sticky_binding_read_failed_during_selection", "group_id", derefGroupID(groupID), "account_id", accountID, "error", err)
 		existingAccountID = 0
 	}
-	if existingAccountID > 0 && existingAccountID != accountID {
+	if existingAccountID > 0 && existingAccountID != accountID && !stickyBindingDeterministicallyStale(ctx, existingAccountID) {
 		return nil
 	}
 	return s.BindStickySession(ctx, groupID, sessionHash, accountID)

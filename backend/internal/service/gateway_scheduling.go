@@ -266,6 +266,7 @@ func (s *GatewayService) SelectAccountWithLoadAwareness(ctx context.Context, gro
 			}
 		}
 	}
+	ctx = withStickyRequestScope(ctx, routingAccountIDs)
 
 	// ============ Layer 1: 模型路由优先选择（优先级高于粘性会话） ============
 	if len(routingAccountIDs) > 0 && s.concurrencyService != nil {
@@ -559,6 +560,12 @@ func (s *GatewayService) SelectAccountWithLoadAwareness(ctx context.Context, gro
 				windowCostOK := s.isAccountSchedulableForWindowCost(ctx, account, true)
 				rpmOK := s.isAccountSchedulableForRPM(ctx, account, true)
 				schedulable := s.isAccountSchedulableForSelection(account)
+
+				// 平台/模型不匹配是确定性不兼容：该账号根本不能服务本次请求，
+				// 绑定必须让位给本次选中的账号，不能被非破坏性绑定保护住。
+				if !platformOK || !modelSupported {
+					ctx = markStickyBindingStale(ctx, accountID)
+				}
 
 				slog.Debug("sticky.layer1_5_no_routing_checks",
 					"account_id", accountID,
@@ -1869,6 +1876,7 @@ func shuffleWithinPriority(accounts []*Account) {
 func (s *GatewayService) selectAccountForModelWithPlatform(ctx context.Context, groupID *int64, sessionHash string, requestedModel string, excludedIDs map[int64]struct{}, platform string) (*Account, error) {
 	preferOAuth := platform == PlatformGemini
 	routingAccountIDs := s.routingAccountIDsForRequest(ctx, groupID, requestedModel, platform)
+	ctx = withStickyRequestScope(ctx, routingAccountIDs)
 
 	// require_privacy_set: 获取分组信息
 	var schedGroup *Group
@@ -2021,6 +2029,11 @@ func (s *GatewayService) selectAccountForModelWithPlatform(ctx context.Context, 
 					if clearSticky {
 						_ = s.cache.DeleteSessionAccountID(ctx, derefGroupID(groupID), sessionHash)
 					}
+					// 平台/模型不匹配属于确定性不兼容，绑定必须让位给本次选中的账号。
+					if account != nil && (account.Platform != platform ||
+						(requestedModel != "" && !s.isModelSupportedByAccountWithContext(ctx, account, requestedModel))) {
+						ctx = markStickyBindingStale(ctx, accountID)
+					}
 					if !clearSticky && s.isGatewayAccountProfitEligible(ctx, account) && s.isAccountInGroup(account, groupID) && account.Platform == platform && (requestedModel == "" || s.isModelSupportedByAccountWithContext(ctx, account, requestedModel)) && s.isAccountSchedulableForModelSelection(ctx, account, requestedModel) && s.isAccountSchedulableForQuota(account) && s.isAccountSchedulableForWindowCost(ctx, account, true) && s.isAccountSchedulableForRPM(ctx, account, true) {
 						return account, nil
 					}
@@ -2135,6 +2148,7 @@ func (s *GatewayService) selectAccountForModelWithPlatform(ctx context.Context, 
 func (s *GatewayService) selectAccountWithMixedScheduling(ctx context.Context, groupID *int64, sessionHash string, requestedModel string, excludedIDs map[int64]struct{}, nativePlatform string) (*Account, error) {
 	preferOAuth := nativePlatform == PlatformGemini
 	routingAccountIDs := s.routingAccountIDsForRequest(ctx, groupID, requestedModel, nativePlatform)
+	ctx = withStickyRequestScope(ctx, routingAccountIDs)
 
 	// require_privacy_set: 获取分组信息
 	var schedGroup *Group
@@ -2286,6 +2300,15 @@ func (s *GatewayService) selectAccountWithMixedScheduling(ctx context.Context, g
 					clearSticky := shouldClearStickySession(account, requestedModel)
 					if clearSticky {
 						_ = s.cache.DeleteSessionAccountID(ctx, derefGroupID(groupID), sessionHash)
+					}
+					// 平台/模型不匹配属于确定性不兼容，绑定必须让位给本次选中的账号。
+					if account != nil {
+						platformUsable := account.Platform == nativePlatform ||
+							(account.Platform == PlatformAntigravity && account.IsMixedSchedulingEnabled())
+						if !platformUsable ||
+							(requestedModel != "" && !s.isModelSupportedByAccountWithContext(ctx, account, requestedModel)) {
+							ctx = markStickyBindingStale(ctx, accountID)
+						}
 					}
 					if !clearSticky && s.isGatewayAccountProfitEligible(ctx, account) && s.isAccountInGroup(account, groupID) && (requestedModel == "" || s.isModelSupportedByAccountWithContext(ctx, account, requestedModel)) && s.isAccountSchedulableForModelSelection(ctx, account, requestedModel) && s.isAccountSchedulableForQuota(account) && s.isAccountSchedulableForWindowCost(ctx, account, true) && s.isAccountSchedulableForRPM(ctx, account, true) && !s.isStickyAccountUpstreamRestricted(ctx, groupID, account, requestedModel) {
 						if account.Platform == nativePlatform || (account.Platform == PlatformAntigravity && account.IsMixedSchedulingEnabled()) {
