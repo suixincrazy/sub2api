@@ -1234,9 +1234,12 @@ func TestGatewayService_AnthropicAPIKeyPassthrough_ForwardDirect_UpstreamRequest
 
 	result, err := svc.forwardAnthropicAPIKeyPassthrough(context.Background(), c, account, []byte(`{"model":"x"}`), "x", "x", false, time.Now())
 	require.Nil(t, result)
-	require.Error(t, err)
-	require.Contains(t, err.Error(), "upstream request failed")
-	require.Equal(t, http.StatusBadGateway, rec.Code)
+	var failoverErr *UpstreamFailoverError
+	require.ErrorAs(t, err, &failoverErr)
+	require.Equal(t, http.StatusBadGateway, failoverErr.StatusCode)
+	require.Equal(t, GatewayFailureReason("anthropic_passthrough_transport"), failoverErr.Reason)
+	require.Equal(t, http.StatusOK, rec.Code)
+	require.Empty(t, rec.Body.String())
 }
 
 func TestGatewayService_AnthropicAPIKeyPassthrough_ForwardDirect_EmptyResponseBody(t *testing.T) {
@@ -1455,13 +1458,19 @@ func TestGatewayService_AnthropicAPIKeyPassthrough_StreamingSendsKeepaliveDuring
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
-		time.Sleep(1200 * time.Millisecond)
 		_, _ = pw.Write([]byte(strings.Join([]string{
 			`data: {"type":"message_start","message":{"usage":{"input_tokens":3}}}`,
 			"",
-			`data: {"type":"message_delta","usage":{"output_tokens":2}}`,
+			`data: {"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}`,
 			"",
-			"data: [DONE]",
+		}, "\n") + "\n"))
+		time.Sleep(1200 * time.Millisecond)
+		_, _ = pw.Write([]byte(strings.Join([]string{
+			`data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"OK"}}`,
+			"",
+			`data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":2}}`,
+			"",
+			`data: {"type":"message_stop"}`,
 			"",
 		}, "\n")))
 		_ = pw.Close()
@@ -1474,7 +1483,7 @@ func TestGatewayService_AnthropicAPIKeyPassthrough_StreamingSendsKeepaliveDuring
 	require.NoError(t, err)
 	require.NotNil(t, result)
 	require.Contains(t, rec.Body.String(), "event: ping\ndata: {\"type\": \"ping\"}\n\n")
-	require.Contains(t, rec.Body.String(), "data: [DONE]")
+	require.Contains(t, rec.Body.String(), `"type":"message_stop"`)
 }
 
 func TestGatewayService_AnthropicAPIKeyPassthrough_StreamingKeepaliveDoesNotInterleavePartialEvent(t *testing.T) {
@@ -1724,7 +1733,11 @@ func TestGatewayService_AnthropicAPIKeyPassthrough_ContextCanceledSkipsOllamaAct
 
 	_, err := svc.forwardAnthropicAPIKeyPassthrough(context.Background(), c, ollama, []byte(`{"model":"x"}`), "x", "x", false, time.Now())
 
-	require.Error(t, err)
+	require.ErrorIs(t, err, context.Canceled)
+	var failoverErr *UpstreamFailoverError
+	require.False(t, errors.As(err, &failoverErr))
+	require.Equal(t, http.StatusOK, rec.Code)
+	require.Empty(t, rec.Body.String())
 	_, ok := deferred.lastUsedUpdates.Load(int64(603))
 	require.False(t, ok, "context.Canceled on Anthropic passthrough must not count as Ollama activity")
 }
@@ -1765,4 +1778,353 @@ func TestGatewayService_AnthropicAPIKeyPassthrough_Non2xxRecordsOllamaActivity(t
 
 	_, ok := deferred.lastUsedUpdates.Load(int64(604))
 	require.True(t, ok, "Anthropic passthrough non-2xx on Ollama account must record activity via handleErrorResponse")
+}
+
+func TestGatewayService_AnthropicAPIKeyPassthrough_SafeguardsSSEErrorTriggersFailoverBeforeWrite(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	rec := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(rec)
+	c.Request = httptest.NewRequest(http.MethodPost, "/v1/messages", nil)
+
+	body := "event: error\n" +
+		"data: {\"type\":\"error\",\"error\":{\"type\":\"invalid_request_error\",\"message\":\"Opus 5 (1M context)'s safeguards flagged this message. This request triggered restrictions under Anthropic's Usage Policy.\"}}\n\n"
+	upstream := &anthropicHTTPUpstreamRecorder{
+		resp: &http.Response{
+			StatusCode: http.StatusOK,
+			Header:     http.Header{"Content-Type": []string{"text/event-stream"}},
+			Body:       io.NopCloser(strings.NewReader(body)),
+		},
+	}
+	svc := &GatewayService{
+		cfg: &config.Config{Security: config.SecurityConfig{
+			URLAllowlist: config.URLAllowlistConfig{Enabled: false},
+		}},
+		httpUpstream: upstream,
+	}
+
+	result, err := svc.forwardAnthropicAPIKeyPassthrough(
+		context.Background(), c, newAnthropicAPIKeyAccountForTest(),
+		[]byte(`{"model":"claude-opus-5","stream":true}`),
+		"claude-opus-5", "claude-opus-5", true, time.Now(),
+	)
+
+	require.Nil(t, result)
+	var failoverErr *UpstreamFailoverError
+	require.ErrorAs(t, err, &failoverErr)
+	require.Equal(t, http.StatusForbidden, failoverErr.StatusCode)
+	require.Contains(t, string(failoverErr.ResponseBody), "safeguards flagged this message")
+	require.Empty(t, rec.Body.String(), "safeguards must be classified before any SSE bytes reach the client")
+}
+
+func TestGatewayService_AnthropicAPIKeyPassthrough_NonStreamingRefusalStopReasonTriggersFailoverBeforeWrite(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	rec := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(rec)
+	c.Request = httptest.NewRequest(http.MethodPost, "/v1/messages", nil)
+
+	body := `{"id":"msg_refusal","type":"message","role":"assistant","model":"claude-opus-5","content":[],"stop_reason":"refusal","stop_sequence":null,"usage":{"input_tokens":12,"output_tokens":0}}`
+	upstream := &anthropicHTTPUpstreamRecorder{
+		resp: &http.Response{
+			StatusCode: http.StatusOK,
+			Header:     http.Header{"Content-Type": []string{"application/json"}},
+			Body:       io.NopCloser(strings.NewReader(body)),
+		},
+	}
+	svc := &GatewayService{
+		cfg: &config.Config{Security: config.SecurityConfig{
+			URLAllowlist: config.URLAllowlistConfig{Enabled: false},
+		}},
+		httpUpstream: upstream,
+	}
+
+	result, err := svc.forwardAnthropicAPIKeyPassthrough(
+		context.Background(), c, newAnthropicAPIKeyAccountForTest(),
+		[]byte(`{"model":"claude-opus-5"}`),
+		"claude-opus-5", "claude-opus-5", false, time.Now(),
+	)
+
+	require.Nil(t, result)
+	var failoverErr *UpstreamFailoverError
+	require.ErrorAs(t, err, &failoverErr)
+	require.Equal(t, http.StatusForbidden, failoverErr.StatusCode)
+	require.Equal(t, GatewayFailureReason("anthropic_safeguards"), failoverErr.Reason)
+	require.Equal(t, GatewayFailureScopeAccount, failoverErr.Scope)
+	require.JSONEq(t, body, string(failoverErr.ResponseBody))
+	require.Empty(t, rec.Body.String(), "refusal must be classified before the response reaches the client")
+}
+
+func TestGatewayService_AnthropicAPIKeyPassthrough_StreamingRefusalStopReasonTriggersFailoverBeforeWrite(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	rec := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(rec)
+	c.Request = httptest.NewRequest(http.MethodPost, "/v1/messages", nil)
+
+	body := strings.Join([]string{
+		`event: message_start`,
+		`data: {"type":"message_start","message":{"id":"msg_refusal","type":"message","role":"assistant","model":"claude-opus-5","content":[],"stop_reason":null,"usage":{"input_tokens":12,"output_tokens":0}}}`,
+		"",
+		`event: message_delta`,
+		`data: {"type":"message_delta","delta":{"stop_reason":"refusal","stop_sequence":null},"usage":{"output_tokens":0}}`,
+		"",
+		`event: message_stop`,
+		`data: {"type":"message_stop"}`,
+		"",
+	}, "\n")
+	upstream := &anthropicHTTPUpstreamRecorder{
+		resp: &http.Response{
+			StatusCode: http.StatusOK,
+			Header:     http.Header{"Content-Type": []string{"text/event-stream"}},
+			Body:       io.NopCloser(strings.NewReader(body)),
+		},
+	}
+	svc := &GatewayService{
+		cfg: &config.Config{Security: config.SecurityConfig{
+			URLAllowlist: config.URLAllowlistConfig{Enabled: false},
+		}},
+		httpUpstream: upstream,
+	}
+
+	result, err := svc.forwardAnthropicAPIKeyPassthrough(
+		context.Background(), c, newAnthropicAPIKeyAccountForTest(),
+		[]byte(`{"model":"claude-opus-5","stream":true}`),
+		"claude-opus-5", "claude-opus-5", true, time.Now(),
+	)
+
+	require.Nil(t, result)
+	var failoverErr *UpstreamFailoverError
+	require.ErrorAs(t, err, &failoverErr)
+	require.Equal(t, http.StatusForbidden, failoverErr.StatusCode)
+	require.Equal(t, GatewayFailureReason("anthropic_safeguards"), failoverErr.Reason)
+	require.Equal(t, GatewayFailureScopeAccount, failoverErr.Scope)
+	require.Contains(t, string(failoverErr.ResponseBody), `"stop_reason":"refusal"`)
+	require.Empty(t, rec.Body.String(), "refusal must not leak message_start before account failover")
+}
+
+func TestGatewayService_AnthropicAPIKeyPassthrough_StreamingRefusalBeforeContentSuppressesKeepalive(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	rec := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(rec)
+	c.Request = httptest.NewRequest(http.MethodPost, "/v1/messages", nil)
+
+	pr, pw := io.Pipe()
+	upstream := &anthropicHTTPUpstreamRecorder{
+		resp: &http.Response{
+			StatusCode: http.StatusOK,
+			Header:     http.Header{"Content-Type": []string{"text/event-stream"}},
+			Body:       pr,
+		},
+	}
+	svc := &GatewayService{
+		cfg: &config.Config{
+			Gateway: config.GatewayConfig{StreamKeepaliveInterval: 1},
+			Security: config.SecurityConfig{
+				URLAllowlist: config.URLAllowlistConfig{Enabled: false},
+			},
+		},
+		httpUpstream: upstream,
+	}
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		time.Sleep(1200 * time.Millisecond)
+		_, _ = pw.Write([]byte(strings.Join([]string{
+			`event: message_start`,
+			`data: {"type":"message_start","message":{"id":"msg_refusal","type":"message","role":"assistant","model":"claude-opus-5","content":[],"stop_reason":null,"usage":{"input_tokens":12,"output_tokens":0}}}`,
+			"",
+			`event: message_delta`,
+			`data: {"type":"message_delta","delta":{"stop_reason":"refusal","stop_sequence":null},"usage":{"output_tokens":0}}`,
+			"",
+		}, "\n")))
+		_ = pw.Close()
+	}()
+
+	result, err := svc.forwardAnthropicAPIKeyPassthrough(
+		context.Background(), c, newAnthropicAPIKeyAccountForTest(),
+		[]byte(`{"model":"claude-opus-5","stream":true}`),
+		"claude-opus-5", "claude-opus-5", true, time.Now(),
+	)
+	_ = pr.Close()
+	<-done
+
+	require.Nil(t, result)
+	var failoverErr *UpstreamFailoverError
+	require.ErrorAs(t, err, &failoverErr)
+	require.Equal(t, GatewayFailureReason("anthropic_safeguards"), failoverErr.Reason)
+	require.False(t, c.Writer.Written())
+	require.Empty(t, rec.Body.String(), "keepalive must not commit the stream before refusal classification")
+}
+
+func TestGatewayService_AnthropicAPIKeyPassthrough_StreamingRefusalSurvivesIntervalCheck(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	rec := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(rec)
+	c.Request = httptest.NewRequest(http.MethodPost, "/v1/messages", nil)
+
+	pr, pw := io.Pipe()
+	upstream := &anthropicHTTPUpstreamRecorder{
+		resp: &http.Response{
+			StatusCode: http.StatusOK,
+			Header:     http.Header{"Content-Type": []string{"text/event-stream"}},
+			Body:       pr,
+		},
+	}
+	svc := &GatewayService{
+		cfg: &config.Config{
+			Gateway: config.GatewayConfig{StreamDataIntervalTimeout: 1},
+			Security: config.SecurityConfig{
+				URLAllowlist: config.URLAllowlistConfig{Enabled: false},
+			},
+		},
+		httpUpstream: upstream,
+	}
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		time.Sleep(650 * time.Millisecond)
+		_, _ = pw.Write([]byte("event: message_start\n" +
+			"data: {\"type\":\"message_start\",\"message\":{\"content\":[],\"stop_reason\":null}}\n\n"))
+		time.Sleep(550 * time.Millisecond)
+		_, _ = pw.Write([]byte("event: message_delta\n" +
+			"data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"refusal\"}}\n\n"))
+		_ = pw.Close()
+	}()
+
+	result, err := svc.forwardAnthropicAPIKeyPassthrough(
+		context.Background(), c, newAnthropicAPIKeyAccountForTest(),
+		[]byte(`{"model":"claude-opus-5","stream":true}`),
+		"claude-opus-5", "claude-opus-5", true, time.Now(),
+	)
+	_ = pr.Close()
+	<-done
+
+	require.Nil(t, result)
+	var failoverErr *UpstreamFailoverError
+	require.ErrorAs(t, err, &failoverErr)
+	require.Equal(t, GatewayFailureReason("anthropic_safeguards"), failoverErr.Reason)
+	require.False(t, c.Writer.Written())
+	require.Empty(t, rec.Body.String(), "a non-expired interval check must not flush the refusal prelude")
+}
+
+func TestGatewayService_AnthropicAPIKeyPassthrough_StreamingSuccessFlushesPreludeOnce(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	rec := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(rec)
+	c.Request = httptest.NewRequest(http.MethodPost, "/v1/messages", nil)
+
+	body := strings.Join([]string{
+		`event: message_start`,
+		`data: {"type":"message_start","message":{"id":"msg_ok","type":"message","role":"assistant","model":"claude-opus-5","content":[],"stop_reason":null,"usage":{"input_tokens":12,"output_tokens":0}}}`,
+		"",
+		`event: content_block_start`,
+		`data: {"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}`,
+		"",
+		`event: content_block_delta`,
+		`data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"OK"}}`,
+		"",
+		`event: message_delta`,
+		`data: {"type":"message_delta","delta":{"stop_reason":"end_turn","stop_sequence":null},"usage":{"output_tokens":1}}`,
+		"",
+		`event: message_stop`,
+		`data: {"type":"message_stop"}`,
+		"",
+	}, "\n")
+	upstream := &anthropicHTTPUpstreamRecorder{
+		resp: &http.Response{
+			StatusCode: http.StatusOK,
+			Header:     http.Header{"Content-Type": []string{"text/event-stream"}},
+			Body:       io.NopCloser(strings.NewReader(body)),
+		},
+	}
+	svc := &GatewayService{
+		cfg: &config.Config{Security: config.SecurityConfig{
+			URLAllowlist: config.URLAllowlistConfig{Enabled: false},
+		}},
+		httpUpstream: upstream,
+	}
+
+	result, err := svc.forwardAnthropicAPIKeyPassthrough(
+		context.Background(), c, newAnthropicAPIKeyAccountForTest(),
+		[]byte(`{"model":"claude-opus-5","stream":true}`),
+		"claude-opus-5", "claude-opus-5", true, time.Now(),
+	)
+
+	require.NoError(t, err)
+	require.NotNil(t, result)
+	require.Equal(t, 12, result.Usage.InputTokens)
+	require.Equal(t, 1, result.Usage.OutputTokens)
+	require.Equal(t, 1, strings.Count(rec.Body.String(), `"type":"message_start"`))
+	require.Contains(t, rec.Body.String(), `"text":"OK"`)
+}
+
+func TestGatewayService_AnthropicAPIKeyPassthrough_SafeguardsWAF405TriggersFailover(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	rec := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(rec)
+	c.Request = httptest.NewRequest(http.MethodPost, "/v1/messages", nil)
+
+	body := `<!doctype html><script>var en_tips={block_message:"Sorry, your request has been blocked as it may cause potential threats to the server's security."}</script>`
+	upstream := &anthropicHTTPUpstreamRecorder{
+		resp: &http.Response{
+			StatusCode: http.StatusMethodNotAllowed,
+			Header:     http.Header{"Content-Type": []string{"text/html"}},
+			Body:       io.NopCloser(strings.NewReader(body)),
+		},
+	}
+	svc := &GatewayService{
+		cfg: &config.Config{Security: config.SecurityConfig{
+			URLAllowlist: config.URLAllowlistConfig{Enabled: false},
+		}},
+		httpUpstream: upstream,
+	}
+
+	result, err := svc.forwardAnthropicAPIKeyPassthrough(
+		context.Background(), c, newAnthropicAPIKeyAccountForTest(),
+		[]byte(`{"model":"claude-opus-5"}`),
+		"claude-opus-5", "claude-opus-5", false, time.Now(),
+	)
+
+	require.Nil(t, result)
+	var failoverErr *UpstreamFailoverError
+	require.ErrorAs(t, err, &failoverErr)
+	require.Equal(t, http.StatusMethodNotAllowed, failoverErr.StatusCode)
+	require.Equal(t, body, string(failoverErr.ResponseBody))
+	require.Empty(t, rec.Body.String(), "WAF safeguards must not commit the client response before failover")
+}
+
+func TestGatewayService_AnthropicAPIKeyPassthrough_OrdinaryInvalidRequest400DoesNotFailover(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	rec := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(rec)
+	c.Request = httptest.NewRequest(http.MethodPost, "/v1/messages", nil)
+
+	body := `{"type":"error","error":{"type":"invalid_request_error","message":"messages must not be empty"}}`
+	upstream := &anthropicHTTPUpstreamRecorder{
+		resp: &http.Response{
+			StatusCode: http.StatusBadRequest,
+			Header:     http.Header{"Content-Type": []string{"application/json"}},
+			Body:       io.NopCloser(strings.NewReader(body)),
+		},
+	}
+	svc := &GatewayService{
+		cfg: &config.Config{Security: config.SecurityConfig{
+			URLAllowlist: config.URLAllowlistConfig{Enabled: false},
+		}},
+		httpUpstream:     upstream,
+		rateLimitService: &RateLimitService{},
+	}
+
+	result, err := svc.forwardAnthropicAPIKeyPassthrough(
+		context.Background(), c, newAnthropicAPIKeyAccountForTest(),
+		[]byte(`{"model":"claude-opus-5"}`),
+		"claude-opus-5", "claude-opus-5", false, time.Now(),
+	)
+
+	require.Nil(t, result)
+	require.Error(t, err)
+	var failoverErr *UpstreamFailoverError
+	require.False(t, errors.As(err, &failoverErr))
+	require.Equal(t, http.StatusBadRequest, rec.Code)
+	require.Contains(t, rec.Body.String(), "messages must not be empty")
 }
