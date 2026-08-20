@@ -86,6 +86,33 @@ func TestRotateLastUsedBucket_OutsideWindowKeepsLRUOrder(t *testing.T) {
 	}
 }
 
+// 主号档（priority 更小）与副号档必须各自成组打散，随机性绝不能把副号顶到主号前面。
+// 有多个主号时这条尤其关键：主号之间要轮询，但轮询不得越过档位把请求降级给副号。
+func TestRotateLastUsedBucket_ShuffleNeverCrossesPriorityTiers(t *testing.T) {
+	withLastUsedGroupTolerance(t, time.Minute)
+	base := time.Date(2026, 8, 20, 22, 0, 0, 0, time.UTC)
+
+	seenFirst := map[int64]int{}
+	for i := 0; i < 200; i++ {
+		// 四个号 LastUsedAt 全落在同一个容差窗口内，只有优先级不同。
+		p1, p2, s1, s2 := base, base.Add(200*time.Millisecond), base.Add(400*time.Millisecond), base.Add(600*time.Millisecond)
+		set := []accountWithLoad{
+			{account: &Account{ID: 5, Priority: 0, LastUsedAt: &p1}, loadInfo: &AccountLoadInfo{AccountID: 5}},
+			{account: &Account{ID: 12, Priority: 0, LastUsedAt: &p2}, loadInfo: &AccountLoadInfo{AccountID: 12}},
+			{account: &Account{ID: 3, Priority: 10, LastUsedAt: &s1}, loadInfo: &AccountLoadInfo{AccountID: 3}},
+			{account: &Account{ID: 11, Priority: 10, LastUsedAt: &s2}, loadInfo: &AccountLoadInfo{AccountID: 11}},
+		}
+		shuffleWithinSortGroups(set)
+		require.Equal(t, 0, set[0].account.Priority, "副号被打散到了主号之前：%v", set[0].account.ID)
+		require.Equal(t, 0, set[1].account.Priority, "第二位也必须仍是主号档")
+		seenFirst[set[0].account.ID]++
+	}
+	require.Len(t, seenFirst, 2, "两个主号都应有机会排在最前，实际 %v", seenFirst)
+	for id, n := range seenFirst {
+		require.Greater(t, n, 20, "主号 %d 只排到最前 %d/200 次，主号档内轮询过于集中", id, n)
+	}
+}
+
 func withLastUsedGroupTolerance(t *testing.T, d time.Duration) {
 	t.Helper()
 	prev := lastUsedGroupTolerance
