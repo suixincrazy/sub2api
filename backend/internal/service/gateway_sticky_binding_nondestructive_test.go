@@ -72,10 +72,12 @@ func TestGatewayStickyBindingDuringSelectionIsNonDestructive(t *testing.T) {
 
 	// 确定性不兼容 ≠ 临时不可用：既有绑定根本不能服务本次请求时必须让位，
 	// 否则会话会被永久钉在上一个模型/平台的账号上（与上游 eager 绑定行为一致）。
+	// 「路由排除」只对被某条路由规则点过名的账号成立，所以 governed 要含 primaryID。
 	t.Run("model routing excluding the bound account allows rebind", func(t *testing.T) {
 		cache := &schedulerTestGatewayCache{sessionBindings: map[string]int64{sessionHash: primaryID}}
 		svc := &GatewayService{cache: cache}
-		ctx := withStickyRequestScope(context.Background(), []int64{fallbackID})
+		ctx := withStickyRequestScope(context.Background(), []int64{fallbackID},
+			map[int64]struct{}{primaryID: {}, fallbackID: {}})
 		require.NoError(t, svc.bindGatewayStickySessionDuringSelection(ctx, &groupID, sessionHash, fallbackID))
 		require.Equal(t, fallbackID, cache.sessionBindings[sessionHash],
 			"模型路由把原账号排除在外时，绑定应更新为路由选中的账号")
@@ -84,10 +86,24 @@ func TestGatewayStickyBindingDuringSelectionIsNonDestructive(t *testing.T) {
 	t.Run("routing set containing the bound account still protects it", func(t *testing.T) {
 		cache := &schedulerTestGatewayCache{sessionBindings: map[string]int64{sessionHash: primaryID}}
 		svc := &GatewayService{cache: cache}
-		ctx := withStickyRequestScope(context.Background(), []int64{primaryID, fallbackID})
+		ctx := withStickyRequestScope(context.Background(), []int64{primaryID, fallbackID},
+			map[int64]struct{}{primaryID: {}, fallbackID: {}})
 		require.NoError(t, svc.bindGatewayStickySessionDuringSelection(ctx, &groupID, sessionHash, fallbackID))
 		require.Equal(t, primaryID, cache.sessionBindings[sessionHash],
 			"原账号仍在路由集合内说明只是临时不可用，绑定必须保留")
+	})
+
+	// 新加进分组、还没写进任何 model_routing 规则的账号不受路由约束：它只是「临时
+	// 不可用」的候选之一，不能被当成确定性不兼容而夺走主号的绑定。
+	t.Run("account never mentioned by any routing rule keeps the binding protected", func(t *testing.T) {
+		const ungovernedID = int64(11)
+		cache := &schedulerTestGatewayCache{sessionBindings: map[string]int64{sessionHash: ungovernedID}}
+		svc := &GatewayService{cache: cache}
+		ctx := withStickyRequestScope(context.Background(), []int64{primaryID, fallbackID},
+			map[int64]struct{}{primaryID: {}, fallbackID: {}})
+		require.NoError(t, svc.bindGatewayStickySessionDuringSelection(ctx, &groupID, sessionHash, fallbackID))
+		require.Equal(t, ungovernedID, cache.sessionBindings[sessionHash],
+			"路由规则从未提到过的账号不算被路由排除，绑定应继续受保护")
 	})
 
 	t.Run("stale marker allows rebind only for the marked account", func(t *testing.T) {

@@ -246,9 +246,11 @@ func (s *GatewayService) SelectAccountWithLoadAwareness(ctx context.Context, gro
 
 	// 获取模型路由配置（anthropic 目标平台；composite 分组按目标平台判断）
 	var routingAccountIDs []int64
+	var routingGovernedIDs map[int64]struct{}
 	if group != nil && requestedModel != "" && platform == PlatformAnthropic &&
 		(group.Platform == PlatformAnthropic || group.Platform == PlatformComposite) {
 		routingAccountIDs = group.GetRoutingAccountIDs(requestedModel)
+		routingGovernedIDs = group.GetRoutingGovernedAccountIDs()
 		if s.debugModelRoutingEnabled() {
 			logger.LegacyPrintf("service.gateway", "[ModelRoutingDebug] context group routing: group_id=%d model=%s enabled=%v rules=%d matched_ids=%v session=%s sticky_account=%d",
 				group.ID, requestedModel, group.ModelRoutingEnabled, len(group.ModelRouting), routingAccountIDs, shortSessionHash(sessionHash), stickyAccountID)
@@ -266,15 +268,43 @@ func (s *GatewayService) SelectAccountWithLoadAwareness(ctx context.Context, gro
 			}
 		}
 	}
-	ctx = withStickyRequestScope(ctx, routingAccountIDs)
+	ctx = withStickyRequestScope(ctx, routingAccountIDs, routingGovernedIDs)
+
+	// 路由候选池 = 显式路由列表 + 未被任何路由规则提到过的分组账号。
+	// 后者是为了让新加进分组的号不必手工写进 model_routing 就能参与调度和同级轮询；
+	// 被别的规则提到过的账号不在此列，那属于「这个号不服务该模型」的明确配置意图。
+	// 必须复制切片：GetRoutingAccountIDs 直接返回配置里的切片，就地 append 会写脏配置缓存。
+	routingCandidateIDs := routingAccountIDs
+	if len(routingAccountIDs) > 0 {
+		var ungoverned []int64
+		for i := range accounts {
+			id := accounts[i].ID
+			if containsInt64(routingAccountIDs, id) {
+				continue
+			}
+			if _, governed := routingGovernedIDs[id]; governed {
+				continue
+			}
+			ungoverned = append(ungoverned, id)
+		}
+		if len(ungoverned) > 0 {
+			routingCandidateIDs = make([]int64, 0, len(routingAccountIDs)+len(ungoverned))
+			routingCandidateIDs = append(routingCandidateIDs, routingAccountIDs...)
+			routingCandidateIDs = append(routingCandidateIDs, ungoverned...)
+			if s.debugModelRoutingEnabled() {
+				logger.LegacyPrintf("service.gateway", "[ModelRoutingDebug] ungoverned accounts joined routing pool: group_id=%v model=%s routed=%v joined=%v",
+					derefGroupID(groupID), requestedModel, routingAccountIDs, ungoverned)
+			}
+		}
+	}
 
 	// ============ Layer 1: 模型路由优先选择（优先级高于粘性会话） ============
-	if len(routingAccountIDs) > 0 && s.concurrencyService != nil {
-		// 1. 过滤出路由列表中可调度的账号
+	if len(routingCandidateIDs) > 0 && s.concurrencyService != nil {
+		// 1. 过滤出路由候选池中可调度的账号
 		var routingCandidates []*Account
 		var filteredExcluded, filteredMissing, filteredUnsched, filteredPlatform, filteredModelScope, filteredModelMapping, filteredWindowCost int
 		var modelScopeSkippedIDs []int64 // 记录因模型限流被跳过的账号 ID
-		for _, routingAccountID := range routingAccountIDs {
+		for _, routingAccountID := range routingCandidateIDs {
 			if isExcluded(routingAccountID) {
 				filteredExcluded++
 				continue
@@ -335,13 +365,13 @@ func (s *GatewayService) SelectAccountWithLoadAwareness(ctx context.Context, gro
 			if sessionHash != "" && stickyAccountID > 0 {
 				slog.Debug("sticky.layer1_5_checking",
 					"sticky_account_id", stickyAccountID,
-					"in_routing_list", containsInt64(routingAccountIDs, stickyAccountID),
+					"in_routing_list", containsInt64(routingCandidateIDs, stickyAccountID),
 					"is_excluded", isExcluded(stickyAccountID),
 					"in_account_map", func() bool { _, ok := accountByID[stickyAccountID]; return ok }(),
 					"session", shortSessionHash(sessionHash),
 				)
-				if containsInt64(routingAccountIDs, stickyAccountID) && !isExcluded(stickyAccountID) {
-					// 粘性账号在路由列表中，优先使用
+				if containsInt64(routingCandidateIDs, stickyAccountID) && !isExcluded(stickyAccountID) {
+					// 粘性账号在路由候选池中，优先使用
 					if stickyAccount, ok := accountByID[stickyAccountID]; ok {
 						var stickyCacheMissReason string
 
@@ -868,16 +898,16 @@ func (s *GatewayService) ResolveGroupByID(ctx context.Context, groupID int64) (*
 	return s.resolveGroupByID(ctx, groupID)
 }
 
-func (s *GatewayService) routingAccountIDsForRequest(ctx context.Context, groupID *int64, requestedModel string, platform string) []int64 {
+func (s *GatewayService) routingAccountIDsForRequest(ctx context.Context, groupID *int64, requestedModel string, platform string) ([]int64, map[int64]struct{}) {
 	if groupID == nil || requestedModel == "" || platform != PlatformAnthropic {
-		return nil
+		return nil, nil
 	}
 	group, err := s.resolveGroupByID(ctx, *groupID)
 	if err != nil || group == nil {
 		if s.debugModelRoutingEnabled() {
 			logger.LegacyPrintf("service.gateway", "[ModelRoutingDebug] resolve group failed: group_id=%v model=%s platform=%s err=%v", derefGroupID(groupID), requestedModel, platform, err)
 		}
-		return nil
+		return nil, nil
 	}
 	// Model routing applies only to requests resolved to Anthropic. Composite
 	// groups may still use those rules once their model resolved to Anthropic.
@@ -885,14 +915,15 @@ func (s *GatewayService) routingAccountIDsForRequest(ctx context.Context, groupI
 		if s.debugModelRoutingEnabled() {
 			logger.LegacyPrintf("service.gateway", "[ModelRoutingDebug] skip: non-anthropic group platform: group_id=%d group_platform=%s model=%s", group.ID, group.Platform, requestedModel)
 		}
-		return nil
+		return nil, nil
 	}
 	ids := group.GetRoutingAccountIDs(requestedModel)
+	governed := group.GetRoutingGovernedAccountIDs()
 	if s.debugModelRoutingEnabled() {
-		logger.LegacyPrintf("service.gateway", "[ModelRoutingDebug] routing lookup: group_id=%d model=%s enabled=%v rules=%d matched_ids=%v",
-			group.ID, requestedModel, group.ModelRoutingEnabled, len(group.ModelRouting), ids)
+		logger.LegacyPrintf("service.gateway", "[ModelRoutingDebug] routing lookup: group_id=%d model=%s enabled=%v rules=%d matched_ids=%v governed=%d",
+			group.ID, requestedModel, group.ModelRoutingEnabled, len(group.ModelRouting), ids, len(governed))
 	}
-	return ids
+	return ids, governed
 }
 
 func (s *GatewayService) resolveGatewayGroup(ctx context.Context, groupID *int64) (*Group, *int64, error) {
@@ -1875,8 +1906,8 @@ func shuffleWithinPriority(accounts []*Account) {
 // selectAccountForModelWithPlatform 选择单平台账户（完全隔离）
 func (s *GatewayService) selectAccountForModelWithPlatform(ctx context.Context, groupID *int64, sessionHash string, requestedModel string, excludedIDs map[int64]struct{}, platform string) (*Account, error) {
 	preferOAuth := platform == PlatformGemini
-	routingAccountIDs := s.routingAccountIDsForRequest(ctx, groupID, requestedModel, platform)
-	ctx = withStickyRequestScope(ctx, routingAccountIDs)
+	routingAccountIDs, routingGovernedIDs := s.routingAccountIDsForRequest(ctx, groupID, requestedModel, platform)
+	ctx = withStickyRequestScope(ctx, routingAccountIDs, routingGovernedIDs)
 
 	// require_privacy_set: 获取分组信息
 	var schedGroup *Group
@@ -1898,7 +1929,7 @@ func (s *GatewayService) selectAccountForModelWithPlatform(ctx context.Context, 
 		// 1) Sticky session only applies if the bound account is within the routing set.
 		if sessionHash != "" && s.cache != nil {
 			accountID, err := s.cache.GetSessionAccountID(ctx, derefGroupID(groupID), sessionHash)
-			if err == nil && accountID > 0 && containsInt64(routingAccountIDs, accountID) {
+			if err == nil && accountID > 0 && modelRoutingAllowsAccount(routingAccountIDs, routingGovernedIDs, accountID) {
 				if _, excluded := excludedIDs[accountID]; !excluded {
 					account, err := s.getSchedulableAccount(ctx, accountID)
 					// 检查账号分组归属和平台匹配（确保粘性会话不会跨分组或跨平台）
@@ -1934,17 +1965,11 @@ func (s *GatewayService) selectAccountForModelWithPlatform(ctx context.Context, 
 		ctx = s.withWindowCostPrefetch(ctx, accounts)
 		ctx = s.withRPMPrefetch(ctx, accounts)
 
-		routingSet := make(map[int64]struct{}, len(routingAccountIDs))
-		for _, id := range routingAccountIDs {
-			if id > 0 {
-				routingSet[id] = struct{}{}
-			}
-		}
-
 		var selected *Account
 		for i := range accounts {
 			acc := &accounts[i]
-			if _, ok := routingSet[acc.ID]; !ok {
+			// 显式路由列表命中，或该账号没被任何路由规则提到过（新加进分组的号）。
+			if !modelRoutingAllowsAccount(routingAccountIDs, routingGovernedIDs, acc.ID) {
 				continue
 			}
 			if _, excluded := excludedIDs[acc.ID]; excluded {
@@ -2147,8 +2172,8 @@ func (s *GatewayService) selectAccountForModelWithPlatform(ctx context.Context, 
 // 查询原生平台账户 + 启用 mixed_scheduling 的 antigravity 账户
 func (s *GatewayService) selectAccountWithMixedScheduling(ctx context.Context, groupID *int64, sessionHash string, requestedModel string, excludedIDs map[int64]struct{}, nativePlatform string) (*Account, error) {
 	preferOAuth := nativePlatform == PlatformGemini
-	routingAccountIDs := s.routingAccountIDsForRequest(ctx, groupID, requestedModel, nativePlatform)
-	ctx = withStickyRequestScope(ctx, routingAccountIDs)
+	routingAccountIDs, routingGovernedIDs := s.routingAccountIDsForRequest(ctx, groupID, requestedModel, nativePlatform)
+	ctx = withStickyRequestScope(ctx, routingAccountIDs, routingGovernedIDs)
 
 	// require_privacy_set: 获取分组信息
 	var schedGroup *Group
@@ -2168,7 +2193,7 @@ func (s *GatewayService) selectAccountWithMixedScheduling(ctx context.Context, g
 		// 1) Sticky session only applies if the bound account is within the routing set.
 		if sessionHash != "" && s.cache != nil {
 			accountID, err := s.cache.GetSessionAccountID(ctx, derefGroupID(groupID), sessionHash)
-			if err == nil && accountID > 0 && containsInt64(routingAccountIDs, accountID) {
+			if err == nil && accountID > 0 && modelRoutingAllowsAccount(routingAccountIDs, routingGovernedIDs, accountID) {
 				if _, excluded := excludedIDs[accountID]; !excluded {
 					account, err := s.getSchedulableAccount(ctx, accountID)
 					// 检查账号分组归属和有效性：原生平台直接匹配，antigravity 需要启用混合调度
@@ -2202,17 +2227,11 @@ func (s *GatewayService) selectAccountWithMixedScheduling(ctx context.Context, g
 		ctx = s.withWindowCostPrefetch(ctx, accounts)
 		ctx = s.withRPMPrefetch(ctx, accounts)
 
-		routingSet := make(map[int64]struct{}, len(routingAccountIDs))
-		for _, id := range routingAccountIDs {
-			if id > 0 {
-				routingSet[id] = struct{}{}
-			}
-		}
-
 		var selected *Account
 		for i := range accounts {
 			acc := &accounts[i]
-			if _, ok := routingSet[acc.ID]; !ok {
+			// 显式路由列表命中，或该账号没被任何路由规则提到过（新加进分组的号）。
+			if !modelRoutingAllowsAccount(routingAccountIDs, routingGovernedIDs, acc.ID) {
 				continue
 			}
 			if _, excluded := excludedIDs[acc.ID]; excluded {

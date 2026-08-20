@@ -247,6 +247,43 @@ func (g *Group) GetRoutingAccountIDs(requestedModel string) []int64 {
 	return nil
 }
 
+// GetRoutingGovernedAccountIDs 返回被本分组 model_routing 显式提到过的所有账号 ID
+// （所有规则取并集）。只有出现在某条规则里的账号才受路由白名单约束：把账号写进
+// 规则 A 而不写进规则 B，是「这个号不服务 B 的模型」的明确意图，必须继续尊重。
+// 从未出现在任何规则里的账号则不受路由约束——它是否能服务某个模型由账号自己的
+// model_mapping 判定。否则每往分组里加一个号都要手工改 model_routing，漏改就会
+// 被静默排除在调度和轮询之外。
+func (g *Group) GetRoutingGovernedAccountIDs() map[int64]struct{} {
+	if !g.ModelRoutingEnabled || len(g.ModelRouting) == 0 {
+		return nil
+	}
+	governed := make(map[int64]struct{})
+	for _, accountIDs := range g.ModelRouting {
+		for _, id := range accountIDs {
+			if id > 0 {
+				governed[id] = struct{}{}
+			}
+		}
+	}
+	if len(governed) == 0 {
+		return nil
+	}
+	return governed
+}
+
+// modelRoutingAllowsAccount 判断账号是否可以进入本次请求的路由候选池。
+// routed 为空表示本次请求没有命中任何路由规则，不做限制。
+func modelRoutingAllowsAccount(routed []int64, governed map[int64]struct{}, accountID int64) bool {
+	if len(routed) == 0 {
+		return true
+	}
+	if containsInt64(routed, accountID) {
+		return true
+	}
+	_, isGoverned := governed[accountID]
+	return !isGoverned
+}
+
 // matchModelPattern 检查模型是否匹配模式
 // 支持 * 通配符，如 "claude-opus-*" 匹配 "claude-opus-4-20250514"
 func matchModelPattern(pattern, model string) bool {
