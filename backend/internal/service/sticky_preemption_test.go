@@ -115,10 +115,41 @@ func TestEvaluateStickyPreemption(t *testing.T) {
 			wantBetter:  6,
 		},
 		{
-			// 主号本身被绑定时，更低优先级的副号绝不能抢占。
+			// 绑定在主号上时，更低优先级的副号绝不能抢占。
 			name:        "bound primary is never preempted by secondary",
 			bound:       cand(5, 0, at(-time.Hour)),
 			candidates:  []stickyPreemptionCandidate{cand(3, 10, at(-2*time.Hour)), cand(6, 10, nil)},
+			higher:      true,
+			rotate:      true,
+			minIdle:     rotateIdle,
+			wantPreempt: false,
+		},
+		{
+			// 多主号：12 与 5 同为 priority=0，轮询判定与副号走的是同一条 == 分支，
+			// 不存在「只有副号才轮询」的档位特例。旧的 case 全用 priority=10，
+			// 这条锁住顶层优先级档同样生效。
+			name:  "multiple primaries rotate within the top tier",
+			bound: cand(12, 0, at(-10*time.Minute)),
+			candidates: []stickyPreemptionCandidate{
+				cand(5, 0, at(-2*time.Hour)),
+				cand(3, 10, at(-5*time.Hour)), // 更旧的副号仍不得被选中
+			},
+			higher:      true,
+			rotate:      true,
+			minIdle:     rotateIdle,
+			wantPreempt: true,
+			wantReason:  "same_priority_rotate",
+			wantBetter:  5,
+		},
+		{
+			// 主号档内的 MinIdle 防抖与副号档完全一致：对等主号只旧 60 秒就不换，
+			// 且此时也不能被更旧的副号钩下去（否则就变成无故降级到副号）。
+			name:  "top tier holds binding when peer primary barely older",
+			bound: cand(12, 0, at(-30*time.Second)),
+			candidates: []stickyPreemptionCandidate{
+				cand(5, 0, at(-90*time.Second)),
+				cand(3, 10, at(-5*time.Hour)),
+			},
 			higher:      true,
 			rotate:      true,
 			minIdle:     rotateIdle,
@@ -352,5 +383,117 @@ func TestStickyPreemptionNeverDemotesToLowerPriority(t *testing.T) {
 	)
 	if decision.preempt {
 		t.Fatalf("绑定在主号上时不得因低优先级副号更旧而降级切换，decision=%+v", decision)
+	}
+}
+
+// 需求：有多个主号时，主号之间要和副号之间有完全一样的轮询机制。
+//
+// 线上背景（2026-08-20 实证）：调度看的是 accounts.priority，
+// 长期只有一个 priority=0 的主号，其余都是 priority=10 的副号，
+// 于是所有轮询实测都发生在副号档，主号档从未有过覆盖。
+// 加入第二个 priority=0 主号后，两个主号必须像两个副号一样按 MinIdle 交替，
+// 并且整个过程中都不许把请求降级给更旧的副号。
+func TestStickyRotationAlternatesBetweenMultiplePrimaries(t *testing.T) {
+	const rotateIdle = 5 * time.Minute
+	now := time.Date(2026, 8, 20, 22, 0, 0, 0, time.UTC)
+
+	priority := map[int64]int{5: 0, 12: 0, 3: 10, 11: 10}
+	lastUsed := map[int64]time.Time{
+		5:  now.Add(-time.Hour),
+		12: now.Add(-2 * time.Hour),
+		3:  now.Add(-10 * time.Hour), // 副号比两个主号都旧得多，仍不得被选中
+		11: now.Add(-12 * time.Hour),
+	}
+	bound := int64(5)
+
+	picks := make([]int64, 0, 6)
+	for i := 0; i < 6; i++ {
+		now = now.Add(rotateIdle + time.Minute)
+
+		candidates := make([]stickyPreemptionCandidate, 0, len(lastUsed))
+		for id := range lastUsed {
+			if id == bound {
+				continue
+			}
+			ts := lastUsed[id]
+			candidates = append(candidates, stickyPreemptionCandidate{ID: id, Priority: priority[id], LastUsedAt: &ts})
+		}
+
+		boundLast := lastUsed[bound]
+		decision := evaluateStickyPreemption(
+			stickyPreemptionCandidate{ID: bound, Priority: priority[bound], LastUsedAt: &boundLast},
+			candidates, true, true, rotateIdle, now,
+		)
+		if decision.preempt {
+			if decision.reason != "same_priority_rotate" {
+				t.Fatalf("主号档轮换的原因应为 same_priority_rotate，实际 %q（picks=%v）", decision.reason, picks)
+			}
+			bound = decision.betterA
+		}
+		picks = append(picks, bound)
+		lastUsed[bound] = now
+	}
+
+	for i, id := range picks {
+		if priority[id] != 0 {
+			t.Fatalf("第 %d 轮把请求降级给了副号 %d，picks=%v", i, id, picks)
+		}
+	}
+	if picks[0] == picks[1] {
+		t.Fatalf("两个主号之间没有发生轮换，picks=%v", picks)
+	}
+	for i := 1; i < len(picks); i++ {
+		if picks[i] == picks[i-1] {
+			t.Fatalf("主号档应严格交替，第 %d 轮重复，picks=%v", i, picks)
+		}
+	}
+}
+
+// 三个以上主号时，轮询必须覆盖到每一个，不能在其中两个之间打转。
+// LRU 单调方向保证每轮都换到「最久没用」的那个，等价于顶层档位的轮转。
+func TestStickyRotationCoversEveryPrimaryInTopTier(t *testing.T) {
+	const rotateIdle = 5 * time.Minute
+	now := time.Date(2026, 8, 20, 22, 0, 0, 0, time.UTC)
+
+	primaries := []int64{5, 12, 13}
+	lastUsed := map[int64]time.Time{
+		5:  now.Add(-time.Hour),
+		12: now.Add(-2 * time.Hour),
+		13: now.Add(-3 * time.Hour),
+	}
+	bound := int64(5)
+
+	seen := map[int64]int{}
+	for i := 0; i < 9; i++ {
+		now = now.Add(rotateIdle + time.Minute)
+
+		candidates := make([]stickyPreemptionCandidate, 0, len(primaries))
+		for _, id := range primaries {
+			if id == bound {
+				continue
+			}
+			ts := lastUsed[id]
+			candidates = append(candidates, stickyPreemptionCandidate{ID: id, Priority: 0, LastUsedAt: &ts})
+		}
+
+		boundLast := lastUsed[bound]
+		decision := evaluateStickyPreemption(
+			stickyPreemptionCandidate{ID: bound, Priority: 0, LastUsedAt: &boundLast},
+			candidates, true, true, rotateIdle, now,
+		)
+		if decision.preempt {
+			bound = decision.betterA
+		}
+		seen[bound]++
+		lastUsed[bound] = now
+	}
+
+	if len(seen) != len(primaries) {
+		t.Fatalf("三个主号应全部参与轮询，实际分布 %v", seen)
+	}
+	for _, id := range primaries {
+		if seen[id] < 2 {
+			t.Fatalf("主号 %d 只被选中 %d 次，轮询不均匀：%v", id, seen[id], seen)
+		}
 	}
 }
