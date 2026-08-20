@@ -311,8 +311,14 @@ func TestGatewayService_AnthropicAPIKeyPassthrough_ForwardStreamMissingTerminalP
 		Stream: true,
 	}
 
+	// content_block_start 会提交响应：字节已写出客户端，无法再 failover，
+	// 此时缺少终止事件必须保留已观测的 usage 用于计费（#5148）。
+	// 未提交就断流的空流走 failover 分支，见
+	// TestGatewayService_AnthropicAPIKeyPassthrough_EmptyStreamBeforeCommitFailsOver。
 	upstreamSSE := strings.Join([]string{
 		`data: {"type":"message_start","message":{"usage":{"input_tokens":9,"cache_read_input_tokens":2}}}`,
+		"",
+		`data: {"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}`,
 		"",
 		`data: {"type":"message_delta","usage":{"output_tokens":3}}`,
 		"",
