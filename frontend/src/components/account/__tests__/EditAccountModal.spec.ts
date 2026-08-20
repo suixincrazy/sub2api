@@ -1350,4 +1350,42 @@ describe('EditAccountModal', () => {
       'antigravity_project_id'
     )
   })
+
+  it('allows priority 0 (highest) and submits it verbatim', async () => {
+    const account = buildAccount()
+    updateAccountMock.mockReset()
+    checkMixedChannelRiskMock.mockReset()
+    checkMixedChannelRiskMock.mockResolvedValue({ has_risk: false })
+    updateAccountMock.mockResolvedValue(account)
+
+    const wrapper = mountModal(account)
+    const input = wrapper.get<HTMLInputElement>('[data-tour="account-form-priority"]')
+
+    // 0 是后端定义的最高优先级（数值越小越优先），输入框不得把下限卡在 1
+    expect(input.attributes('min')).toBe('0')
+
+    await input.setValue('0')
+    await wrapper.get('form#edit-account-form').trigger('submit.prevent')
+
+    expect(updateAccountMock).toHaveBeenCalledTimes(1)
+    expect(updateAccountMock.mock.calls[0]?.[1]?.priority).toBe(0)
+  })
+
+  it('loads an existing priority 0 account without falling back to 1', async () => {
+    const account = { ...buildAccount(), priority: 0 }
+    updateAccountMock.mockReset()
+    checkMixedChannelRiskMock.mockReset()
+    checkMixedChannelRiskMock.mockResolvedValue({ has_risk: false })
+    updateAccountMock.mockResolvedValue(account)
+
+    const wrapper = mountModal(account)
+
+    expect(
+      wrapper.get<HTMLInputElement>('[data-tour="account-form-priority"]').element.value
+    ).toBe('0')
+
+    await wrapper.get('form#edit-account-form').trigger('submit.prevent')
+
+    expect(updateAccountMock.mock.calls[0]?.[1]?.priority).toBe(0)
+  })
 })
