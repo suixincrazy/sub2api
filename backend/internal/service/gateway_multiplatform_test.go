@@ -1392,9 +1392,12 @@ func TestGatewayService_selectAccountWithMixedScheduling(t *testing.T) {
 		require.Equal(t, int64(1), acc.ID)
 	})
 
+	// 被别的路由规则点过名的账号属于「受路由约束」：本次请求没命中它，说明配置意图
+	// 就是它不服务该模型，必须排除，即使它优先级更高。
 	t.Run("混合调度-路由优先选择路由账号", func(t *testing.T) {
 		groupID := int64(30)
 		requestedModel := "claude-sonnet-4-5"
+		otherModel := "claude-opus-4-1"
 		repo := &mockAccountRepoForPlatform{
 			accounts: []Account{
 				{ID: 1, Platform: PlatformAnthropic, Priority: 1, Status: StatusActive, Schedulable: true},
@@ -1419,6 +1422,7 @@ func TestGatewayService_selectAccountWithMixedScheduling(t *testing.T) {
 					ModelRoutingEnabled: true,
 					ModelRouting: map[string][]int64{
 						requestedModel: {2},
+						otherModel:     {1},
 					},
 				},
 			},
@@ -1435,6 +1439,52 @@ func TestGatewayService_selectAccountWithMixedScheduling(t *testing.T) {
 		require.NoError(t, err)
 		require.NotNil(t, acc)
 		require.Equal(t, int64(2), acc.ID)
+	})
+
+	// 从未被任何 model_routing 规则提到过的账号（典型场景：刚加进分组的新号）不受路由
+	// 白名单约束，必须能正常进入候选池参与调度与同级轮询。否则每加一个号都要手工改
+	// model_routing，漏改就会被静默排除在调度之外。
+	t.Run("混合调度-未被任何路由规则提到的账号仍可参与调度", func(t *testing.T) {
+		groupID := int64(32)
+		requestedModel := "claude-sonnet-4-5"
+		repo := &mockAccountRepoForPlatform{
+			accounts: []Account{
+				{ID: 1, Platform: PlatformAnthropic, Priority: 1, Status: StatusActive, Schedulable: true},
+				{ID: 2, Platform: PlatformAntigravity, Priority: 2, Status: StatusActive, Schedulable: true, Extra: map[string]any{"mixed_scheduling": true}},
+			},
+			accountsByID: map[int64]*Account{},
+		}
+		for i := range repo.accounts {
+			repo.accountsByID[repo.accounts[i].ID] = &repo.accounts[i]
+		}
+
+		groupRepo := &mockGroupRepoForGateway{
+			groups: map[int64]*Group{
+				groupID: {
+					ID:                  groupID,
+					Name:                "route-mixed-ungoverned",
+					Platform:            PlatformAnthropic,
+					Status:              StatusActive,
+					Hydrated:            true,
+					ModelRoutingEnabled: true,
+					ModelRouting: map[string][]int64{
+						requestedModel: {2},
+					},
+				},
+			},
+		}
+
+		svc := &GatewayService{
+			accountRepo: repo,
+			cache:       &mockGatewayCacheForPlatform{},
+			cfg:         testConfig(),
+			groupRepo:   groupRepo,
+		}
+
+		acc, err := svc.selectAccountWithMixedScheduling(ctx, &groupID, "", requestedModel, nil, PlatformAnthropic)
+		require.NoError(t, err)
+		require.NotNil(t, acc)
+		require.Equal(t, int64(1), acc.ID, "账号 1 没被任何路由规则提到过，应正常入池并以更高优先级胜出")
 	})
 
 	t.Run("混合调度-路由粘性命中", func(t *testing.T) {

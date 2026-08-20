@@ -975,15 +975,17 @@ type stickyRequestScopeCtxKey struct{}
 type stickyStaleBindingCtxKey struct{}
 
 type stickyRequestScope struct {
-	routingAccountIDs []int64
+	routingAccountIDs  []int64
+	governedAccountIDs map[int64]struct{}
 }
 
-func withStickyRequestScope(ctx context.Context, routingAccountIDs []int64) context.Context {
+func withStickyRequestScope(ctx context.Context, routingAccountIDs []int64, governedAccountIDs map[int64]struct{}) context.Context {
 	if len(routingAccountIDs) == 0 {
 		return ctx
 	}
 	return context.WithValue(ctx, stickyRequestScopeCtxKey{}, stickyRequestScope{
-		routingAccountIDs: routingAccountIDs,
+		routingAccountIDs:  routingAccountIDs,
+		governedAccountIDs: governedAccountIDs,
 	})
 }
 
@@ -1009,7 +1011,9 @@ func stickyBindingDeterministicallyStale(ctx context.Context, existingAccountID 
 	if !ok || len(scope.routingAccountIDs) == 0 {
 		return false
 	}
-	return !containsInt64(scope.routingAccountIDs, existingAccountID)
+	// 只有被路由规则显式点过名的账号才算「路由确定性地排除了它」；规则从未提到过的
+	// 账号不受路由约束，视为仍然可用，绑定继续受非破坏性保护。
+	return !modelRoutingAllowsAccount(scope.routingAccountIDs, scope.governedAccountIDs, existingAccountID)
 }
 
 // bindGatewayStickySessionDuringSelection preserves the normal eager sticky
