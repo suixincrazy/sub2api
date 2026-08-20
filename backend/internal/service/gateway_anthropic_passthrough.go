@@ -411,6 +411,61 @@ func (s *GatewayService) newAnthropicSafetyFailoverError(c *gin.Context, resp *h
 	}
 }
 
+const anthropicEmptyStreamUpstreamMessage = "Anthropic upstream returned an empty SSE stream with no terminal event"
+
+func anthropicEmptyStreamErrorBody() []byte {
+	body, err := json.Marshal(map[string]any{
+		"type": "error",
+		"error": map[string]any{
+			"type":    "upstream_error",
+			"code":    "anthropic_empty_stream",
+			"message": anthropicEmptyStreamUpstreamMessage,
+		},
+	})
+	if err != nil {
+		return []byte(`{"type":"error","error":{"type":"upstream_error","code":"anthropic_empty_stream","message":"Anthropic upstream returned an empty SSE stream with no terminal event"}}`)
+	}
+	return body
+}
+
+// newAnthropicEmptyStreamFailoverError 把「上游 200 但整条 SSE 只送来非提交性前奏
+// （message_start / ping / message_delta）后就断流」标记为可 failover 的上游异常。
+//
+// 这类响应对客户端完全无用——Claude Code 只会报 "API returned an empty or malformed
+// response (HTTP 200)"。而它必然发生在 prelude 还没写出客户端之前（keepalive 在
+// !streamCommitted 时只重置定时器不写字节，响应头也只落在 c.Header() 的 map 里），
+// 所以此刻 failover 窗口仍然完好，必须切号而不是把半条流 flush 给客户端钉死成 200。
+//
+// 不设 RetryableOnSameAccount：空流往往伴随上游长时间挂起，在同一账号上重试只会
+// 把停顿时间成倍放大；Scope=Account 会照常把这次失败计入调度健康度。
+func (s *GatewayService) newAnthropicEmptyStreamFailoverError(c *gin.Context, resp *http.Response, account *Account, reason string) *UpstreamFailoverError {
+	upstreamRequestID := ""
+	headers := http.Header{}
+	if resp != nil {
+		upstreamRequestID = resp.Header.Get("x-request-id")
+		headers = resp.Header.Clone()
+	}
+	appendOpsUpstreamError(c, OpsUpstreamErrorEvent{
+		Platform:           account.Platform,
+		AccountID:          account.ID,
+		AccountName:        account.Name,
+		UpstreamStatusCode: http.StatusBadGateway,
+		UpstreamRequestID:  upstreamRequestID,
+		Kind:               "empty_stream_failover",
+		Message:            anthropicEmptyStreamUpstreamMessage,
+		Detail:             reason,
+	})
+	logger.LegacyPrintf("service.gateway", "[Anthropic Passthrough] empty stream before commit, failover account=%d(%s) request_id=%s reason=%s",
+		account.ID, account.Name, upstreamRequestID, reason)
+	return &UpstreamFailoverError{
+		StatusCode:      http.StatusBadGateway,
+		ResponseBody:    anthropicEmptyStreamErrorBody(),
+		ResponseHeaders: headers,
+		Scope:           GatewayFailureScopeAccount,
+		Reason:          GatewayFailureReason("anthropic_empty_stream"),
+	}
+}
+
 func (s *GatewayService) buildUpstreamRequestAnthropicAPIKeyPassthrough(
 	ctx context.Context,
 	c *gin.Context,
@@ -662,6 +717,15 @@ func (s *GatewayService) handleStreamingResponseAnthropicAPIKeyPassthrough(
 		select {
 		case ev, ok := <-events:
 			if !ok {
+				// 上游把流关了却一个语义事件都没送到：此刻 prelude 还没写出客户端，
+				// failover 窗口完好，必须先切号。一旦 flushPendingPrelude() 把
+				// message_start 写出去，200 就钉死在客户端上，只能报 empty/malformed。
+				// 客户端已经走了就别切了：留给下面的 flush 去发现断开并保住已观测的 usage。
+				if !sawTerminalEvent && !streamCommitted && !clientDisconnected &&
+					c.Request.Context().Err() == nil {
+					pendingPreludeLines = pendingPreludeLines[:0]
+					return nil, s.newAnthropicEmptyStreamFailoverError(c, resp, account, "missing terminal event")
+				}
 				flushPendingPrelude()
 				if !clientDisconnected {
 					// 兜底补刷，确保最后一个未以空行结尾的事件也能及时送达客户端。
@@ -679,6 +743,19 @@ func (s *GatewayService) handleStreamingResponseAnthropicAPIKeyPassthrough(
 				return &streamingResult{usage: usage, firstTokenMs: firstTokenMs, clientDisconnect: clientDisconnected}, nil
 			}
 			if ev.err != nil {
+				// 上游还没吐出任何一行就读失败：这是明确的死上游，且 prelude 为空，
+				// 切号最安全。已经收到 message_start 的中途断流不在此列——那时故障方
+				// 可能是客户端，仍走下面的 flush 以便通过写失败发现客户端已断开并保住计量。
+				// 另排除三类换号无用的情形：客户端取消/超时与账号无关，行超长是本地
+				// MaxLineSize 配置问题。
+				if !sawTerminalEvent && !streamCommitted && !clientDisconnected &&
+					len(pendingPreludeLines) == 0 &&
+					c.Request.Context().Err() == nil &&
+					!errors.Is(ev.err, context.Canceled) &&
+					!errors.Is(ev.err, context.DeadlineExceeded) &&
+					!errors.Is(ev.err, bufio.ErrTooLong) {
+					return nil, s.newAnthropicEmptyStreamFailoverError(c, resp, account, fmt.Sprintf("stream read error before any data: %v", ev.err))
+				}
 				flushPendingPrelude()
 				if sawTerminalEvent {
 					return &streamingResult{usage: usage, firstTokenMs: firstTokenMs, clientDisconnect: clientDisconnected}, nil

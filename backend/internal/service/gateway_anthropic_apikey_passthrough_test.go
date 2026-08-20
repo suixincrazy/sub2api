@@ -1139,6 +1139,50 @@ func TestGatewayService_AnthropicAPIKeyPassthrough_MissingTerminalEventReturnsEr
 		rateLimitService: &RateLimitService{},
 	}
 
+	// content_block_start 会提交响应：字节已写出客户端，无法再 failover，
+	// 缺少终止事件只能作为普通错误返回，并保留已计量的 usage 以免漏记。
+	resp := &http.Response{
+		StatusCode: http.StatusOK,
+		Header:     http.Header{"Content-Type": []string{"text/event-stream"}},
+		Body: io.NopCloser(strings.NewReader(strings.Join([]string{
+			`data: {"type":"message_start","message":{"usage":{"input_tokens":11}}}`,
+			"",
+			`data: {"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}`,
+			"",
+			`data: {"type":"message_delta","usage":{"output_tokens":5}}`,
+			"",
+		}, "\n"))),
+	}
+
+	result, err := svc.handleStreamingResponseAnthropicAPIKeyPassthrough(context.Background(), resp, c, &Account{ID: 1}, time.Now(), "claude-3-7-sonnet-20250219")
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "missing terminal event")
+	require.NotNil(t, result)
+
+	var failoverErr *UpstreamFailoverError
+	require.False(t, errors.As(err, &failoverErr), "已写出客户端的流不得再触发 failover")
+	require.NotEmpty(t, rec.Body.String(), "提交后的 prelude 应已写给客户端")
+}
+
+// 上游 200 却只送来非提交性前奏就断流时（Claude Code 报 "API returned an empty or
+// malformed response (HTTP 200)"），必须丢弃 prelude 并转成账号级 failover，
+// 而不是把半条流 flush 给客户端。
+func TestGatewayService_AnthropicAPIKeyPassthrough_EmptyStreamBeforeCommitFailsOver(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	rec := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(rec)
+	c.Request = httptest.NewRequest(http.MethodPost, "/v1/messages", nil)
+
+	svc := &GatewayService{
+		cfg: &config.Config{
+			Gateway: config.GatewayConfig{
+				MaxLineSize: defaultMaxLineSize,
+			},
+		},
+		rateLimitService: &RateLimitService{},
+	}
+
 	resp := &http.Response{
 		StatusCode: http.StatusOK,
 		Header:     http.Header{"Content-Type": []string{"text/event-stream"}},
@@ -1152,8 +1196,19 @@ func TestGatewayService_AnthropicAPIKeyPassthrough_MissingTerminalEventReturnsEr
 
 	result, err := svc.handleStreamingResponseAnthropicAPIKeyPassthrough(context.Background(), resp, c, &Account{ID: 1}, time.Now(), "claude-3-7-sonnet-20250219")
 	require.Error(t, err)
-	require.Contains(t, err.Error(), "missing terminal event")
-	require.NotNil(t, result)
+	require.Nil(t, result, "failover 错误必须 result=nil，否则会重复计费")
+
+	var failoverErr *UpstreamFailoverError
+	require.True(t, errors.As(err, &failoverErr))
+	require.Equal(t, http.StatusBadGateway, failoverErr.StatusCode)
+	require.Equal(t, GatewayFailureScopeAccount, failoverErr.Scope)
+	require.Equal(t, GatewayFailureReason("anthropic_empty_stream"), failoverErr.Reason)
+	require.False(t, failoverErr.RetryableOnSameAccount)
+	require.Contains(t, string(failoverErr.ResponseBody), "anthropic_empty_stream")
+
+	// 一个字节都不能写出去，否则 handler 的防腐闸门会禁掉 failover。
+	require.Empty(t, rec.Body.String())
+	require.False(t, c.Writer.Written())
 }
 
 func TestGatewayService_AnthropicAPIKeyPassthrough_ForwardDirect_NonStreamingSuccess(t *testing.T) {
@@ -1555,9 +1610,13 @@ func TestGatewayService_AnthropicAPIKeyPassthrough_StreamingReadError(t *testing
 
 	result, err := svc.handleStreamingResponseAnthropicAPIKeyPassthrough(context.Background(), resp, c, &Account{ID: 6}, time.Now(), "claude-3-7-sonnet-20250219")
 	require.Error(t, err)
-	require.Contains(t, err.Error(), "stream read error")
-	require.NotNil(t, result)
-	require.False(t, result.clientDisconnect)
+	// 上游一行都没吐出就读失败：prelude 为空、客户端还在，转成账号级 failover。
+	require.Nil(t, result, "failover 错误必须 result=nil，否则会重复计费")
+	var failoverErr *UpstreamFailoverError
+	require.True(t, errors.As(err, &failoverErr))
+	require.Equal(t, http.StatusBadGateway, failoverErr.StatusCode)
+	require.Equal(t, GatewayFailureReason("anthropic_empty_stream"), failoverErr.Reason)
+	require.Empty(t, rec.Body.String())
 }
 
 func TestGatewayService_AnthropicAPIKeyPassthrough_StreamingTimeoutAfterClientDisconnect(t *testing.T) {
