@@ -413,6 +413,8 @@ func (s *GatewayService) newAnthropicSafetyFailoverError(c *gin.Context, resp *h
 
 const anthropicEmptyStreamUpstreamMessage = "Anthropic upstream returned an empty SSE stream with no terminal event"
 
+const anthropicTruncatedStreamUpstreamMessage = "Anthropic upstream truncated the SSE stream after it was committed to the client"
+
 func anthropicEmptyStreamErrorBody() []byte {
 	body, err := json.Marshal(map[string]any{
 		"type": "error",
@@ -426,6 +428,43 @@ func anthropicEmptyStreamErrorBody() []byte {
 		return []byte(`{"type":"error","error":{"type":"upstream_error","code":"anthropic_empty_stream","message":"Anthropic upstream returned an empty SSE stream with no terminal event"}}`)
 	}
 	return body
+}
+
+// reportStreamTruncatedAfterCommit 记录「流已提交给客户端后被上游截断」。
+//
+// 这类失败无法在本次请求内 failover：字节已经 flush，200 已经钉死，改写只会腐化
+// 响应（handler 层的 c.Writer.Size() 守卫正是为此）。但它仍然是确定的上游故障，
+// 必须留下两个痕迹，否则客户端紧接着发来的重试会被粘性送回同一个坏账号：
+//  1. ops 错误看板可见的归因记录——否则 ops_error_logs 只有一行 upstream_status_code=null
+//     的空壳，运维无法判断故障方；
+//  2. 账号健康度惩罚，与空闲超时同一套 stream_timeout_settings 开关/阈值，
+//     达阈后账号临时不可调度，下一次请求自然落到别的账号。
+//
+// 调用方必须已排除客户端侧原因（clientDisconnected / ctx 取消）与本地配置原因
+// （bufio.ErrTooLong）：那些换号无用，罚账号只会误伤。
+func (s *GatewayService) reportStreamTruncatedAfterCommit(ctx context.Context, c *gin.Context, resp *http.Response, account *Account, model, reason string) {
+	if account == nil {
+		return
+	}
+	upstreamRequestID := ""
+	if resp != nil {
+		upstreamRequestID = resp.Header.Get("x-request-id")
+	}
+	appendOpsUpstreamError(c, OpsUpstreamErrorEvent{
+		Platform:           account.Platform,
+		AccountID:          account.ID,
+		AccountName:        account.Name,
+		UpstreamStatusCode: http.StatusBadGateway,
+		UpstreamRequestID:  upstreamRequestID,
+		Kind:               "stream_truncated_after_commit",
+		Message:            anthropicTruncatedStreamUpstreamMessage,
+		Detail:             reason,
+	})
+	logger.LegacyPrintf("service.gateway", "[Anthropic Passthrough] stream truncated after commit, no failover possible: account=%d(%s) model=%s request_id=%s reason=%s",
+		account.ID, account.Name, model, upstreamRequestID, reason)
+	if s.rateLimitService != nil {
+		s.rateLimitService.HandleStreamTruncated(ctx, account, model)
+	}
 }
 
 // newAnthropicEmptyStreamFailoverError 把「上游 200 但整条 SSE 只送来非提交性前奏
@@ -738,6 +777,9 @@ func (s *GatewayService) handleStreamingResponseAnthropicAPIKeyPassthrough(
 							return &streamingResult{usage: usage, firstTokenMs: firstTokenMs, clientDisconnect: true}, fmt.Errorf("stream usage incomplete after timeout")
 						}
 					}
+					if !clientDisconnected && c.Request.Context().Err() == nil {
+						s.reportStreamTruncatedAfterCommit(ctx, c, resp, account, model, "upstream closed stream without terminal event")
+					}
 					return &streamingResult{usage: usage, firstTokenMs: firstTokenMs, clientDisconnect: clientDisconnected}, fmt.Errorf("stream usage incomplete: missing terminal event")
 				}
 				return &streamingResult{usage: usage, firstTokenMs: firstTokenMs, clientDisconnect: clientDisconnected}, nil
@@ -770,6 +812,7 @@ func (s *GatewayService) handleStreamingResponseAnthropicAPIKeyPassthrough(
 					logger.LegacyPrintf("service.gateway", "[Anthropic passthrough] SSE line too long: account=%d max_size=%d error=%v", account.ID, maxLineSize, ev.err)
 					return &streamingResult{usage: usage, firstTokenMs: firstTokenMs}, ev.err
 				}
+				s.reportStreamTruncatedAfterCommit(ctx, c, resp, account, model, "stream read error after commit: "+sanitizeStreamError(ev.err))
 				return &streamingResult{usage: usage, firstTokenMs: firstTokenMs}, fmt.Errorf("stream read error: %w", ev.err)
 			}
 
@@ -1059,13 +1102,64 @@ func (s *GatewayService) handleNonStreamingResponseAnthropicAPIKeyPassthrough(
 	}
 
 	writeAnthropicPassthroughResponseHeaders(c.Writer.Header(), resp.Header, s.responseHeaderFilter)
-	contentType := strings.TrimSpace(resp.Header.Get("Content-Type"))
-	if contentType == "" {
-		contentType = "application/json"
-	}
+	contentType := normalizeJSONBodyContentType(c.Writer.Header(), resp.Header.Get("Content-Type"), body)
 	body = reverseToolNamesIfPresent(c, body)
 	c.Data(resp.StatusCode, contentType, body)
 	return usage, nil
+}
+
+// normalizeJSONBodyContentType 修正上游对 JSON 响应体的错误 Content-Type 声明。
+//
+// 透传分支原样复制上游 Content-Type，但中转类上游（oneapi/自建 relay）常把
+// /v1/messages 的 JSON 响应标成 text/plain，严格客户端会直接判定
+// "API returned an empty or malformed response (HTTP 200)" 并丢弃整个响应——
+// 哪怕响应体本身是完好的 Anthropic message。非透传分支早就默认 application/json
+// （见 handleNonStreamingResponse），这里补齐同样的保证。
+//
+// 只在响应体确实是 JSON 且上游声明不是 JSON 媒体类型时改写：非 JSON 体（如上游
+// 直接吐纯文本错误）保持原声明，不掩盖上游真实行为。dst 非空时必须一并覆盖，
+// 因为 WriteFilteredHeaders 已把上游值写进 header map，而 gin 的 writeContentType
+// 只在 header 缺失时才会写入。
+func normalizeJSONBodyContentType(dst http.Header, upstreamContentType string, body []byte) string {
+	contentType := strings.TrimSpace(upstreamContentType)
+	// 上游已声明 JSON：原样保留（含 charset 等参数）。
+	if isJSONMediaType(contentType) {
+		return contentType
+	}
+	// 响应体不是 JSON：不掩盖上游的真实声明，仅在其缺失时兜底。
+	if !bodyLooksLikeJSON(body) {
+		if contentType == "" {
+			return "application/json"
+		}
+		return contentType
+	}
+	if dst != nil {
+		dst.Set("Content-Type", "application/json")
+	}
+	return "application/json"
+}
+
+// isJSONMediaType 判断媒体类型是否为 JSON 家族（含 application/*+json 与 text/json）。
+func isJSONMediaType(contentType string) bool {
+	mediaType := strings.ToLower(strings.TrimSpace(contentType))
+	if idx := strings.IndexByte(mediaType, ';'); idx >= 0 {
+		mediaType = strings.TrimSpace(mediaType[:idx])
+	}
+	return mediaType == "application/json" ||
+		mediaType == "text/json" ||
+		strings.HasSuffix(mediaType, "+json")
+}
+
+// bodyLooksLikeJSON 只做首字符判定 + json.Valid 校验，避免对大响应体反复反序列化。
+func bodyLooksLikeJSON(body []byte) bool {
+	trimmed := bytes.TrimSpace(body)
+	if len(trimmed) == 0 {
+		return false
+	}
+	if trimmed[0] != '{' && trimmed[0] != '[' {
+		return false
+	}
+	return json.Valid(trimmed)
 }
 
 func classifyAnthropicResponseInputAsCacheRead(body []byte, usage *ClaudeUsage) ([]byte, error) {

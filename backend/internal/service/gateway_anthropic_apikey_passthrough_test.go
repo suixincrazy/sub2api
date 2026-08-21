@@ -2187,3 +2187,90 @@ func TestGatewayService_AnthropicAPIKeyPassthrough_OrdinaryInvalidRequest400Does
 	require.Equal(t, http.StatusBadRequest, rec.Code)
 	require.Contains(t, rec.Body.String(), "messages must not be empty")
 }
+
+// 中转类上游（oneapi/自建 relay）常把 /v1/messages 的 JSON 响应标成 text/plain。
+// 严格客户端会直接判定 "API returned an empty or malformed response (HTTP 200)"
+// 并丢弃整个响应，哪怕响应体本身完好。透传分支必须把 JSON 体的 Content-Type
+// 归正成 application/json。
+func TestGatewayService_AnthropicAPIKeyPassthrough_NonStreamingNormalizesJSONContentType(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	rec := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(rec)
+	c.Request = httptest.NewRequest(http.MethodPost, "/v1/messages", nil)
+
+	upstreamJSON := `{"id":"msg_1","type":"message","usage":{"input_tokens":12,"output_tokens":7}}`
+	resp := &http.Response{
+		StatusCode: http.StatusOK,
+		Header: http.Header{
+			"Content-Type": []string{"text/plain; charset=utf-8"},
+			"x-request-id": []string{"rid-textplain"},
+		},
+		Body: io.NopCloser(strings.NewReader(upstreamJSON)),
+	}
+	svc := &GatewayService{cfg: &config.Config{}, rateLimitService: &RateLimitService{}}
+
+	usage, err := svc.handleNonStreamingResponseAnthropicAPIKeyPassthrough(context.Background(), resp, c, &Account{ID: 1})
+	require.NoError(t, err)
+	require.NotNil(t, usage)
+
+	// 响应体必须逐字节原样透传，只有声明被纠正。
+	require.Equal(t, upstreamJSON, rec.Body.String())
+	require.Equal(t, "application/json", rec.Header().Get("Content-Type"))
+	require.Len(t, rec.Header().Values("Content-Type"), 1, "不得同时留下上游的 text/plain")
+}
+
+// 上游已声明 JSON 时不得改写（含 charset 等参数原样保留）。
+func TestGatewayService_AnthropicAPIKeyPassthrough_NonStreamingKeepsUpstreamJSONContentType(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	rec := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(rec)
+	c.Request = httptest.NewRequest(http.MethodPost, "/v1/messages", nil)
+
+	resp := &http.Response{
+		StatusCode: http.StatusOK,
+		Header:     http.Header{"Content-Type": []string{"application/json; charset=utf-8"}},
+		Body:       io.NopCloser(strings.NewReader(`{"id":"msg_1","type":"message"}`)),
+	}
+	svc := &GatewayService{cfg: &config.Config{}, rateLimitService: &RateLimitService{}}
+
+	_, err := svc.handleNonStreamingResponseAnthropicAPIKeyPassthrough(context.Background(), resp, c, &Account{ID: 1})
+	require.NoError(t, err)
+	require.Equal(t, "application/json; charset=utf-8", rec.Header().Get("Content-Type"))
+}
+
+func TestNormalizeJSONBodyContentType(t *testing.T) {
+	cases := []struct {
+		name     string
+		upstream string
+		body     string
+		want     string
+	}{
+		{"JSON 体被误标 text/plain 时归正", "text/plain; charset=utf-8", `{"a":1}`, "application/json"},
+		{"JSON 数组体同样归正", "text/plain", `[1,2]`, "application/json"},
+		{"上游已声明 JSON 则原样保留", "application/json; charset=utf-8", `{"a":1}`, "application/json; charset=utf-8"},
+		{"厂商 +json 媒体类型视为 JSON", "application/vnd.foo+json", `{"a":1}`, "application/vnd.foo+json"},
+		{"text/json 视为 JSON", "text/json", `{"a":1}`, "text/json"},
+		{"上游缺失声明时兜底 JSON", "", `{"a":1}`, "application/json"},
+		// 体不是 JSON 时保留上游真实声明，不掩盖上游行为。
+		{"纯文本体保留上游声明", "text/plain", `upstream is down`, "text/plain"},
+		{"截断的非法 JSON 保留上游声明", "text/plain", `{"a":`, "text/plain"},
+		{"SSE 体保留上游声明", "text/event-stream", "data: {}\n\n", "text/event-stream"},
+		{"空体且无声明时兜底 JSON", "", ``, "application/json"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			header := http.Header{}
+			if tc.upstream != "" {
+				header.Set("Content-Type", tc.upstream)
+			}
+			got := normalizeJSONBodyContentType(header, tc.upstream, []byte(tc.body))
+			require.Equal(t, tc.want, got)
+			// header map 若留有值，必须与返回值一致：gin 的 writeContentType 只在
+			// header 缺失时才写入，残留的上游旧值会覆盖掉我们的纠正结果。
+			// 上游未声明时 map 本就为空，交给 gin 写入即可。
+			if actual := header.Get("Content-Type"); actual != "" {
+				require.Equal(t, tc.want, actual, "header map 残留值会覆盖返回的 Content-Type")
+			}
+		})
+	}
+}
