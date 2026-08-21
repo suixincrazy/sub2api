@@ -833,6 +833,7 @@ func (s *GatewayService) handleStreamingResponse(ctx context.Context, resp *http
 	needModelReplace := originalModel != mappedModel
 	clientDisconnected := false // 客户端断开标志，断开后继续读取上游以获取完整usage
 	sawTerminalEvent := false
+	refusalReported := false // 非透传路径没有提交前拒答检测，任何位置的 refusal 都只能事后归因
 	useNoopDeltaKeepalive := c != nil && c.Request != nil && shouldUseClaudeCodeNoopDeltaKeepalive(c.GetHeader("User-Agent"))
 	noopDeltaKeepaliveBlockIndex := -1
 	noopDeltaKeepaliveDeltaType := ""
@@ -888,6 +889,13 @@ func (s *GatewayService) handleStreamingResponse(ctx context.Context, resp *http
 
 		eventType, _ := event["type"].(string)
 		observer.ObserveAnthropic([]byte(dataLine))
+		// 这条路径完全没有拒答 failover（不像透传分支有 !streamCommitted 的提交前窗口），
+		// 所以拒答只能事后归因 + 罚账号，好让客户端下一发重试落到别的号，而不是被粘性
+		// 原样送回同一个坏账号。
+		if !refusalReported && isAnthropicSafetyRefusalResponse(http.StatusForbidden, []byte(dataLine)) {
+			refusalReported = true
+			s.reportSafetyRefusalWithoutFailover(ctx, c, resp, account, originalModel, "refusal on non-passthrough stream", []byte(dataLine))
+		}
 		if eventName == "" {
 			eventName = eventType
 		}
@@ -1393,6 +1401,14 @@ func (s *GatewayService) handleNonStreamingResponse(ctx context.Context, resp *h
 	}
 	observer.ObserveAnthropic(body)
 
+	// 200 响应体里的 stop_reason:refusal 与透传分支（gateway_anthropic_passthrough.go
+	// 的非流式段）同样处理：此刻还没向客户端写任何字节，failover 窗口完好，必须切号。
+	// 把拒答原样透传会让 Claude Code 触发 scope=session 的 model_refusal_fallback，
+	// 整个会话被钉死降级，之后再也没机会落到副号。
+	if resp.StatusCode >= http.StatusOK && resp.StatusCode < http.StatusMultipleChoices &&
+		isAnthropicSafetyRefusalResponse(resp.StatusCode, body) {
+		return nil, s.newAnthropicSafetyFailoverError(c, resp, account, body)
+	}
 	// 解析usage
 	var response struct {
 		Usage ClaudeUsage `json:"usage"`
