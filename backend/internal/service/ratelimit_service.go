@@ -2456,6 +2456,18 @@ func (s *RateLimitService) HandleStreamTruncated(ctx context.Context, account *A
 		"Stream truncated without terminal event for model: "+model)
 }
 
+// HandleStreamRefused 处理「安全拒答到达时已经切不了号」。
+//
+// 与 HandleStreamTruncated / HandleStreamTimeout 并列：三者都表示这个账号交付了一条
+// 客户端无法使用的响应，因此共用 stream_timeout_settings 的开关/阈值/计数窗口，只在
+// 落库 keyword 与错误文案上区分。拒答的特殊之处在于它**账号特有**（同一请求换个账号
+// 常常就过了），所以罚号冷却正是让下一发重试落到别的账号的手段——否则粘性会把重试原样
+// 送回同一个坏账号，表现为「一直报 safeguards 却从不主副切换」。
+func (s *RateLimitService) HandleStreamRefused(ctx context.Context, account *Account, model string) bool {
+	return s.handleStreamDeliveryFailure(ctx, account, model, "stream_safety_refusal",
+		"Safeguards refusal could not be failed over for model: "+model)
+}
+
 // HandleStreamTimeout 处理流数据超时
 // 根据系统设置决定是否标记账户为临时不可调度或错误状态
 // 返回是否应该停止该账号的调度

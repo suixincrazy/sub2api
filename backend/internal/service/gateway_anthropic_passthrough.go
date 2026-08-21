@@ -366,14 +366,45 @@ func hasAnthropicRefusalStopReason(body []byte) bool {
 	return false
 }
 
+// anthropicSSEPayloadCommitsResponse 判断这一帧 SSE 一旦写给客户端，本次响应是否就被
+// 钉死（200 已发出、字节已 flush，再 failover 只会腐化响应）。
+//
+// 两个例外都是「不含任何用户可见内容」的帧，不能因为它们放弃 failover 窗口：
+// 空思考块的 `content_block_start`（`thinking:""`）与随后的 `signature_delta`。
+// 上游的安全拒答恰好就是这个形状——空思考块 + `message_delta{stop_reason:"refusal"}`
+// （实测 output_tokens=5，正文只有一个空 thinking 与一段 signature）。旧实现在
+// `content_block_start` 处就提交，于是携带 refusal 的 `message_delta` 只能被原样透传，
+// 客户端据此把整个会话钉死降级（Claude Code 的 model_refusal_fallback 是 scope=session），
+// 主号拒答后再也没机会切副号。把这两帧留在 prelude 里，拒答就能在提交前被捕获并真切号；
+// 正常响应的第一帧可见增量（text_delta / thinking_delta / input_json_delta）照旧立即
+// 提交，客户端观感不变，最坏情况只是纯 signature 响应推迟到 message_stop 才 flush。
 func anthropicSSEPayloadCommitsResponse(body []byte) bool {
 	trimmed := bytes.TrimSpace(body)
 	if bytes.Equal(trimmed, []byte("[DONE]")) || !json.Valid(trimmed) {
 		return true
 	}
-	switch gjson.GetBytes(trimmed, "type").String() {
-	case "content_block_start", "content_block_delta", "message_stop", "error":
+	parsed := gjson.ParseBytes(trimmed)
+	switch parsed.Get("type").String() {
+	case "content_block_start":
+		return !anthropicContentBlockIsContentlessThinking(parsed.Get("content_block"))
+	case "content_block_delta":
+		return !strings.EqualFold(strings.TrimSpace(parsed.Get("delta.type").String()), "signature_delta")
+	case "message_stop", "error":
 		return true
+	default:
+		return false
+	}
+}
+
+// anthropicContentBlockIsContentlessThinking 判定 content_block_start 携带的块是否是
+// 「尚无任何可见内容的思考块」。redacted_thinking 的载荷在 data 字段而非 thinking。
+// 只认这两种类型：text / tool_use 等块的起始帧一律照旧视为提交，不扩大改动面。
+func anthropicContentBlockIsContentlessThinking(block gjson.Result) bool {
+	switch strings.ToLower(strings.TrimSpace(block.Get("type").String())) {
+	case "thinking":
+		return strings.TrimSpace(block.Get("thinking").String()) == ""
+	case "redacted_thinking":
+		return strings.TrimSpace(block.Get("data").String()) == ""
 	default:
 		return false
 	}
@@ -414,6 +445,8 @@ func (s *GatewayService) newAnthropicSafetyFailoverError(c *gin.Context, resp *h
 const anthropicEmptyStreamUpstreamMessage = "Anthropic upstream returned an empty SSE stream with no terminal event"
 
 const anthropicTruncatedStreamUpstreamMessage = "Anthropic upstream truncated the SSE stream after it was committed to the client"
+
+const anthropicUnfailedOverRefusalUpstreamMessage = "Anthropic upstream returned a safeguards refusal that could no longer be failed over"
 
 func anthropicEmptyStreamErrorBody() []byte {
 	body, err := json.Marshal(map[string]any{
@@ -464,6 +497,53 @@ func (s *GatewayService) reportStreamTruncatedAfterCommit(ctx context.Context, c
 		account.ID, account.Name, model, upstreamRequestID, reason)
 	if s.rateLimitService != nil {
 		s.rateLimitService.HandleStreamTruncated(ctx, account, model)
+	}
+}
+
+// reportSafetyRefusalWithoutFailover 记录「安全拒答到达时已经切不了号」。
+//
+// 两个调用现场：透传流在 prelude 提交之后才收到 refusal 帧（此时 200 已钉死，
+// newAnthropicSafetyFailoverError 那条真切号的路走不了了）；以及非透传流——它压根没有
+// 提交前拒答检测，任何位置的 refusal 都只能事后归因。
+//
+// 必须留痕的理由与 reportStreamTruncatedAfterCommit 完全一致：不罚账号的话，客户端紧接着
+// 的重试会被粘性原样送回同一个坏账号，表现为「一直报 safeguards 却从不主副切换」。实测拒答
+// 是**账号特有**的（主号每帧被拒的同时，副号的同一请求成功），所以罚号换号确实有效。
+// 沿用 stream_timeout_settings 的开关/阈值/窗口（运维只需一个旋钮），只在 keyword 与文案上
+// 区分；线上阈值为 1 = 第一次拒答就把该账号冷却 1 分钟，下一发自然落到副号。
+//
+// 极端情形（提示词本身违规导致所有账号都拒）会让各账号各自冷却一个阈值窗口，代价可接受：
+// 冷却是分钟级临时态，且客户端此时无论换到哪个号都拿不到有效响应。
+func (s *GatewayService) reportSafetyRefusalWithoutFailover(ctx context.Context, c *gin.Context, resp *http.Response, account *Account, model, reason string, body []byte) {
+	if account == nil {
+		return
+	}
+	statusCode := http.StatusForbidden
+	upstreamRequestID := ""
+	if resp != nil {
+		upstreamRequestID = resp.Header.Get("x-request-id")
+		if resp.StatusCode != 0 && resp.StatusCode != http.StatusOK {
+			statusCode = resp.StatusCode
+		}
+	}
+	message := strings.TrimSpace(extractUpstreamErrorMessage(body))
+	if message == "" {
+		message = anthropicUnfailedOverRefusalUpstreamMessage
+	}
+	appendOpsUpstreamError(c, OpsUpstreamErrorEvent{
+		Platform:           account.Platform,
+		AccountID:          account.ID,
+		AccountName:        account.Name,
+		UpstreamStatusCode: statusCode,
+		UpstreamRequestID:  upstreamRequestID,
+		Kind:               "safety_refusal_no_failover",
+		Message:            sanitizeUpstreamErrorMessage(message),
+		Detail:             reason,
+	})
+	logger.LegacyPrintf("service.gateway", "[Anthropic] safeguards refusal, too late to failover: account=%d(%s) model=%s request_id=%s reason=%s body=%s",
+		account.ID, account.Name, model, upstreamRequestID, reason, truncateString(string(body), 1000))
+	if s.rateLimitService != nil {
+		s.rateLimitService.HandleStreamRefused(ctx, account, model)
 	}
 }
 
@@ -703,11 +783,20 @@ func (s *GatewayService) handleStreamingResponseAnthropicAPIKeyPassthrough(
 	inPartialEvent := false
 	pendingPreludeLines := make([]string, 0, 12)
 	streamCommitted := c.Writer.Written()
+	refusalReported := false
 
 	processLine := func(line string) {
 		if data, ok := extractAnthropicSSEDataLine(line); ok {
 			trimmed := strings.TrimSpace(data)
 			observer.ObserveAnthropic([]byte(trimmed))
+			// 提交之后才到的拒答：本次请求已无法切号（字节已 flush、200 已钉死），但仍必须
+			// 留下归因与账号惩罚，否则客户端的下一发重试会被粘性送回同一个坏账号。提交之前
+			// 到的拒答不会走到这里——它在 !streamCommitted 分支就 return 成真 failover 了。
+			if !refusalReported && trimmed != "" && trimmed != "[DONE]" &&
+				isAnthropicSafetyRefusalResponse(http.StatusForbidden, []byte(trimmed)) {
+				refusalReported = true
+				s.reportSafetyRefusalWithoutFailover(ctx, c, resp, account, model, "refusal arrived after stream commit", []byte(trimmed))
+			}
 			if anthropicStreamEventIsTerminal("", trimmed) {
 				sawTerminalEvent = true
 			}
