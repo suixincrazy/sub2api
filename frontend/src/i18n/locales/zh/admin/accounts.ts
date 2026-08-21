@@ -1022,6 +1022,10 @@ export default {
       bedrockApiKeyLeaveEmpty: '留空以保持当前密钥',
       apiKeyIsRequired: 'API Key 是必需的',
       leaveEmptyToKeep: '留空以保持当前密钥',
+      apiKeyLoading: '正在读取当前密钥…',
+      apiKeyPrefilled: '已回填当前密钥，直接修改即可；清空则保持原值不变',
+      apiKeyShow: '显示密钥',
+      apiKeyHide: '隐藏密钥',
       // Upstream type
       upstream: {
         baseUrl: '上游 Base URL',

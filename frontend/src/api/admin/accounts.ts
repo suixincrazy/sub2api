@@ -6,6 +6,7 @@
 import { apiClient } from '../client'
 import type {
   Account,
+  AccountCredentialsReveal,
   CreateAccountRequest,
   UpdateAccountRequest,
   PaginatedResponse,
@@ -129,6 +130,20 @@ export async function listWithEtag(
  */
 export async function getById(id: number): Promise<Account> {
   const { data } = await apiClient.get<Account>(`/admin/accounts/${id}`)
+  return data
+}
+
+/**
+ * 读取账号凭证原文（api_key / token 等）。
+ *
+ * 列表与 getById 的 credentials 是脱敏过的，只有这个接口回传原文，因此后端挂了
+ * step-up 2FA 门控并会留审计记录。仅在用户明确要查看/编辑凭证时调用，不要拿它
+ * 替代 getById 做常规读取。
+ */
+export async function getCredentials(id: number): Promise<AccountCredentialsReveal> {
+  const { data } = await apiClient.get<AccountCredentialsReveal>(
+    `/admin/accounts/${id}/credentials`
+  )
   return data
 }
 
@@ -989,6 +1004,7 @@ export const accountsAPI = {
   list,
   listWithEtag,
   getById,
+  getCredentials,
   create,
   duplicate,
   update,

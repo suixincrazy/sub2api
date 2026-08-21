@@ -28,6 +28,24 @@ func RedactCredentials(in map[string]any) (out map[string]any, status map[string
 	return out, status
 }
 
+// RevealCredentials 返回 in 的浅拷贝，敏感子键**不做剥离**——供凭证查看接口回填编辑表单。
+//
+// 与 RedactCredentials 相反，是全库唯一允许把 api_key / token 原文序列化给前端的路径，
+// 调用方必须已通过 step-up 2FA 门控且该路由已进审计白名单。新增调用点前请先确认这两条。
+//
+// 输入 nil 时返回 nil（与 RedactCredentials 保持一致，避免响应里出现空对象）。
+// 拷贝是浅的：顶层键值独立，嵌套 map/slice 仍与入参共享，因此返回值只可用于序列化、不可改写。
+func RevealCredentials(in map[string]any) map[string]any {
+	if in == nil {
+		return nil
+	}
+	out := make(map[string]any, len(in))
+	for k, v := range in {
+		out[k] = v
+	}
+	return out
+}
+
 // isCredentialValuePresent 判断值是否"存在且非零"。空字符串、nil、false 均视为未配置；
 // 其余非零类型（数字、对象、字符串等）视为已配置。
 func isCredentialValuePresent(v any) bool {
