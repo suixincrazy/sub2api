@@ -99,3 +99,26 @@ func TestRedactCredentials_AllKnownSensitiveKeys(t *testing.T) {
 		require.True(t, status["has_"+k], "key %s 应在 status 中标记为已配置", k)
 	}
 }
+
+func TestRevealCredentials_NilInput(t *testing.T) {
+	require.Nil(t, RevealCredentials(nil))
+}
+
+func TestRevealCredentials_KeepsSensitiveKeys(t *testing.T) {
+	in := map[string]any{
+		"api_key":       "sk-secret",
+		"refresh_token": "rt-secret",
+		"base_url":      "https://api.example.com",
+	}
+	out := RevealCredentials(in)
+	require.Equal(t, "sk-secret", out["api_key"])
+	require.Equal(t, "rt-secret", out["refresh_token"])
+	require.Equal(t, "https://api.example.com", out["base_url"])
+}
+
+func TestRevealCredentials_ShallowCopyDoesNotAliasTopLevel(t *testing.T) {
+	in := map[string]any{"api_key": "sk-secret"}
+	out := RevealCredentials(in)
+	out["api_key"] = "overwritten"
+	require.Equal(t, "sk-secret", in["api_key"], "顶层键改写不应影响入参")
+}

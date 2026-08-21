@@ -958,6 +958,10 @@ export default {
       bedrockApiKeyLeaveEmpty: 'Leave empty to keep current key',
       apiKeyIsRequired: 'API Key is required',
       leaveEmptyToKeep: 'Leave empty to keep current key',
+      apiKeyLoading: 'Loading current key...',
+      apiKeyPrefilled: 'Current key loaded; edit it directly, or clear it to keep the existing value',
+      apiKeyShow: 'Show key',
+      apiKeyHide: 'Hide key',
       // Upstream type
       upstream: {
         baseUrl: 'Upstream Base URL',

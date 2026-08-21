@@ -775,6 +775,37 @@ func (h *AccountHandler) GetByID(c *gin.Context) {
 	response.Success(c, h.buildAccountResponseWithRuntime(c.Request.Context(), account))
 }
 
+// GetCredentials 返回账号凭证原文，供编辑弹窗回填 api_key 等敏感字段。
+//
+// 常规详情/列表接口一律经 dto.RedactCredentials 脱敏，本接口是唯一例外，所以：
+//   - 路由挂 step-up 2FA 门控（与账号导出 GET /accounts/data 同等对待）
+//   - 路由进 auditSensitiveReads 白名单，每次读取留审计记录
+//
+// 不复用 GetByID 加查询参数，是为了避免把原文顺带塞进它现有的调用方——
+// 渠道页会对一批 id 逐个 getById、分组页与监控表单也在用它。
+//
+// GET /api/v1/admin/accounts/:id/credentials
+func (h *AccountHandler) GetCredentials(c *gin.Context) {
+	accountID, err := strconv.ParseInt(c.Param("id"), 10, 64)
+	if err != nil {
+		response.BadRequest(c, "Invalid account ID")
+		return
+	}
+
+	account, err := h.adminService.GetAccount(c.Request.Context(), accountID)
+	if err != nil {
+		response.ErrorFrom(c, err)
+		return
+	}
+
+	response.Success(c, gin.H{
+		"id":          account.ID,
+		"type":        account.Type,
+		"platform":    account.Platform,
+		"credentials": dto.RevealCredentials(account.Credentials),
+	})
+}
+
 // CheckMixedChannel handles checking mixed channel risk for account-group binding.
 // POST /api/v1/admin/accounts/check-mixed-channel
 func (h *AccountHandler) CheckMixedChannel(c *gin.Context) {

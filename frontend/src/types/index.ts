@@ -1109,6 +1109,19 @@ export interface OllamaCloudUsageSettings {
   debounce_minutes: number
 }
 
+/**
+ * GET /admin/accounts/:id/credentials 的响应：凭证原文，未脱敏。
+ *
+ * 后端对该路由挂了 step-up 2FA 门控并记审计日志，因此只在用户明确要查看或编辑
+ * 凭证时请求，拿到后不要写进任何缓存 / store。
+ */
+export interface AccountCredentialsReveal {
+  id: number
+  type: AccountType
+  platform: AccountPlatform
+  credentials?: Record<string, unknown>
+}
+
 export interface Account {
   id: number
   name: string
@@ -1119,6 +1132,7 @@ export interface Account {
   // api_key / session_key / cookie / aws_secret_access_key / aws_session_token /
   // service_account_json / service_account / private_key 不会出现，
   // 改为通过 credentials_status.has_<key> 暴露存在性。
+  // 需要原文时单独调 accountsAPI.getCredentials(id)（见 AccountCredentialsReveal）。
   credentials?: Record<string, unknown>
   credentials_status?: Record<string, boolean>
   ollama_cloud_usage?: OllamaCloudUsageState

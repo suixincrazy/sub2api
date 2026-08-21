@@ -120,27 +120,37 @@
         </div>
         <div>
           <label class="input-label">{{ t('admin.accounts.apiKey') }}</label>
-          <input
-            v-model="editApiKey"
-            type="password"
-            class="input font-mono"
-            autocomplete="new-password"
-            data-1p-ignore
-            data-lpignore="true"
-            data-bwignore="true"
-            :placeholder="
-              account.platform === 'openai'
-                ? 'sk-proj-...'
-                : account.platform === 'gemini'
-                  ? 'AIza...'
-                  : account.platform === 'antigravity'
-                    ? 'sk-...'
-                    : account.platform === 'grok'
-                      ? 'xai-...'
-                      : 'sk-ant-...'
-            "
-          />
-          <p class="input-hint">{{ t('admin.accounts.leaveEmptyToKeep') }}</p>
+          <div class="relative">
+            <input
+              v-model="editApiKey"
+              :type="showApiKey ? 'text' : 'password'"
+              class="input pr-11 font-mono"
+              autocomplete="new-password"
+              data-1p-ignore
+              data-lpignore="true"
+              data-bwignore="true"
+              :placeholder="
+                account.platform === 'openai'
+                  ? 'sk-proj-...'
+                  : account.platform === 'gemini'
+                    ? 'AIza...'
+                    : account.platform === 'antigravity'
+                      ? 'sk-...'
+                      : account.platform === 'grok'
+                        ? 'xai-...'
+                        : 'sk-ant-...'
+              "
+            />
+            <button
+              type="button"
+              class="absolute inset-y-0 right-0 flex items-center pr-3.5 text-gray-400 transition-colors hover:text-gray-600 dark:hover:text-dark-300"
+              :aria-label="t(showApiKey ? 'admin.accounts.apiKeyHide' : 'admin.accounts.apiKeyShow')"
+              @click="showApiKey = !showApiKey"
+            >
+              <Icon :name="showApiKey ? 'eyeOff' : 'eye'" size="md" />
+            </button>
+          </div>
+          <p class="input-hint">{{ apiKeyHint }}</p>
         </div>
 
         <!-- Model Restriction Section (不适用于 Antigravity) -->
@@ -745,13 +755,23 @@
         </div>
         <div>
           <label class="input-label">{{ t('admin.accounts.upstream.apiKey') }}</label>
-          <input
-            v-model="editApiKey"
-            type="password"
-            class="input font-mono"
-            placeholder="sk-..."
-          />
-          <p class="input-hint">{{ t('admin.accounts.leaveEmptyToKeep') }}</p>
+          <div class="relative">
+            <input
+              v-model="editApiKey"
+              :type="showApiKey ? 'text' : 'password'"
+              class="input pr-11 font-mono"
+              placeholder="sk-..."
+            />
+            <button
+              type="button"
+              class="absolute inset-y-0 right-0 flex items-center pr-3.5 text-gray-400 transition-colors hover:text-gray-600 dark:hover:text-dark-300"
+              :aria-label="t(showApiKey ? 'admin.accounts.apiKeyHide' : 'admin.accounts.apiKeyShow')"
+              @click="showApiKey = !showApiKey"
+            >
+              <Icon :name="showApiKey ? 'eyeOff' : 'eye'" size="md" />
+            </button>
+          </div>
+          <p class="input-hint">{{ apiKeyHint }}</p>
         </div>
       </div>
 
@@ -2905,6 +2925,13 @@ interface TempUnschedRuleForm {
 const submitting = ref(false)
 const editBaseUrl = ref('https://api.anthropic.com')
 const editApiKey = ref('')
+// api_key 编辑框回填状态：showApiKey 控制明文/掩码，apiKeyPrefilled 表示当前值来自
+// 后端回填（用于提示文案区分"已回填"与"留空即保留"），apiKeyLoading 是取原文的进行中标记。
+// apiKeyLoadToken 用于丢弃切换账号后才返回的过期响应。
+const showApiKey = ref(false)
+const apiKeyPrefilled = ref(false)
+const apiKeyLoading = ref(false)
+let apiKeyLoadToken = 0
 
 // ── 国产供应商（Kimi / Zhipu / DeepSeek）account_mode / api_protocol 编辑 ──
 // account_mode 决定额度/余额监控路径，api_protocol 决定转发端点与格式；
@@ -3975,7 +4002,49 @@ const syncFormFromAccount = (newAccount: Account | null) => {
     selectedErrorCodes.value = []
   }
   editApiKey.value = ''
+  showApiKey.value = false
+  apiKeyPrefilled.value = false
 }
+
+// 回填已存的 api_key：列表与详情接口的 credentials 都是脱敏过的，必须单独取原文。
+// 该接口挂了 step-up 2FA 门控并记审计日志，所以只在账号确实存了 key 时才请求。
+// 取不到（门控未通过、账号被删等）就维持留空，提交逻辑按"留空即保留原值"处理，
+// 行为退回到未回填之前，不阻塞其它字段的编辑。
+async function loadExistingApiKey(account: Account): Promise<void> {
+  const token = ++apiKeyLoadToken
+  if (!account.credentials_status?.has_api_key) {
+    return
+  }
+  apiKeyLoading.value = true
+  try {
+    const revealed = await adminAPI.accounts.getCredentials(account.id)
+    if (token !== apiKeyLoadToken) {
+      return
+    }
+    const key = revealed.credentials?.api_key
+    if (typeof key === 'string' && key !== '') {
+      editApiKey.value = key
+      apiKeyPrefilled.value = true
+    }
+  } catch {
+    // 取不到原文就维持留空
+  } finally {
+    if (token === apiKeyLoadToken) {
+      apiKeyLoading.value = false
+    }
+  }
+}
+
+// api_key 输入框提示：正在取原文 / 已回填（清空会被当成保留原值）/ 尚未回填。
+const apiKeyHint = computed(() => {
+  if (apiKeyLoading.value) {
+    return t('admin.accounts.apiKeyLoading')
+  }
+  if (apiKeyPrefilled.value) {
+    return t('admin.accounts.apiKeyPrefilled')
+  }
+  return t('admin.accounts.leaveEmptyToKeep')
+})
 
 async function loadTLSProfiles() {
   try {
@@ -3994,6 +4063,7 @@ watch(
     }
     if (!wasShow || newAccount !== previousAccount) {
       syncFormFromAccount(newAccount)
+      loadExistingApiKey(newAccount)
       loadTLSProfiles()
     }
   },
