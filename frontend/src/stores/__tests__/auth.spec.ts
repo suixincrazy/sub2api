@@ -386,5 +386,81 @@ describe('useAuthStore', () => {
       const store = useAuthStore()
       expect(store.isSimpleMode).toBe(false)
     })
+
+    // run_mode 只能从服务端得知。不缓存的话每次刷新都会先按 'standard' 画一遍完整
+    // 侧边栏，等 /auth/me 回来再把 hideInSimpleMode 的项撤掉，表现为「菜单偶尔全
+    // 显示、一刷新又没了」。以下用例锁住"首帧就是正确模式"这个契约。
+    it('登录拿到的 run_mode 会落盘', async () => {
+      mockLogin.mockResolvedValue({
+        ...fakeAuthResponse,
+        user: { ...fakeUser, run_mode: 'simple' as const },
+      })
+      const store = useAuthStore()
+
+      await store.login({ email: 'test@example.com', password: '123456' })
+
+      expect(localStorage.getItem('auth_run_mode')).toBe('simple')
+    })
+
+    it('刷新页面时首帧直接采用缓存的 simple，不经过任何请求', () => {
+      localStorage.setItem('auth_run_mode', 'simple')
+      setActivePinia(createPinia())
+
+      const store = useAuthStore()
+
+      expect(store.isSimpleMode).toBe(true)
+      expect(mockGetCurrentUser).not.toHaveBeenCalled()
+    })
+
+    it('refreshUser 返回的 run_mode 会更新并落盘', async () => {
+      localStorage.setItem('auth_token', 'test-token-123')
+      localStorage.setItem('auth_user', JSON.stringify(fakeUser))
+      setActivePinia(createPinia())
+      const store = useAuthStore()
+      store.checkAuth()
+      mockGetCurrentUser.mockResolvedValue({ data: { ...fakeUser, run_mode: 'simple' } })
+
+      await store.refreshUser()
+
+      expect(store.isSimpleMode).toBe(true)
+      expect(localStorage.getItem('auth_run_mode')).toBe('simple')
+    })
+
+    it('非法 run_mode 被忽略，保留当前模式', async () => {
+      localStorage.setItem('auth_run_mode', 'simple')
+      localStorage.setItem('auth_token', 'test-token-123')
+      localStorage.setItem('auth_user', JSON.stringify(fakeUser))
+      setActivePinia(createPinia())
+      const store = useAuthStore()
+      store.checkAuth()
+      mockGetCurrentUser.mockResolvedValue({ data: { ...fakeUser, run_mode: 'bogus' } })
+
+      await store.refreshUser()
+
+      expect(store.isSimpleMode).toBe(true)
+      expect(localStorage.getItem('auth_run_mode')).toBe('simple')
+    })
+
+    it('缓存里是非法值时回落 standard', () => {
+      localStorage.setItem('auth_run_mode', 'bogus')
+      setActivePinia(createPinia())
+
+      expect(useAuthStore().isSimpleMode).toBe(false)
+    })
+
+    it('登出会清掉 run_mode 缓存', async () => {
+      mockLogin.mockResolvedValue({
+        ...fakeAuthResponse,
+        user: { ...fakeUser, run_mode: 'simple' as const },
+      })
+      mockLogout.mockResolvedValue(undefined)
+      const store = useAuthStore()
+      await store.login({ email: 'test@example.com', password: '123456' })
+
+      await store.logout()
+
+      expect(localStorage.getItem('auth_run_mode')).toBeNull()
+      expect(store.isSimpleMode).toBe(false)
+    })
   })
 })

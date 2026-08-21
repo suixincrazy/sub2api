@@ -18,11 +18,33 @@ const AUTH_TOKEN_KEY = 'auth_token'
 const AUTH_USER_KEY = 'auth_user'
 const REFRESH_TOKEN_KEY = 'refresh_token'
 const TOKEN_EXPIRES_AT_KEY = 'token_expires_at' // 存储过期时间戳而非有效期
+const RUN_MODE_KEY = 'auth_run_mode'
 const PENDING_AUTH_SESSION_KEY = 'pending_auth_session'
 const AUTO_REFRESH_INTERVAL = 60 * 1000 // 60 seconds for user data refresh
 const TOKEN_REFRESH_BUFFER = 120 * 1000 // 120 seconds before expiry to refresh token
 
 type PendingAuthTokenField = 'pending_auth_token' | 'pending_oauth_token'
+
+type RunMode = 'standard' | 'simple'
+
+function normalizeRunMode(value: unknown): RunMode | null {
+  return value === 'standard' || value === 'simple' ? value : null
+}
+
+/**
+ * run_mode 是服务端全局配置，只能从 /auth/me（或登录响应）得知。
+ * 不落盘的话每次刷新都会先按默认值 'standard' 画一遍完整菜单，等异步响应回来
+ * 再把 hideInSimpleMode 的菜单项撤掉——表现为「菜单偶尔全显示、一刷新又没了」。
+ * 所以缓存上一次已知的模式，让首帧就用正确值；服务端改了配置也会在下一次
+ * /auth/me 返回时自动纠正。
+ */
+function readPersistedRunMode(): RunMode {
+  try {
+    return normalizeRunMode(localStorage.getItem(RUN_MODE_KEY)) ?? 'standard'
+  } catch {
+    return 'standard'
+  }
+}
 
 interface PendingAuthSessionSummary {
   token: string
@@ -81,7 +103,7 @@ export const useAuthStore = defineStore('auth', () => {
   const token = ref<string | null>(null)
   const refreshTokenValue = ref<string | null>(null)
   const tokenExpiresAt = ref<number | null>(null) // 过期时间戳（毫秒）
-  const runMode = ref<'standard' | 'simple'>('standard')
+  const runMode = ref<RunMode>(readPersistedRunMode())
   const pendingAuthSession = ref<PendingAuthSessionSummary | null>(null)
   let refreshIntervalId: ReturnType<typeof setInterval> | null = null
   let tokenRefreshTimeoutId: ReturnType<typeof setTimeout> | null = null
@@ -100,6 +122,23 @@ export const useAuthStore = defineStore('auth', () => {
   const hasPendingAuthSession = computed(() => pendingAuthSession.value !== null)
 
   // ==================== Actions ====================
+
+  /**
+   * 记录服务端下发的 run_mode 并缓存，供下次刷新的首帧直接使用。
+   * 未知/缺失值一律忽略，保留当前值而不是回落成 'standard'。
+   */
+  function applyRunMode(value: unknown): void {
+    const normalized = normalizeRunMode(value)
+    if (!normalized) {
+      return
+    }
+    runMode.value = normalized
+    try {
+      localStorage.setItem(RUN_MODE_KEY, normalized)
+    } catch {
+      // ignore localStorage failures
+    }
+  }
 
   /**
    * Initialize auth state from localStorage
@@ -308,7 +347,7 @@ export const useAuthStore = defineStore('auth', () => {
 
     // Extract run_mode if present
     if (response.user.run_mode) {
-      runMode.value = response.user.run_mode
+      applyRunMode(response.user.run_mode)
     }
     const { run_mode: _run_mode, ...userData } = response.user
     user.value = userData
@@ -440,7 +479,7 @@ export const useAuthStore = defineStore('auth', () => {
     try {
       const response = await authAPI.getCurrentUser()
       if (response.data.run_mode) {
-        runMode.value = response.data.run_mode
+        applyRunMode(response.data.run_mode)
       }
       const { run_mode: _run_mode, ...userData } = response.data
       user.value = userData
@@ -472,10 +511,12 @@ export const useAuthStore = defineStore('auth', () => {
     refreshTokenValue.value = null
     tokenExpiresAt.value = null
     user.value = null
+    runMode.value = 'standard'
     localStorage.removeItem(AUTH_TOKEN_KEY)
     localStorage.removeItem(AUTH_USER_KEY)
     localStorage.removeItem(REFRESH_TOKEN_KEY)
     localStorage.removeItem(TOKEN_EXPIRES_AT_KEY)
+    localStorage.removeItem(RUN_MODE_KEY)
 
     if (options?.preservePendingAuthSession) {
       pendingAuthSession.value = getPersistedPendingAuthSession()
