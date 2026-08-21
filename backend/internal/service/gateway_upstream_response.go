@@ -1006,6 +1006,9 @@ func (s *GatewayService) handleStreamingResponse(ctx context.Context, resp *http
 			if !ok {
 				// 上游完成，返回结果
 				if !sawTerminalEvent {
+					if !clientDisconnected && c.Request.Context().Err() == nil {
+						s.reportStreamTruncatedAfterCommit(ctx, c, resp, account, originalModel, "upstream closed stream without terminal event")
+					}
 					return &streamingResult{usage: usage, firstTokenMs: firstTokenMs, clientDisconnect: clientDisconnected}, fmt.Errorf("stream usage incomplete: missing terminal event")
 				}
 				return &streamingResult{usage: usage, firstTokenMs: firstTokenMs, clientDisconnect: clientDisconnected}, nil
@@ -1051,6 +1054,7 @@ func (s *GatewayService) handleStreamingResponse(ctx context.Context, resp *http
 					}
 				}
 				sendErrorEvent("stream_read_error", disconnectMsg)
+				s.reportStreamTruncatedAfterCommit(ctx, c, resp, account, originalModel, "stream read error after commit: "+sanitizeStreamError(ev.err))
 				return &streamingResult{usage: usage, firstTokenMs: firstTokenMs}, fmt.Errorf("stream read error: %w", ev.err)
 			}
 			line := ev.line
