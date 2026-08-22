@@ -280,6 +280,18 @@ func (h *GatewayHandler) Messages(c *gin.Context) {
 		sessionKey = "gemini:" + sessionHash
 	}
 
+	// 把粘性会话坐标放进 ctx：转发层判定「协议合法但疑似没把话说完」后需要靠它解绑，
+	// 否则同一条会话会被永久钉在那个只吐一句就收尾的账号上。必须在选号之前写入，
+	// 因为解绑发生在转发层的流结束处，那里拿不到 handler 的局部变量。
+	if sessionKey != "" {
+		stickyGroupID := int64(0)
+		if apiKey.GroupID != nil {
+			stickyGroupID = *apiKey.GroupID
+		}
+		c.Request = c.Request.WithContext(service.WithStickySessionScope(
+			c.Request.Context(), stickyGroupID, sessionKey, h.metadataBridgeEnabled()))
+	}
+
 	// 查询粘性会话绑定的账号 ID
 	var sessionBoundAccountID int64
 	if sessionKey != "" {

@@ -15,6 +15,7 @@ import (
 )
 
 const stickySessionPrefix = "sticky_session:"
+const stickyShortTurnStreakPrefix = "sticky_short_turn:"
 const openAIResponsesSessionWindowPrefix = "openai_responses_session_window:"
 const liveCallPrefix = "live:call:"
 
@@ -34,6 +35,54 @@ func buildSessionKey(groupID int64, sessionHash string) string {
 
 func buildOpenAIResponsesSessionWindowKey(groupID int64, sessionHash string) string {
 	return fmt.Sprintf("%s%d:%s", openAIResponsesSessionWindowPrefix, groupID, sessionHash)
+}
+
+// buildStickyShortTurnStreakKey 构建「该会话连续几发都是可疑短回合」的计数键。
+// 与粘性绑定同样按 groupID 隔离，避免不同分组的同名会话互相干扰。
+func buildStickyShortTurnStreakKey(groupID int64, sessionHash string) string {
+	return fmt.Sprintf("%s%d:%s", stickyShortTurnStreakPrefix, groupID, sessionHash)
+}
+
+// IncrStickyShortTurnStreak 累加该会话的「可疑短回合」连击数并返回累加后的值。
+//
+// 为什么要计数而不是一发就解绑：合法的短回答确实存在（实测健康账号约 3.7% 的
+// 回合 output_tokens<50），一发就解绑会频繁打断会话的 prompt-cache 亲和性，
+// 把 129k 的 cache_read 变成 cache miss，代价真实。连续两发才动手：两发都是
+// 合法短回答的概率约 0.1%,可以忽略。
+//
+// TTL 与粘性绑定同寿：绑定都过期了，连击数也没有意义。
+func (c *gatewayCache) IncrStickyShortTurnStreak(ctx context.Context, groupID int64, sessionHash string, ttl time.Duration) (int64, error) {
+	if c == nil || c.rdb == nil {
+		return 0, errors.New("gateway cache unavailable")
+	}
+	sessionHash = strings.TrimSpace(sessionHash)
+	if sessionHash == "" {
+		return 0, errors.New("invalid sticky short turn session hash")
+	}
+	if ttl <= 0 {
+		ttl = time.Hour
+	}
+	key := buildStickyShortTurnStreakKey(groupID, sessionHash)
+	pipe := c.rdb.Pipeline()
+	incr := pipe.Incr(ctx, key)
+	pipe.Expire(ctx, key, ttl)
+	if _, err := pipe.Exec(ctx); err != nil {
+		return 0, err
+	}
+	return incr.Val(), nil
+}
+
+// ResetStickyShortTurnStreak 清零连击数。任何一次「正常」回合都必须调用它，
+// 否则跨越很长时间的两次偶发短回答会被累加成一次误判。
+func (c *gatewayCache) ResetStickyShortTurnStreak(ctx context.Context, groupID int64, sessionHash string) error {
+	if c == nil || c.rdb == nil {
+		return errors.New("gateway cache unavailable")
+	}
+	sessionHash = strings.TrimSpace(sessionHash)
+	if sessionHash == "" {
+		return nil
+	}
+	return c.rdb.Del(ctx, buildStickyShortTurnStreakKey(groupID, sessionHash)).Err()
 }
 
 func (c *gatewayCache) GetSessionAccountID(ctx context.Context, groupID int64, sessionHash string) (int64, error) {

@@ -12,6 +12,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"net/http"
 	"strings"
 	"sync/atomic"
@@ -521,8 +522,116 @@ func anthropicStreamLooksIncompleteDespiteTerminal(
 	return "", false
 }
 
-const anthropicEmptyStreamUpstreamMessage = "Anthropic upstream returned an empty SSE stream with no terminal event"
+// stickyShortTurnStreakStore 是 GatewayCache 的可选扩展：实现了它的缓存支持
+// 「该会话连续几发都是可疑短回合」的计数。
+//
+// 做成可选接口而不是加进 GatewayCache：那个接口被大量测试替身实现，加方法会一次性
+// 弄坏所有 mock。真实的 *gatewayCache 结构上满足它，线上正常生效；替身不满足时
+// 整个机制静默退化成「不解绑」，也就是改动前的行为，不会把请求引到更差的路径上。
+type stickyShortTurnStreakStore interface {
+	IncrStickyShortTurnStreak(ctx context.Context, groupID int64, sessionHash string, ttl time.Duration) (int64, error)
+	ResetStickyShortTurnStreak(ctx context.Context, groupID int64, sessionHash string) error
+}
 
+const (
+	// anthropicShortTurnVisibleCharLimit 判定「短回合」的可见字符上限。
+	// 实测两次故障分别是 19 和 30 个 output_token，对应正文都在 100 字符以内；
+	// 取 200 留出余量，同时远低于一次正常的工具调用或成段回答。
+	anthropicShortTurnVisibleCharLimit = 200
+	// anthropicShortTurnStreakThreshold 连续多少发才解绑。
+	// 1 会频繁误伤合法短回答的 prompt-cache 亲和性，见 IncrStickyShortTurnStreak 的说明。
+	anthropicShortTurnStreakThreshold = 2
+)
+
+// anthropicTurnLooksSuspiciouslyShort 判定这一回合是否为「协议合法但疑似没把话说完」。
+//
+// 与 anthropicStreamLooksIncompleteDespiteTerminal 的分工：那个判的是能确定的残缺
+// （异常 stop_reason、开了块却零内容），确定就罚号；这个判的是**不能确定**的可疑形态，
+// 只用来累计连击、到阈值后解绑，绝不罚号。两者必须分开，否则可疑形态会被当成确定故障
+// 把健康账号罚下线——那正是当初否掉「输出长度突降基线」的理由。
+//
+// 四个条件同时成立才算可疑：
+//  1. stop_reason 恰好是 end_turn。tool_use/max_tokens/stop_sequence 都说明模型
+//     确实干了活或是被限制截断，pause_turn 是协议级续传，都不算。
+//  2. 没有开过 tool_use 块。开了工具块的回合无论正文多短都是正常的 agent 行为。
+//  3. 可见字符低于上限。
+//  4. 上游确实报了正的 output_tokens。为 0 的情形归 anthropicStreamLooksIncomplete-
+//     DespiteTerminal 管，这里放行避免同一次故障被两套逻辑各记一次。
+func anthropicTurnLooksSuspiciouslyShort(
+	stopReason string,
+	visibleChars int,
+	outputTokens int,
+	sawToolUseBlock bool,
+) bool {
+	if !strings.EqualFold(strings.TrimSpace(stopReason), "end_turn") {
+		return false
+	}
+	if sawToolUseBlock {
+		return false
+	}
+	if outputTokens <= 0 {
+		return false
+	}
+	return visibleChars > 0 && visibleChars <= anthropicShortTurnVisibleCharLimit
+}
+
+// noteAnthropicShortTurnStreak 累计可疑短回合，达到阈值就解除本会话的粘性绑定。
+//
+// 为什么解绑而不是罚号：罚号会把账号从所有会话的调度池里摘掉，而这里的判据是启发式的，
+// 误判代价太大。解绑只影响这一条会话的账号亲和性，误判的代价仅是丢一次 prompt cache，
+// 而收益是客户端下一发能落到同优先级的另一个账号上——正是「自动切换到别的号继续」。
+func (s *GatewayService) noteAnthropicShortTurnStreak(
+	ctx context.Context, account *Account, model string, visibleChars, outputTokens int,
+) {
+	groupID, sessionKey, ok := StickySessionScopeFromContext(ctx)
+	if !ok {
+		return
+	}
+	store, ok := s.cache.(stickyShortTurnStreakStore)
+	if !ok {
+		return
+	}
+	streak, err := store.IncrStickyShortTurnStreak(ctx, groupID, sessionKey, stickySessionTTL)
+	if err != nil {
+		slog.Warn("sticky_short_turn_incr_failed", "account_id", account.ID, "error", err)
+		return
+	}
+	if streak < anthropicShortTurnStreakThreshold {
+		slog.Info("sticky_short_turn_observed",
+			"account_id", account.ID, "model", model, "streak", streak,
+			"visible_chars", visibleChars, "output_tokens", outputTokens)
+		return
+	}
+	if err := s.cache.DeleteSessionAccountID(ctx, groupID, sessionKey); err != nil {
+		slog.Warn("sticky_short_turn_unbind_failed", "account_id", account.ID, "error", err)
+		return
+	}
+	// 解绑后清零：否则下一发换到好账号上答了一句短话就又达标，会来回解绑。
+	if err := store.ResetStickyShortTurnStreak(ctx, groupID, sessionKey); err != nil {
+		slog.Warn("sticky_short_turn_reset_failed", "account_id", account.ID, "error", err)
+	}
+	slog.Warn("sticky_short_turn_unbound",
+		"account_id", account.ID, "model", model, "streak", streak,
+		"visible_chars", visibleChars, "output_tokens", outputTokens,
+		"reason", "consecutive protocol-legal but suspiciously short turns")
+}
+
+// clearAnthropicShortTurnStreak 在一次正常回合后清零连击数。
+func (s *GatewayService) clearAnthropicShortTurnStreak(ctx context.Context) {
+	groupID, sessionKey, ok := StickySessionScopeFromContext(ctx)
+	if !ok {
+		return
+	}
+	store, ok := s.cache.(stickyShortTurnStreakStore)
+	if !ok {
+		return
+	}
+	if err := store.ResetStickyShortTurnStreak(ctx, groupID, sessionKey); err != nil {
+		slog.Warn("sticky_short_turn_reset_failed", "error", err)
+	}
+}
+
+const anthropicEmptyStreamUpstreamMessage = "Anthropic upstream returned an empty SSE stream with no terminal event"
 const anthropicIncompleteStreamUpstreamMessage = "Anthropic upstream delivered a terminal event but the content was incomplete"
 
 const anthropicTruncatedStreamUpstreamMessage = "Anthropic upstream truncated the SSE stream after it was committed to the client"
@@ -820,6 +929,7 @@ func (s *GatewayService) handleStreamingResponseAnthropicAPIKeyPassthrough(
 	sawStopReason := ""
 	visibleChars := 0
 	sawContentBlockStart := false
+	sawToolUseBlock := false
 
 	scanner := bufio.NewScanner(resp.Body)
 	maxLineSize := defaultMaxLineSize
@@ -931,6 +1041,9 @@ func (s *GatewayService) handleStreamingResponseAnthropicAPIKeyPassthrough(
 					}
 				case "content_block_start":
 					sawContentBlockStart = true
+					if strings.EqualFold(strings.TrimSpace(parsedFrame.Get("content_block.type").String()), "tool_use") {
+						sawToolUseBlock = true
+					}
 				}
 				visibleChars += anthropicVisibleDeltaChars(parsedFrame)
 			}
@@ -985,6 +1098,13 @@ func (s *GatewayService) handleStreamingResponseAnthropicAPIKeyPassthrough(
 		reason, incomplete := anthropicStreamLooksIncompleteDespiteTerminal(
 			sawStopReason, visibleChars, usage.OutputTokens, sawContentBlockStart)
 		if !incomplete {
+			// 确定性判定放行之后，再看这一回合是否属于「协议合法但疑似没把话说完」。
+			// 这条路径只累计连击 / 到阈值解绑，绝不罚号，见 noteAnthropicShortTurnStreak。
+			if anthropicTurnLooksSuspiciouslyShort(sawStopReason, visibleChars, usage.OutputTokens, sawToolUseBlock) {
+				s.noteAnthropicShortTurnStreak(ctx, account, model, visibleChars, usage.OutputTokens)
+			} else {
+				s.clearAnthropicShortTurnStreak(ctx)
+			}
 			return
 		}
 		s.reportStreamIncompleteAfterCommit(ctx, c, resp, account, model, reason)

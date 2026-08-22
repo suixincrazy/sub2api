@@ -156,11 +156,21 @@ func (f *fakeConcurrencyCache) CleanupExpiredAccountSlots(context.Context, int64
 func (f *fakeConcurrencyCache) CleanupExpiredAccountSlotKeys(context.Context) error     { return nil }
 func (f *fakeConcurrencyCache) CleanupStaleProcessSlots(context.Context, string) error  { return nil }
 
-func newTestGatewayHandler(t *testing.T, group *service.Group, accounts []*service.Account) (*GatewayHandler, func()) {
+// newTestGatewayHandler 组装最小可用的 GatewayHandler。gatewayCache 可选：
+// 不传即 nil（关闭粘性，多数用例的既有行为），传入替身则可观测粘性读写。
+func newTestGatewayHandler(
+	t *testing.T, group *service.Group, accounts []*service.Account,
+	gatewayCache ...service.GatewayCache,
+) (*GatewayHandler, func()) {
 	t.Helper()
 
 	schedulerCache := &fakeSchedulerCache{accounts: accounts}
 	schedulerSnapshot := service.NewSchedulerSnapshotService(schedulerCache, nil, nil, nil, nil)
+
+	var cache service.GatewayCache
+	if len(gatewayCache) > 0 {
+		cache = gatewayCache[0]
+	}
 
 	gwSvc := service.NewGatewayService(
 		nil, // accountRepo (not used: scheduler snapshot hit)
@@ -170,7 +180,7 @@ func newTestGatewayHandler(t *testing.T, group *service.Group, accounts []*servi
 		nil, // userRepo
 		nil, // userSubRepo
 		nil, // userGroupRateRepo
-		nil, // cache (disable sticky)
+		cache,
 		nil, // cfg
 		schedulerSnapshot,
 		nil, // concurrencyService (disable load-aware; tryAcquire always acquired)
