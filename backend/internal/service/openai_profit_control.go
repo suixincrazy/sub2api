@@ -342,7 +342,11 @@ func (s *OpenAIGatewayService) ProfitControlVetoLatest(ctx context.Context, sele
 // only after the terminal post-slot check, and a fallback selected after the
 // current sticky account failed must not replace that primary binding.
 func (s *OpenAIGatewayService) bindOpenAIStickySessionDuringSelection(ctx context.Context, groupID *int64, sessionHash string, accountID int64) error {
-	if gatewayProfitControlGateActive(ctx) || stickyBindingProtectedForFailover(ctx, accountID) {
+	// 三个不绑的理由互相独立：利润门要等终检后再绑；failover 保护期内副号不许抢绑；
+	// 上游的 guardian 父账号亲和要求 auto-review 子请求不改动父账号的绑定。
+	if gatewayProfitControlGateActive(ctx) ||
+		stickyBindingProtectedForFailover(ctx, accountID) ||
+		preserveOpenAIGuardianParentBinding(ctx, sessionHash) {
 		return nil
 	}
 	if sessionHash == "" || accountID <= 0 {
@@ -370,6 +374,9 @@ func (s *OpenAIGatewayService) bindOpenAIStickySessionDuringSelection(ctx contex
 // recovers.
 func (s *OpenAIGatewayService) BindStickySessionAfterProfitAdmission(ctx context.Context, groupID *int64, sessionHash string, accountID int64) error {
 	if sessionHash == "" || accountID <= 0 {
+		return nil
+	}
+	if preserveOpenAIGuardianParentBinding(ctx, sessionHash) {
 		return nil
 	}
 	if !gatewayProfitControlGateActive(ctx) {
