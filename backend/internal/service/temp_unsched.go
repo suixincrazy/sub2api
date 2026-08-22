@@ -19,6 +19,14 @@ type TempUnschedState struct {
 	// ProbeFailures 后台探针连续探测失败的次数，由 AccountStreamProbeService 写入。
 	// 只有「流交付失败」家族的冷却会带这个字段，用来做冷却退避；其它触发源不写。
 	ProbeFailures int `json:"probe_failures,omitempty"`
+	// Model 记录触发这次停调时客户端请求的模型，供后台探针复现同一条链路。
+	//
+	// 为什么非记不可：探针原先固定用 claude.DefaultTestModel 去探，而中转类账号的
+	// 上游只供应自己那一份模型清单，探测请求会直接吃 404 model_not_found。404 归入
+	// inconclusive，于是每一轮都「探了但下不了结论」，探针对这类账号等于完全不工作。
+	// 用当初把账号罚下线的那个模型去探，既能保证上游一定认（刚刚才在服务它），
+	// 又让探测结论和真实流量说的是同一件事。
+	Model string `json:"model,omitempty"`
 }
 
 // TempUnschedCache 临时不可调度缓存接口
