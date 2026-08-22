@@ -2327,6 +2327,42 @@ func (r *accountRepository) SetTempUnschedulable(ctx context.Context, id int64, 
 	return nil
 }
 
+// SetTempUnschedulableAllowShorten 写入停调窗口，允许把到点时间改早。
+//
+// 与 SetTempUnschedulable 的唯一区别是不带「只延长」的守卫条件
+// （temp_unschedulable_until < $1）。专供后台探针收回自己顶上去的 guard 窗口：
+// 探针探不出结论时必须把窗口还原成原本的到点时间，而常规方法会因为守卫条件不成立
+// 静默丢弃这次写入（affected=0 也返回 nil），于是每一轮 inconclusive 都净延长
+// 一个 guard，账号被探针自己永久关在池外。
+//
+// 别处一律用 SetTempUnschedulable：那个「只延长」语义是为了防止一个子系统
+// 缩短另一个子系统写下的惩罚窗口，不要绕过它。
+func (r *accountRepository) SetTempUnschedulableAllowShorten(ctx context.Context, id int64, until time.Time, reason string) error {
+	result, err := r.sql.ExecContext(ctx, `
+		UPDATE accounts
+		SET temp_unschedulable_until = $1,
+			temp_unschedulable_reason = $2,
+			updated_at = NOW()
+		WHERE id = $3
+			AND deleted_at IS NULL
+	`, until, reason, id)
+	if err != nil {
+		return err
+	}
+	affected, err := result.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if affected <= 0 {
+		return nil
+	}
+	if err := enqueueSchedulerOutbox(ctx, r.sql, service.SchedulerOutboxEventAccountChanged, &id, nil, nil); err != nil {
+		logger.LegacyPrintf("repository.account", "[SchedulerOutbox] enqueue temp unschedulable shorten failed: account=%d err=%v", id, err)
+	}
+	r.syncSchedulerAccountSnapshot(ctx, id)
+	return nil
+}
+
 func (r *accountRepository) SetGrokCredentialTempUnschedulableIfMatch(
 	ctx context.Context,
 	id int64,
