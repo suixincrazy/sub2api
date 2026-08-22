@@ -29,7 +29,12 @@ type fakeStreamProbeStore struct {
 	mu       sync.Mutex
 	accounts []Account
 	setCalls []streamProbeSetCall
-	cleared  []int64
+	// shortenCalls 与 setCalls 分开记，是为了区分两种语义完全不同的写入：
+	// SetTempUnschedulable 只延长不缩短（真实仓储带 SQL 守卫，往早改静默丢弃），
+	// SetTempUnschedulableAllowShorten 才能把窗口收回来。还原窗口必须走后者，
+	// 混用会让「探不出结论」变成净延长一个 guard，账号被探针自己永久关在池外。
+	shortenCalls []streamProbeSetCall
+	cleared      []int64
 }
 
 func (f *fakeStreamProbeStore) ListByPlatform(context.Context, string) ([]Account, error) {
@@ -45,6 +50,13 @@ func (f *fakeStreamProbeStore) SetTempUnschedulable(_ context.Context, id int64,
 	return nil
 }
 
+func (f *fakeStreamProbeStore) SetTempUnschedulableAllowShorten(_ context.Context, id int64, until time.Time, reason string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.shortenCalls = append(f.shortenCalls, streamProbeSetCall{id: id, until: until, reason: reason})
+	return nil
+}
+
 func (f *fakeStreamProbeStore) ClearTempUnschedulable(_ context.Context, id int64) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -56,6 +68,31 @@ func (f *fakeStreamProbeStore) snapshot() ([]streamProbeSetCall, []int64) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	return append([]streamProbeSetCall(nil), f.setCalls...), append([]int64(nil), f.cleared...)
+}
+
+func (f *fakeStreamProbeStore) shortenSnapshot() []streamProbeSetCall {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]streamProbeSetCall(nil), f.shortenCalls...)
+}
+
+// fakeStreamProbeLegacyStore 只实现 streamProbeAccountStore，不实现
+// streamProbeWindowShortener，用来钉住「仓储不支持收窄」时的回落分支。
+// 刻意不嵌入 fakeStreamProbeStore：嵌入会把收窄方法一起提升上来，接口断言就成立了。
+type fakeStreamProbeLegacyStore struct {
+	inner fakeStreamProbeStore
+}
+
+func (f *fakeStreamProbeLegacyStore) ListByPlatform(ctx context.Context, platform string) ([]Account, error) {
+	return f.inner.ListByPlatform(ctx, platform)
+}
+
+func (f *fakeStreamProbeLegacyStore) SetTempUnschedulable(ctx context.Context, id int64, until time.Time, reason string) error {
+	return f.inner.SetTempUnschedulable(ctx, id, until, reason)
+}
+
+func (f *fakeStreamProbeLegacyStore) ClearTempUnschedulable(ctx context.Context, id int64) error {
+	return f.inner.ClearTempUnschedulable(ctx, id)
 }
 
 type fakeStreamProber struct {
@@ -419,14 +456,74 @@ func assertProbeRestoresWindow(t *testing.T, probeErr error) {
 	svc.probeOne(context.Background(), account, state)
 
 	setCalls, cleared := store.snapshot()
+	shortenCalls := store.shortenSnapshot()
 	assert.Empty(t, cleared)
-	require.Len(t, setCalls, 2, "guard 之后要把窗口还原回去")
-	assert.WithinDuration(t, until, setCalls[1].until, time.Second,
+	require.Len(t, setCalls, 1, "只该有 guard 那一次只延长写入")
+
+	// 还原必须走「允许收窄」的方法：只延长的那个在真实仓储里会因为 SQL 守卫
+	// 静默丢弃这次写入，guard 窗口收不回来（见下面那条回归测试的说明）。
+	require.Len(t, shortenCalls, 1, "还原窗口必须走允许收窄的仓储方法")
+	assert.Equal(t, int64(9), shortenCalls[0].id)
+	assert.WithinDuration(t, until, shortenCalls[0].until, time.Second,
 		"必须还原成原到点时间，而不是往后推")
 
 	var persisted TempUnschedState
-	require.NoError(t, json.Unmarshal([]byte(setCalls[1].reason), &persisted))
+	require.NoError(t, json.Unmarshal([]byte(shortenCalls[0].reason), &persisted))
 	assert.Equal(t, 0, persisted.ProbeFailures, "下不了结论不算失败，不该累计退避")
+	assert.Equal(t, shortenCalls[0].until.Unix(), persisted.UntilUnix,
+		"reason 里的到点时间要和列一致，否则缓存 TTL 按 guard 值算，出现半恢复状态")
+}
+
+// 收回的窗口必须比 guard 窗口更早——这才是「还原」，也是缺陷的要害。
+//
+// 回归的是一个把账号永久关在池外的缺陷：还原原先走 SetTempUnschedulable，
+// 而它是只延长不缩短语义（SQL 带 temp_unschedulable_until < $1 守卫，affected=0
+// 也返回 nil），于是探针自己顶上去的 2 分钟 guard 收不回来，每一轮 inconclusive
+// 都净延长一个 guard，连 restore_failed 都不告警。线上实测：一个副号连续 18 轮
+// inconclusive，停调窗口每 ~100 秒往后挪 ~100 秒，永远等不到自然到点。
+func TestProbeOneShortensGuardWindowBackWhenInconclusive(t *testing.T) {
+	until := time.Now().Add(20 * time.Second)
+	account := streamProbeAccount(t, until, streamProbeKeywordTruncated, 0)
+	state := parseStreamProbeState(account.TempUnschedulableReason)
+	require.NotNil(t, state)
+
+	store := &fakeStreamProbeStore{}
+	svc := newTestStreamProbeService(store, &fakeStreamProber{err: errStreamProbeInconclusive})
+
+	svc.probeOne(context.Background(), account, state)
+
+	setCalls, _ := store.snapshot()
+	shortenCalls := store.shortenSnapshot()
+	require.Len(t, setCalls, 1)
+	require.Len(t, shortenCalls, 1)
+
+	guardUntil := setCalls[0].until
+	restoredUntil := shortenCalls[0].until
+	assert.True(t, restoredUntil.Before(guardUntil),
+		"还原后的到点时间必须早于 guard，否则每轮都净延长一个 guard：guard=%s restored=%s",
+		guardUntil, restoredUntil)
+	assert.WithinDuration(t, until, restoredUntil, time.Second)
+}
+
+// 仓储没实现收窄方法时退回「清掉冷却」，而不是留着 guard 窗口继续关着账号。
+// 走到这里说明原到点只剩几十秒，放回调度池比被 guard 多关两分钟更接近
+// inconclusive 该有的「退回自然到点」语义。
+func TestProbeOneClearsCooldownWhenStoreCannotShorten(t *testing.T) {
+	until := time.Now().Add(20 * time.Second)
+	account := streamProbeAccount(t, until, streamProbeKeywordTruncated, 0)
+	state := parseStreamProbeState(account.TempUnschedulableReason)
+	require.NotNil(t, state)
+
+	store := &fakeStreamProbeLegacyStore{}
+	require.NotImplements(t, (*streamProbeWindowShortener)(nil), store,
+		"这个替身的意义就是不实现收窄接口")
+	svc := newTestStreamProbeService(store, &fakeStreamProber{err: errStreamProbeInconclusive})
+
+	svc.probeOne(context.Background(), account, state)
+
+	setCalls, cleared := store.inner.snapshot()
+	require.Len(t, setCalls, 1, "guard 还是要写的")
+	assert.Equal(t, []int64{9}, cleared, "不支持收窄时清掉冷却，不能把 guard 窗口留着")
 }
 
 // --- runOnce ---

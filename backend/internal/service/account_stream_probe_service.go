@@ -101,6 +101,20 @@ type streamProbeAccountStore interface {
 	ClearTempUnschedulable(ctx context.Context, id int64) error
 }
 
+// streamProbeWindowShortener 是 streamProbeAccountStore 的可选扩展：
+// 实现了它的仓储允许把停调窗口的到点时间改早。
+//
+// 为什么非要它：常规的 SetTempUnschedulable 是「只延长不缩短」语义——SQL 带着
+// temp_unschedulable_until < $1 的守卫，且 affected=0 时静默返回 nil。那是为了
+// 防止一个子系统缩短另一个子系统写下的惩罚窗口，不该绕过。但探针的 guard 窗口是
+// 它自己临时顶上去的，探不出结论时必须收回；走常规方法这次写入会被静默丢弃
+// （连 restore_failed 都不会告警），于是每一轮 inconclusive 都净延长一个 guard，
+// 账号被探针自己永久关在池外——正是 probeOne 里那段注释声明要避免的后果。
+// 线上实测：一个副号连续 18 轮 inconclusive，停调窗口每 ~100 秒后移 ~100 秒。
+type streamProbeWindowShortener interface {
+	SetTempUnschedulableAllowShorten(ctx context.Context, id int64, until time.Time, reason string) error
+}
+
 // streamHealthProber 抽象一次「这个账号现在能不能交付一条完整的流」的探测。
 //
 // model 是当初把账号罚下线时客户端请求的模型；为空时由实现方回落到默认测试模型。
@@ -281,7 +295,7 @@ func (s *AccountStreamProbeService) probeOne(ctx context.Context, account *Accou
 		// 毛病（过期 token 之类）会把一个健康主号越关越久。
 		originalUntil := time.Unix(state.UntilUnix, 0)
 		if state.UntilUnix > 0 && originalUntil.After(time.Now()) {
-			if err := s.markTempUnschedulable(ctx, account.ID, state, originalUntil); err != nil {
+			if err := s.restoreTempUnschedulable(ctx, account.ID, state, originalUntil); err != nil {
 				slog.Warn("stream_probe_restore_failed", "account_id", account.ID, "error", err)
 			}
 		} else if err := s.clearTempUnschedulable(ctx, account.ID); err != nil {
@@ -342,6 +356,49 @@ func (s *AccountStreamProbeService) markTempUnschedulable(
 		return err
 	}
 	if s.tempUnschedCache != nil {
+		if err := s.tempUnschedCache.SetTempUnsched(ctx, accountID, &next); err != nil {
+			slog.Warn("stream_probe_cache_set_failed", "account_id", accountID, "error", err)
+		}
+	}
+	return nil
+}
+
+// restoreTempUnschedulable 把停调窗口收回到 until——通常比当前生效的 guard 窗口更早。
+//
+// 必须走 streamProbeWindowShortener 而不是 markTempUnschedulable：后者的仓储实现
+// 是「只延长不缩短」，往早改会被静默丢弃（见 streamProbeWindowShortener 的说明）。
+// 缓存那边同样只延长（tempUnschedSetScript 里 new_until <= existing_until 直接
+// return 0），所以要先删再写，否则库里收回了、缓存还留着 guard 值，出现半恢复状态。
+func (s *AccountStreamProbeService) restoreTempUnschedulable(
+	ctx context.Context, accountID int64, state *TempUnschedState, until time.Time,
+) error {
+	next := *state
+	next.UntilUnix = until.Unix()
+
+	reason := next.ErrorMessage
+	if raw, err := json.Marshal(&next); err == nil {
+		reason = string(raw)
+	}
+
+	shortener, ok := s.accountRepo.(streamProbeWindowShortener)
+	if !ok {
+		// 仓储不支持收窄时退回「清掉冷却」，而不是留着 guard 窗口把账号继续关着。
+		// inconclusive 的语义是退回自然到点，而走到这里说明原到点只剩几秒，
+		// 放回调度池比被 guard 多关两分钟更接近这个语义。
+		//
+		// 真实仓储（*accountRepository）是实现了收窄方法的，所以线上不该走到这里。
+		// 打条日志：万一以后给 AccountRepository 套了装饰器把方法藏掉，
+		// 语义会静悄悄退化成「提前几十秒放回未验证的账号」，得看得见。
+		slog.Warn("stream_probe_shorten_unsupported", "account_id", accountID)
+		return s.clearTempUnschedulable(ctx, accountID)
+	}
+	if err := shortener.SetTempUnschedulableAllowShorten(ctx, accountID, until, reason); err != nil {
+		return err
+	}
+	if s.tempUnschedCache != nil {
+		if err := s.tempUnschedCache.DeleteTempUnsched(ctx, accountID); err != nil {
+			slog.Warn("stream_probe_cache_delete_failed", "account_id", accountID, "error", err)
+		}
 		if err := s.tempUnschedCache.SetTempUnsched(ctx, accountID, &next); err != nil {
 			slog.Warn("stream_probe_cache_set_failed", "account_id", accountID, "error", err)
 		}
