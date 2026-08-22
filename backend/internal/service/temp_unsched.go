@@ -16,6 +16,9 @@ type TempUnschedState struct {
 	TriggerCount         int64  `json:"trigger_count,omitempty"`          // 本次触发累计命中次数
 	TriggerThreshold     int    `json:"trigger_threshold,omitempty"`      // 触发阈值
 	TriggerWindowMinutes int    `json:"trigger_window_minutes,omitempty"` // 计数窗口（分钟）
+	// ProbeFailures 后台探针连续探测失败的次数，由 AccountStreamProbeService 写入。
+	// 只有「流交付失败」家族的冷却会带这个字段，用来做冷却退避；其它触发源不写。
+	ProbeFailures int `json:"probe_failures,omitempty"`
 }
 
 // TempUnschedCache 临时不可调度缓存接口

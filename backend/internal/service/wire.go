@@ -300,6 +300,26 @@ func ProvideCNProviderBalanceCheckService(
 	return svc
 }
 
+// ProvideAccountStreamProbeService 构造并启动「流交付失败恢复探测」任务。
+//
+// 解决的问题：流一旦提交就无法故障转移（gateway 那句 "stream truncated after commit,
+// no failover possible"），所以「冷却到点后试试主号还行不行」这个动作必然让某个客户端
+// 吃一次断流。这里把试错搬到后台：冷却将要到点时先探一次，探通才放主号回调度池，
+// 探不通就按 2/4/8/15 分钟退避继续停调、流量留在副号，直到主号真的可用。
+//
+// 探测复用 AccountTestService 的上游请求构造（同包方法 ProbeClaudeStreamHealth）。
+// 是否启用跟随面板上那个「流超时处理」开关，运维只需要记住一个旋钮。
+func ProvideAccountStreamProbeService(
+	accountRepo AccountRepository,
+	testService *AccountTestService,
+	settingService *SettingService,
+	tempUnschedCache TempUnschedCache,
+) *AccountStreamProbeService {
+	svc := NewAccountStreamProbeService(accountRepo, testService, settingService, tempUnschedCache, streamProbeScanInterval)
+	svc.Start()
+	return svc
+}
+
 // ProvideGeminiTokenProvider creates GeminiTokenProvider with OAuthRefreshAPI injection
 func ProvideGeminiTokenProvider(
 	accountRepo AccountRepository,
@@ -841,6 +861,7 @@ var ProviderSet = wire.NewSet(
 	ProvideCNProviderQuotaService,
 	ProvideCNProviderBalanceService,
 	ProvideCNProviderBalanceCheckService,
+	ProvideAccountStreamProbeService,
 	ProvideClaudeTokenProvider,
 	NewAntigravityGatewayService,
 	ProvideRateLimitService,
