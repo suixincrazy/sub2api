@@ -2,6 +2,7 @@ package service
 
 import (
 	"context"
+	"strings"
 	"sync/atomic"
 
 	"github.com/Wei-Shaw/sub2api/internal/pkg/ctxkey"
@@ -18,6 +19,11 @@ type RequestMetadata struct {
 	PrefetchedStickyGroupID    *int64
 	SingleAccountRetry         *bool
 	AccountSwitchCount         *int
+	// StickySessionKey / StickySessionGroupID 是本次请求的网关粘性会话坐标。
+	// 转发层需要它来解绑：上游送来协议合法但内容残缺的响应时，罚号条件一条都不成立，
+	// 只能靠断开这条会话的账号亲和性，让客户端的下一发重新选号。
+	StickySessionKey     *string
+	StickySessionGroupID *int64
 }
 
 var (
@@ -105,6 +111,32 @@ func WithSingleAccountRetry(ctx context.Context, value bool, bridgeOldKeys bool)
 	}, func(base context.Context) context.Context {
 		return context.WithValue(base, ctxkey.SingleAccountRetry, value)
 	})
+}
+
+// WithStickySessionScope 记录本次请求的网关粘性会话坐标，供转发层在需要时解绑。
+// 这是个新字段，没有旧 ctxkey 需要桥接，故 legacyBridge 传 nil。
+func WithStickySessionScope(ctx context.Context, groupID int64, sessionKey string, bridgeOldKeys bool) context.Context {
+	if strings.TrimSpace(sessionKey) == "" {
+		return ctx
+	}
+	return updateRequestMetadata(ctx, bridgeOldKeys, func(md *RequestMetadata) {
+		key := sessionKey
+		group := groupID
+		md.StickySessionKey = &key
+		md.StickySessionGroupID = &group
+	}, nil)
+}
+
+// StickySessionScopeFromContext 取回粘性会话坐标；缺失时 ok=false。
+func StickySessionScopeFromContext(ctx context.Context) (groupID int64, sessionKey string, ok bool) {
+	md := metadataFromContext(ctx)
+	if md == nil || md.StickySessionKey == nil || strings.TrimSpace(*md.StickySessionKey) == "" {
+		return 0, "", false
+	}
+	if md.StickySessionGroupID != nil {
+		groupID = *md.StickySessionGroupID
+	}
+	return groupID, *md.StickySessionKey, true
 }
 
 func WithAccountSwitchCount(ctx context.Context, value int, bridgeOldKeys bool) context.Context {
