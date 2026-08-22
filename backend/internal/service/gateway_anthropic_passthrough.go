@@ -442,7 +442,88 @@ func (s *GatewayService) newAnthropicSafetyFailoverError(c *gin.Context, resp *h
 	}
 }
 
+// anthropicStopReasonIsHealthy 判定 message_delta 收尾的 stop_reason 是不是一次正常收束。
+//
+// 协议层的 message_stop 只证明上游"说完了"，不证明它"说完整了"：实测主号故障时
+// 会送来带 message_stop 的残缺流，此时 sawTerminalEvent=true，旧判定一路放行，
+// 账号不被罚，粘性把下一发重试原样送回同一个坏号——就是「一直断流却从不主副切换」。
+//
+// 白名单而非黑名单：Anthropic 的正常终止值是这四个，未来新增的正常值宁可先被判成
+// 异常（多罚一次 1 分钟冷却，代价可控），也不能把未知故障值放行。空值单独处理：
+// 上游没送 stop_reason 时不做判断，交给 output_tokens 那条信号，避免误伤兼容层。
+func anthropicStopReasonIsHealthy(stopReason string) bool {
+	switch strings.ToLower(strings.TrimSpace(stopReason)) {
+	case "end_turn", "max_tokens", "tool_use", "stop_sequence", "pause_turn":
+		return true
+	default:
+		return false
+	}
+}
+
+// anthropicVisibleDeltaChars 取这一帧可见增量贡献的字符数。
+//
+// 只认真正会渲染给用户的三种增量，与 anthropicSSEPayloadCommitsResponse 的"提交"
+// 口径保持一致：signature_delta 与空思考块不算内容，否则纯 signature 的响应会被
+// 误判成有正文。
+func anthropicVisibleDeltaChars(parsed gjson.Result) int {
+	if strings.TrimSpace(parsed.Get("type").String()) != "content_block_delta" {
+		return 0
+	}
+	switch strings.ToLower(strings.TrimSpace(parsed.Get("delta.type").String())) {
+	case "text_delta":
+		return len(parsed.Get("delta.text").String())
+	case "thinking_delta":
+		return len(parsed.Get("delta.thinking").String())
+	case "input_json_delta":
+		return len(parsed.Get("delta.partial_json").String())
+	default:
+		return 0
+	}
+}
+
+// anthropicStreamLooksIncompleteDespiteTerminal 是「协议层收尾了但内容不完整」的启发式判定。
+//
+// 存在的理由：sawTerminalEvent 只证明上游送来了 message_stop，不证明它把话说完。实测主号
+// 故障时会送来带 message_stop 的残缺流，旧判定一路放行 → 账号不被罚 → 粘性把下一发重试
+// 原样送回同一个坏号，表现为「一直断流却从不主副切换」。
+//
+// 两条信号，任一成立即判残缺：
+//  1. stop_reason 不在正常白名单里（含上游明确送来的故障值）；
+//  2. 有 content_block_start（上游确实开了正文块）却零可见字符且 output_tokens<=0
+//     ——开了块却什么都没吐出来，是截断的确定形态。
+//
+// 刻意不做「输出长度突降」的历史基线比对：那需要按账号+模型维护滑动窗口，且用户完全
+// 可能问一个只需十几 token 就能答完的问题，误报会把健康账号罚下线。上面第 2 条取的是
+// 「零内容」这个无歧义下界，既覆盖突降的极端情形，又不需要基线、不会误伤短回答。
+//
+// 空 stop_reason 单独放行：兼容层（gemini/openai 转 anthropic）不一定填这个字段，
+// 此时只由第 2 条信号判断。
+//
+// refusal 也必须放行：它已由 reportSafetyRefusalWithoutFailover 用专属 keyword
+// （stream_safety_refusal）归因并罚号，这里再判一次会把一次故障记成两次，打乱阈值
+// 窗口的计数、也让 ops 看板出现两条指向同一次失败的记录。
+func anthropicStreamLooksIncompleteDespiteTerminal(
+	stopReason string,
+	visibleChars int,
+	outputTokens int,
+	sawContentBlockStart bool,
+) (string, bool) {
+	trimmed := strings.TrimSpace(stopReason)
+	if strings.EqualFold(trimmed, "refusal") {
+		return "", false
+	}
+	if trimmed != "" && !anthropicStopReasonIsHealthy(trimmed) {
+		return "terminal event carried abnormal stop_reason=" + trimmed, true
+	}
+	if sawContentBlockStart && visibleChars == 0 && outputTokens <= 0 {
+		return "terminal event arrived with an opened content block but zero visible output", true
+	}
+	return "", false
+}
+
 const anthropicEmptyStreamUpstreamMessage = "Anthropic upstream returned an empty SSE stream with no terminal event"
+
+const anthropicIncompleteStreamUpstreamMessage = "Anthropic upstream delivered a terminal event but the content was incomplete"
 
 const anthropicTruncatedStreamUpstreamMessage = "Anthropic upstream truncated the SSE stream after it was committed to the client"
 
@@ -494,6 +575,40 @@ func (s *GatewayService) reportStreamTruncatedAfterCommit(ctx context.Context, c
 		Detail:             reason,
 	})
 	logger.LegacyPrintf("service.gateway", "[Anthropic Passthrough] stream truncated after commit, no failover possible: account=%d(%s) model=%s request_id=%s reason=%s",
+		account.ID, account.Name, model, upstreamRequestID, reason)
+	if s.rateLimitService != nil {
+		s.rateLimitService.HandleStreamTruncated(ctx, account, model)
+	}
+}
+
+// reportStreamIncompleteAfterCommit 记录「协议层收尾了但内容不完整」。
+//
+// 与 reportStreamTruncatedAfterCommit 并列，区别只在判定依据：那边是流断在半路
+// （连 message_stop 都没来），这边是 message_stop 到了、但 stop_reason 异常或正文为空。
+// 后者过去完全没有信号——sawTerminalEvent=true 就直接 return nil，账号不罚，粘性把
+// 下一发重试送回同一个坏号，于是「一直断流却从不主副切换」。
+//
+// 走同一个 HandleStreamTruncated：两者对客户端的后果一样（拿到一条用不了的响应），
+// 运维也只需一个旋钮（stream_timeout_settings）。ops 看板上用 Kind 区分归因。
+func (s *GatewayService) reportStreamIncompleteAfterCommit(ctx context.Context, c *gin.Context, resp *http.Response, account *Account, model, reason string) {
+	if account == nil {
+		return
+	}
+	upstreamRequestID := ""
+	if resp != nil {
+		upstreamRequestID = resp.Header.Get("x-request-id")
+	}
+	appendOpsUpstreamError(c, OpsUpstreamErrorEvent{
+		Platform:           account.Platform,
+		AccountID:          account.ID,
+		AccountName:        account.Name,
+		UpstreamStatusCode: http.StatusBadGateway,
+		UpstreamRequestID:  upstreamRequestID,
+		Kind:               "stream_incomplete_after_commit",
+		Message:            anthropicIncompleteStreamUpstreamMessage,
+		Detail:             reason,
+	})
+	logger.LegacyPrintf("service.gateway", "[Anthropic Passthrough] terminal event but incomplete content, no failover possible: account=%d(%s) model=%s request_id=%s reason=%s",
 		account.ID, account.Name, model, upstreamRequestID, reason)
 	if s.rateLimitService != nil {
 		s.rateLimitService.HandleStreamTruncated(ctx, account, model)
@@ -700,6 +815,11 @@ func (s *GatewayService) handleStreamingResponseAnthropicAPIKeyPassthrough(
 	var firstTokenMs *int
 	clientDisconnected := false
 	sawTerminalEvent := false
+	// 启发式截断判定用的三个观测量：协议层收尾了不等于内容完整，见
+	// reportStreamIncompleteAfterCommit 的说明。
+	sawStopReason := ""
+	visibleChars := 0
+	sawContentBlockStart := false
 
 	scanner := bufio.NewScanner(resp.Body)
 	maxLineSize := defaultMaxLineSize
@@ -800,6 +920,20 @@ func (s *GatewayService) handleStreamingResponseAnthropicAPIKeyPassthrough(
 			if anthropicStreamEventIsTerminal("", trimmed) {
 				sawTerminalEvent = true
 			}
+			// 采集启发式判定所需的三个量。放在终止判定之后、写客户端之前，
+			// 保证 message_delta 的 stop_reason 一定先于流结束被记下。
+			if trimmed != "" && trimmed != "[DONE]" {
+				parsedFrame := gjson.Parse(trimmed)
+				switch strings.TrimSpace(parsedFrame.Get("type").String()) {
+				case "message_delta":
+					if r := strings.TrimSpace(parsedFrame.Get("delta.stop_reason").String()); r != "" {
+						sawStopReason = r
+					}
+				case "content_block_start":
+					sawContentBlockStart = true
+				}
+				visibleChars += anthropicVisibleDeltaChars(parsedFrame)
+			}
 			if firstTokenMs == nil && trimmed != "" && trimmed != "[DONE]" {
 				ms := int(time.Since(startTime).Milliseconds())
 				firstTokenMs = &ms
@@ -841,6 +975,21 @@ func (s *GatewayService) handleStreamingResponseAnthropicAPIKeyPassthrough(
 		streamCommitted = true
 	}
 
+	// reportIfTerminalButIncomplete 在「协议层收尾了」的成功返回点上再做一次内容完整性
+	// 启发式判定。客户端自己断开、请求被取消的情形一律不判——那时残缺是客户端造成的，
+	// 罚账号只会误伤。已按拒答归因过的流也不再判：同一次故障不能记两次。
+	reportIfTerminalButIncomplete := func() {
+		if clientDisconnected || refusalReported || c.Request.Context().Err() != nil {
+			return
+		}
+		reason, incomplete := anthropicStreamLooksIncompleteDespiteTerminal(
+			sawStopReason, visibleChars, usage.OutputTokens, sawContentBlockStart)
+		if !incomplete {
+			return
+		}
+		s.reportStreamIncompleteAfterCommit(ctx, c, resp, account, model, reason)
+	}
+
 	for {
 		select {
 		case ev, ok := <-events:
@@ -871,6 +1020,7 @@ func (s *GatewayService) handleStreamingResponseAnthropicAPIKeyPassthrough(
 					}
 					return &streamingResult{usage: usage, firstTokenMs: firstTokenMs, clientDisconnect: clientDisconnected}, fmt.Errorf("stream usage incomplete: missing terminal event")
 				}
+				reportIfTerminalButIncomplete()
 				return &streamingResult{usage: usage, firstTokenMs: firstTokenMs, clientDisconnect: clientDisconnected}, nil
 			}
 			if ev.err != nil {
@@ -889,6 +1039,7 @@ func (s *GatewayService) handleStreamingResponseAnthropicAPIKeyPassthrough(
 				}
 				flushPendingPrelude()
 				if sawTerminalEvent {
+					reportIfTerminalButIncomplete()
 					return &streamingResult{usage: usage, firstTokenMs: firstTokenMs, clientDisconnect: clientDisconnected}, nil
 				}
 				if clientDisconnected {
