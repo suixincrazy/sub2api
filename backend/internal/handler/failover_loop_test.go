@@ -859,18 +859,24 @@ func TestHandleSelectionExhausted(t *testing.T) {
 		require.Equal(t, FailoverExhausted, action)
 	})
 
-	t.Run("非503错误返回Exhausted", func(t *testing.T) {
-		fs := NewFailoverState(3, false)
-		fs.LastFailoverErr = newTestFailoverErr(500, false, false)
+	t.Run("瞬时错误_整档试完后退避重来一轮", func(t *testing.T) {
+		// 「碰到账号不可用就换号、整档换不到就继续循环」——5xx/429 这类账号下一秒
+		// 可能就恢复，不能直接给客户端报错。502 是提交前断流用的状态码。
+		for _, status := range []int{500, 502, 503, 429} {
+			fs := NewFailoverState(3, false)
+			fs.backoffDelay = time.Nanosecond
+			fs.LastFailoverErr = newTestFailoverErr(status, false, false)
+			fs.FailedAccountIDs[100] = struct{}{}
 
-		action := fs.HandleSelectionExhausted(context.Background())
-		require.Equal(t, FailoverExhausted, action)
+			action := fs.HandleSelectionExhausted(context.Background())
+			require.Equal(t, FailoverContinue, action, "status=%d 应退避重来", status)
+			require.Empty(t, fs.FailedAccountIDs, "status=%d 应清除失败账号列表", status)
+		}
 	})
 
-	t.Run("503且未耗尽_等待后返回Continue并清除失败列表", func(t *testing.T) {
+	t.Run("重来之前真的退避2秒", func(t *testing.T) {
 		fs := NewFailoverState(3, false)
 		fs.LastFailoverErr = newTestFailoverErr(503, false, false)
-		fs.FailedAccountIDs[100] = struct{}{}
 		fs.SwitchCount = 1
 
 		start := time.Now()
@@ -878,9 +884,59 @@ func TestHandleSelectionExhausted(t *testing.T) {
 		elapsed := time.Since(start)
 
 		require.Equal(t, FailoverContinue, action)
-		require.Empty(t, fs.FailedAccountIDs, "应清除失败账号列表")
 		require.GreaterOrEqual(t, elapsed, 1500*time.Millisecond, "应等待约 2s")
 		require.Less(t, elapsed, 5*time.Second)
+	})
+
+	t.Run("确定性错误返回Exhausted", func(t *testing.T) {
+		// 400 在每个账号上都会以同样方式失败，重来一轮只是把同一个错误
+		// 推迟十几秒才告诉客户端。
+		for _, status := range []int{400, 404, 422} {
+			fs := NewFailoverState(3, false)
+			fs.LastFailoverErr = newTestFailoverErr(status, false, false)
+
+			start := time.Now()
+			action := fs.HandleSelectionExhausted(context.Background())
+			require.Equal(t, FailoverExhausted, action, "status=%d 不该重来", status)
+			require.Less(t, time.Since(start), 100*time.Millisecond, "status=%d 不应等待", status)
+		}
+	})
+
+	t.Run("上游标成可重试的4xx也会重来", func(t *testing.T) {
+		// Google 间歇性 400 之类：状态码是确定性的，但上游已标明瞬时。
+		fs := NewFailoverState(3, false)
+		fs.backoffDelay = time.Nanosecond
+		fs.LastFailoverErr = newTestFailoverErr(400, true, false)
+
+		require.Equal(t, FailoverContinue, fs.HandleSelectionExhausted(context.Background()))
+	})
+
+	t.Run("凭证失效返回Exhausted", func(t *testing.T) {
+		fs := NewFailoverState(3, false)
+		fs.LastFailoverErr = newTestFailoverErr(500, false, false)
+		fs.LastFailoverErr.Stage = service.GatewayFailureStageAccountAuth
+
+		action := fs.HandleSelectionExhausted(context.Background())
+		require.Equal(t, FailoverExhausted, action, "凭证失效重来一轮也是同样结果")
+	})
+
+	t.Run("整档重选轮数有上限_不会活锁", func(t *testing.T) {
+		// 退避分支清空排除列表后，账号可能已被本次请求临时封禁，选号继续失败，
+		// 而那条路径不推进 SwitchCount。没有独立上限就是 2 秒一轮的无限循环。
+		fs := NewFailoverState(1000, false)
+		fs.backoffDelay = time.Nanosecond
+		fs.LastFailoverErr = newTestFailoverErr(502, false, false)
+
+		rounds := 0
+		for range make([]struct{}, maxSelectionExhaustedRetries+5) {
+			if fs.HandleSelectionExhausted(context.Background()) != FailoverContinue {
+				break
+			}
+			rounds++
+		}
+		require.Equal(t, maxSelectionExhaustedRetries, rounds, "应在轮数上限处停下")
+		require.Equal(t, maxSelectionExhaustedRetries, fs.SelectionExhaustedRetries())
+		require.Equal(t, FailoverExhausted, fs.HandleSelectionExhausted(context.Background()))
 	})
 
 	t.Run("503但SwitchCount已超过MaxSwitches_返回Exhausted", func(t *testing.T) {

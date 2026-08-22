@@ -49,6 +49,14 @@ const (
 	// 取值与 maxAccountSwitches 默认值一致：混合定价的大分组仍有充分重选机会，
 	// 同时把整池越线时的无谓选号开销限制在常数级。
 	maxProfitVetoAttempts = 10
+	// maxSelectionExhaustedRetries 单次请求内允许的「整档试完 → 退避 → 重选」轮数上限。
+	//
+	// 必须有这个独立上限：退避分支清空排除列表后，如果账号已在本次请求里被临时封禁，
+	// 选号会继续失败，而这条路径根本走不到 HandleFailoverError，SwitchCount 不前进
+	// ——退避条件于是永远成立，形成 2 秒一轮的活锁（#4925 就是同一类）。
+	// 取值与 maxAccountSwitches / maxProfitVetoAttempts 一致，最坏客户端多等
+	// maxSelectionExhaustedRetries × singleAccountBackoffDelay。
+	maxSelectionExhaustedRetries = 10
 )
 
 // profitVetoExhaustedMessage 是利润否决次数耗尽时返回给客户端的文案。
@@ -113,6 +121,21 @@ type FailoverState struct {
 	profitVetoedAccountIDs map[int64]struct{}
 	// profitVetoCount 本次请求累计的利润否决次数，用于 maxProfitVetoAttempts 上限。
 	profitVetoCount int
+	// selectionExhaustedRetries 本次请求累计的「整档试完 → 退避 → 重选」轮数，
+	// 用于 maxSelectionExhaustedRetries 上限（防活锁，见该常量注释）。
+	selectionExhaustedRetries int
+	// backoffDelay 整档重选前的退避时长；零值使用 singleAccountBackoffDelay。
+	// 存在这个字段只为了让测试把退避压到纳秒级——否则钉活锁上限的测试要跑
+	// maxSelectionExhaustedRetries × 2s。生产路径不设置它。
+	backoffDelay time.Duration
+}
+
+// selectionBackoff 返回整档重选前的退避时长。
+func (s *FailoverState) selectionBackoff() time.Duration {
+	if s.backoffDelay > 0 {
+		return s.backoffDelay
+	}
+	return singleAccountBackoffDelay
 }
 
 // NewFailoverState 创建 failover 状态
@@ -247,9 +270,35 @@ func (s *FailoverState) HandleFailoverError(
 	return FailoverContinue
 }
 
+// shouldRetryAfterSelectionExhausted 判断「本档账号都试过一遍还是没成」之后，
+// 是否值得退避一下再来一轮。
+//
+// 值得重来的是**瞬时**不可用：5xx（含提交前断流那种 502）、429，以及上游明确标成
+// 可重试 / 请求级瞬时的错误。这些账号下一秒可能就恢复，直接给客户端报错等于
+// 放弃了一个本来能成功的请求——「碰到不可用就换号、换不到就继续循环」要的正是这个。
+//
+// 不值得重来的是**确定性**失败：400 参数错、凭证失效。它们在每个账号上都会以同样的
+// 方式失败，重来一轮只是把同一个错误推迟十几秒才告诉客户端。
+func shouldRetryAfterSelectionExhausted(failoverErr *service.UpstreamFailoverError) bool {
+	if failoverErr == nil {
+		return false
+	}
+	if failoverErr.IsCredentialFailure() {
+		return false
+	}
+	if failoverErr.RetryableOnSameAccount || failoverErr.RequestScopedTransient {
+		return true
+	}
+	return failoverErr.StatusCode >= http.StatusInternalServerError ||
+		failoverErr.StatusCode == http.StatusTooManyRequests
+}
+
 // HandleSelectionExhausted 处理选号失败（所有候选账号都在排除列表中）时的退避重试决策。
-// 针对 Antigravity 单账号分组的 503 (MODEL_CAPACITY_EXHAUSTED) 场景：
-// 清除排除列表、等待退避后重新选号。
+//
+// 语义：本档账号已经轮询完一遍都不可用，退避 2s 后清空排除列表再来一轮，
+// 直到轮到能用的号、或者撞上轮数/切换次数上限。调度器保证重选时仍然先高优先级档
+// （filterByMinPriority 取最小优先级那一档，试完才会落到低档），所以这里不需要
+// 自己管分档顺序。
 //
 // 返回 FailoverContinue 时，调用方应设置 SingleAccountRetry context 并 continue。
 // 返回 FailoverExhausted 时，调用方应返回错误响应。
@@ -261,43 +310,55 @@ func (s *FailoverState) HandleSelectionExhausted(ctx context.Context) FailoverAc
 		return FailoverCanceled
 	}
 
-	if s.LastFailoverErr != nil &&
-		s.LastFailoverErr.StatusCode == http.StatusServiceUnavailable &&
-		s.SwitchCount <= s.MaxSwitches {
-
-		// 排除列表全由利润门否决贡献时，清空后会被原样恢复：退避重试拿不到
-		// 任何新候选，而利润否决不推进 SwitchCount，退避条件将永远成立。
-		// 这里直接判定耗尽，避免每 2s 空转一轮的活锁。
-		if s.allExclusionsAreProfitVetoed() {
-			logger.FromContext(ctx).Warn("gateway.failover_selection_exhausted_by_profit_veto",
-				zap.Int("profit_veto_count", s.profitVetoCount),
-				zap.Int("excluded_accounts", len(s.FailedAccountIDs)),
-			)
-			return FailoverExhausted
-		}
-
-		logger.FromContext(ctx).Warn("gateway.failover_single_account_backoff",
-			zap.Duration("backoff_delay", singleAccountBackoffDelay),
-			zap.Int("switch_count", s.SwitchCount),
-			zap.Int("max_switches", s.MaxSwitches),
-		)
-		if !sleepWithContext(ctx, singleAccountBackoffDelay) {
-			return FailoverCanceled
-		}
-		logger.FromContext(ctx).Warn("gateway.failover_single_account_retry",
-			zap.Int("switch_count", s.SwitchCount),
-			zap.Int("max_switches", s.MaxSwitches),
-		)
-		s.FailedAccountIDs = make(map[int64]struct{})
-		// 利润门否决的账号不参与退避重试的解除：判定依据（冻结的下游倍率）在
-		// 同一请求内不变，放它们回池只会被再次否决。
-		for id := range s.profitVetoedAccountIDs {
-			s.FailedAccountIDs[id] = struct{}{}
-		}
-		return FailoverContinue
+	if !shouldRetryAfterSelectionExhausted(s.LastFailoverErr) || s.SwitchCount > s.MaxSwitches {
+		return FailoverExhausted
 	}
-	return FailoverExhausted
+
+	// 排除列表全由利润门否决贡献时，清空后会被原样恢复：退避重试拿不到
+	// 任何新候选，而利润否决不推进 SwitchCount，退避条件将永远成立。
+	// 这里直接判定耗尽，避免每 2s 空转一轮的活锁。
+	if s.allExclusionsAreProfitVetoed() {
+		logger.FromContext(ctx).Warn("gateway.failover_selection_exhausted_by_profit_veto",
+			zap.Int("profit_veto_count", s.profitVetoCount),
+			zap.Int("excluded_accounts", len(s.FailedAccountIDs)),
+		)
+		return FailoverExhausted
+	}
+
+	// 轮数上限：清空排除列表后账号可能已被本次请求临时封禁，选号会继续失败，
+	// 而那条路径不推进 SwitchCount。没有这个独立上限就是 2 秒一轮的活锁。
+	if s.selectionExhaustedRetries >= maxSelectionExhaustedRetries {
+		logger.FromContext(ctx).Warn("gateway.failover_selection_retry_budget_exhausted",
+			zap.Int("selection_exhausted_retries", s.selectionExhaustedRetries),
+			zap.Int("max_selection_exhausted_retries", maxSelectionExhaustedRetries),
+			zap.Int("switch_count", s.SwitchCount),
+			zap.Int("upstream_status", s.LastFailoverErr.StatusCode),
+		)
+		return FailoverExhausted
+	}
+	s.selectionExhaustedRetries++
+
+	logger.FromContext(ctx).Warn("gateway.failover_selection_exhausted_backoff",
+		zap.Duration("backoff_delay", s.selectionBackoff()),
+		zap.Int("selection_exhausted_retries", s.selectionExhaustedRetries),
+		zap.Int("switch_count", s.SwitchCount),
+		zap.Int("max_switches", s.MaxSwitches),
+		zap.Int("upstream_status", s.LastFailoverErr.StatusCode),
+	)
+	if !sleepWithContext(ctx, s.selectionBackoff()) {
+		return FailoverCanceled
+	}
+	s.FailedAccountIDs = make(map[int64]struct{})
+	// 利润门否决的账号不参与退避重试的解除：判定依据（冻结的下游倍率）在
+	// 同一请求内不变，放它们回池只会被再次否决。
+	for id := range s.profitVetoedAccountIDs {
+		s.FailedAccountIDs[id] = struct{}{}
+	}
+	return FailoverContinue
 }
+
+// SelectionExhaustedRetries 返回本次请求累计的整档重选轮数（供日志/测试使用）。
+func (s *FailoverState) SelectionExhaustedRetries() int { return s.selectionExhaustedRetries }
 
 // needForceCacheBilling 判断 failover 时是否需要强制缓存计费。
 // 粘性会话实际切换账号、或上游明确标记时，将 input_tokens 转为 cache_read 计费。
