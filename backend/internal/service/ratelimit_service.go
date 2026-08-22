@@ -2553,7 +2553,7 @@ func (s *RateLimitService) handleStreamDeliveryFailure(ctx context.Context, acco
 	// 达到阈值，执行相应操作
 	switch settings.Action {
 	case StreamTimeoutActionTempUnsched:
-		return s.triggerStreamTimeoutTempUnsched(ctx, account, settings, keyword, errorMessage)
+		return s.triggerStreamTimeoutTempUnsched(ctx, account, settings, model, keyword, errorMessage)
 	case StreamTimeoutActionError:
 		return s.triggerStreamTimeoutError(ctx, account, model, errorMessage)
 	default:
@@ -2562,7 +2562,9 @@ func (s *RateLimitService) handleStreamDeliveryFailure(ctx context.Context, acco
 }
 
 // triggerStreamTimeoutTempUnsched 触发流超时临时不可调度
-func (s *RateLimitService) triggerStreamTimeoutTempUnsched(ctx context.Context, account *Account, settings *StreamTimeoutSettings, keyword, errorMessage string) bool {
+//
+// model 会随停调状态一起落库，后台探针据此复现同一条链路（见 TempUnschedState.Model）。
+func (s *RateLimitService) triggerStreamTimeoutTempUnsched(ctx context.Context, account *Account, settings *StreamTimeoutSettings, model, keyword, errorMessage string) bool {
 	now := time.Now()
 	until := now.Add(time.Duration(settings.TempUnschedMinutes) * time.Minute)
 
@@ -2573,6 +2575,7 @@ func (s *RateLimitService) triggerStreamTimeoutTempUnsched(ctx context.Context, 
 		MatchedKeyword:  keyword,
 		RuleIndex:       -1, // 表示系统级规则
 		ErrorMessage:    errorMessage,
+		Model:           model,
 	}
 
 	reason := ""

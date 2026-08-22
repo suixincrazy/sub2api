@@ -102,8 +102,10 @@ type streamProbeAccountStore interface {
 }
 
 // streamHealthProber 抽象一次「这个账号现在能不能交付一条完整的流」的探测。
+//
+// model 是当初把账号罚下线时客户端请求的模型；为空时由实现方回落到默认测试模型。
 type streamHealthProber interface {
-	ProbeClaudeStreamHealth(ctx context.Context, account *Account) error
+	ProbeClaudeStreamHealth(ctx context.Context, account *Account, model string) error
 }
 
 // AccountStreamProbeService 周期性探测「因流交付失败被临时停调」的 Anthropic 账号，
@@ -271,7 +273,7 @@ func (s *AccountStreamProbeService) probeOne(ctx context.Context, account *Accou
 
 	probeCtx, cancel := context.WithTimeout(ctx, streamProbeTimeout)
 	defer cancel()
-	probeErr := s.prober.ProbeClaudeStreamHealth(probeCtx, account)
+	probeErr := s.prober.ProbeClaudeStreamHealth(probeCtx, account, state.Model)
 
 	if errors.Is(probeErr, errStreamProbeUnsupported) || errors.Is(probeErr, errStreamProbeInconclusive) {
 		// 探不了、或者探了但下不了结论：把窗口还原成原本的到点时间，
@@ -408,7 +410,11 @@ func parseStreamProbeState(reason string) *TempUnschedState {
 // 已知盲点：和面板那个按钮一样，这里不刷新 OAuth access_token。token 过期会得到
 // 401，而 401 归入 inconclusive，所以最坏结果只是探不出结论、退回自然到点，
 // 不会误伤账号。
-func (s *AccountTestService) ProbeClaudeStreamHealth(ctx context.Context, account *Account) error {
+//
+// model 为当初触发停调的客户端请求模型，空则回落到 claude.DefaultTestModel。
+// 必须优先用前者：中转类账号的上游只供应自己那份模型清单，拿默认模型去探会吃
+// 404 model_not_found，而 404 归入 inconclusive，探针对这类账号就永远下不了结论。
+func (s *AccountTestService) ProbeClaudeStreamHealth(ctx context.Context, account *Account, model string) error {
 	if s == nil || account == nil {
 		return fmt.Errorf("%w: nil service or account", errStreamProbeInconclusive)
 	}
@@ -418,7 +424,10 @@ func (s *AccountTestService) ProbeClaudeStreamHealth(ctx context.Context, accoun
 		return errStreamProbeUnsupported
 	}
 
-	modelID := claude.DefaultTestModel
+	modelID := strings.TrimSpace(model)
+	if modelID == "" {
+		modelID = claude.DefaultTestModel
+	}
 	var apiURL, authToken string
 
 	switch {

@@ -62,13 +62,16 @@ type fakeStreamProber struct {
 	mu    sync.Mutex
 	err   error
 	calls int
+	// gotModels 记录每次探测收到的模型，用来断言探针复现的是罚号时那条链路。
+	gotModels []string
 	// onProbe 在探测发生的瞬间回调，用来断言「探测开始前窗口已经被顶住」。
 	onProbe func()
 }
 
-func (f *fakeStreamProber) ProbeClaudeStreamHealth(context.Context, *Account) error {
+func (f *fakeStreamProber) ProbeClaudeStreamHealth(_ context.Context, _ *Account, model string) error {
 	f.mu.Lock()
 	f.calls++
+	f.gotModels = append(f.gotModels, model)
 	cb := f.onProbe
 	err := f.err
 	f.mu.Unlock()
@@ -76,6 +79,12 @@ func (f *fakeStreamProber) ProbeClaudeStreamHealth(context.Context, *Account) er
 		cb()
 	}
 	return err
+}
+
+func (f *fakeStreamProber) models() []string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]string(nil), f.gotModels...)
 }
 
 func (f *fakeStreamProber) callCount() int {
@@ -255,6 +264,72 @@ func TestProbeOneExtendsCooldownWhenStillUnhealthy(t *testing.T) {
 	assert.Equal(t, 1, persisted.ProbeFailures, "失败次数要落库，下一轮才能继续退避")
 	assert.Equal(t, streamProbeKeywordTruncated, persisted.MatchedKeyword, "keyword 必须保留，否则下一轮认不出这是自己的停调")
 	assert.Equal(t, last.until.Unix(), persisted.UntilUnix)
+}
+
+// 探针必须拿「当初把账号罚下线的那个模型」去探。
+//
+// 回归的是一个让探针对中转类账号完全失效的缺陷：原先固定用 claude.DefaultTestModel，
+// 而中转上游只供应自己那份模型清单，探测请求直接吃 404 model_not_found；404 归入
+// inconclusive，于是每一轮都「探了但下不了结论」，账号只能靠自然到点回池——探针
+// 白跑、还烧上游额度。线上实测连续 18 轮全是 inconclusive。
+func TestProbeOneProbesWithModelThatTriggeredCooldown(t *testing.T) {
+	until := time.Now().Add(15 * time.Second)
+	account := streamProbeAccount(t, until, streamProbeKeywordTruncated, 0)
+
+	state := parseStreamProbeState(account.TempUnschedulableReason)
+	require.NotNil(t, state)
+	state.Model = "claude-opus-5"
+
+	store := &fakeStreamProbeStore{}
+	prober := &fakeStreamProber{}
+	svc := newTestStreamProbeService(store, prober)
+
+	svc.probeOne(context.Background(), account, state)
+
+	require.Equal(t, []string{"claude-opus-5"}, prober.models(),
+		"必须复现罚号时那条链路，否则中转号永远探不出结论")
+}
+
+// 停调状态里没有模型时（旧数据、或触发源没记）回落到默认测试模型，不能把空串发给上游。
+func TestProbeOneFallsBackToDefaultModelWhenStateHasNone(t *testing.T) {
+	until := time.Now().Add(15 * time.Second)
+	account := streamProbeAccount(t, until, streamProbeKeywordTruncated, 0)
+	state := parseStreamProbeState(account.TempUnschedulableReason)
+	require.NotNil(t, state)
+	require.Empty(t, state.Model)
+
+	store := &fakeStreamProbeStore{}
+	prober := &fakeStreamProber{}
+	svc := newTestStreamProbeService(store, prober)
+
+	svc.probeOne(context.Background(), account, state)
+
+	// 探针服务原样把空模型交给实现方，由 ProbeClaudeStreamHealth 决定回落，
+	// 这样回落规则只有一处。
+	require.Equal(t, []string{""}, prober.models())
+}
+
+// 续停时模型必须一起保住：丢了下一轮又会退回默认模型去探，缺陷复现。
+func TestProbeOneKeepsModelWhenExtendingCooldown(t *testing.T) {
+	until := time.Now().Add(15 * time.Second)
+	account := streamProbeAccount(t, until, streamProbeKeywordTruncated, 0)
+	state := parseStreamProbeState(account.TempUnschedulableReason)
+	require.NotNil(t, state)
+	state.Model = "claude-opus-5"
+
+	store := &fakeStreamProbeStore{}
+	prober := &fakeStreamProber{err: errStreamProbeTestFailure}
+	svc := newTestStreamProbeService(store, prober)
+
+	svc.probeOne(context.Background(), account, state)
+
+	setCalls, _ := store.snapshot()
+	require.Len(t, setCalls, 2)
+	for i, call := range setCalls {
+		var persisted TempUnschedState
+		require.NoError(t, json.Unmarshal([]byte(call.reason), &persisted))
+		assert.Equal(t, "claude-opus-5", persisted.Model, "第 %d 次写入丢了模型", i+1)
+	}
 }
 
 // 连续失败也只续停一分钟——单档，不做逐级退避，主号恢复要快。

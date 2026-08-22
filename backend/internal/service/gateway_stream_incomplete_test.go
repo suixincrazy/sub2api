@@ -129,6 +129,9 @@ func TestAnthropicPassthrough_AbnormalStopReasonPenalizesAccount(t *testing.T) {
 	var state TempUnschedState
 	require.NoError(t, json.Unmarshal([]byte(repo.lastTempReason), &state))
 	require.Equal(t, "stream_truncated", state.MatchedKeyword)
+	// 模型要一路落到停调状态里，后台探针靠它复现同一条链路；丢了就退回默认模型，
+	// 中转类账号会永远探不出结论（见 TempUnschedState.Model）。
+	require.Equal(t, "claude-opus-5", state.Model)
 
 	events := opsEvents(t, c)
 	require.Len(t, events, 1)
