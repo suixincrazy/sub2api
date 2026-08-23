@@ -1036,6 +1036,19 @@ type GatewayConfig struct {
 	// MaxLineSize: 上游 SSE 单行最大字节数（0使用默认值）
 	MaxLineSize int `mapstructure:"max_line_size"`
 
+	// AnthropicHoldbackWindowMs: Anthropic 透传流「零暴露持流」窗口（毫秒），0 表示禁用。
+	//
+	// 上游偶发返回协议合法但没把话说完的回合（HTTP 200 / stop_reason=end_turn /
+	// output_tokens 是个正的小数值 / 只吐一句开场白）。判据全在 message_delta 里，而正文
+	// 早在第一个 content_block_delta 就 flush 给客户端了，所以事后只能归因、不能重试。
+	// 开启后网关把首帧可见增量之后的帧攒住不发，攒到能判定为止：判定为可疑就丢掉缓冲换号
+	// 重来（每次客户端请求最多丢一次），否则原样放行。
+	//
+	// 3000ms 是拿 48 小时真实流量标定的：疑似截断回合从首帧到流结束的耗时 p95=2591ms，
+	// 3000ms 覆盖 97.0%；再加到 5000ms 只多覆盖 2.1 个百分点，却把延迟代价整体抬高。
+	// 正文超过短回合上限或出现 tool_use 块都会提前放行，所以多数长回答等不满这个窗口。
+	AnthropicHoldbackWindowMs int `mapstructure:"anthropic_holdback_window_ms"`
+
 	// 是否记录上游错误响应体摘要（避免输出请求内容）
 	LogUpstreamErrorBody bool `mapstructure:"log_upstream_error_body"`
 	// 上游错误响应体记录最大字节数（超过会截断）
@@ -2471,6 +2484,9 @@ func setDefaults() {
 	viper.SetDefault("gateway.image_stream_keepalive_interval", 10)
 	viper.SetDefault("gateway.image_nonstream_keepalive_interval", 0)
 	viper.SetDefault("gateway.max_line_size", 500*1024*1024)
+	// 必须显式 SetDefault，AutomaticEnv 只能覆盖已注册的键、不会新增键，
+	// 否则 GATEWAY_ANTHROPIC_HOLDBACK_WINDOW_MS 无法在不重新构建的前提下改这个值。
+	viper.SetDefault("gateway.anthropic_holdback_window_ms", 3000)
 	viper.SetDefault("gateway.scheduling.sticky_session_max_waiting", 3)
 	viper.SetDefault("gateway.scheduling.sticky_session_wait_timeout", 120*time.Second)
 	viper.SetDefault("gateway.scheduling.fallback_wait_timeout", 30*time.Second)
@@ -3340,6 +3356,13 @@ func (c *Config) Validate() error {
 	if c.Gateway.StreamKeepaliveInterval != 0 &&
 		(c.Gateway.StreamKeepaliveInterval < 5 || c.Gateway.StreamKeepaliveInterval > 30) {
 		return fmt.Errorf("gateway.stream_keepalive_interval must be 0 or between 5-30 seconds")
+	}
+	if c.Gateway.AnthropicHoldbackWindowMs < 0 {
+		return fmt.Errorf("gateway.anthropic_holdback_window_ms must be non-negative")
+	}
+	if c.Gateway.AnthropicHoldbackWindowMs != 0 &&
+		(c.Gateway.AnthropicHoldbackWindowMs < 500 || c.Gateway.AnthropicHoldbackWindowMs > 15000) {
+		return fmt.Errorf("gateway.anthropic_holdback_window_ms must be 0 or between 500-15000 milliseconds")
 	}
 	if c.Gateway.ImageStreamDataIntervalTimeout < 0 {
 		return fmt.Errorf("gateway.image_stream_data_interval_timeout must be non-negative")

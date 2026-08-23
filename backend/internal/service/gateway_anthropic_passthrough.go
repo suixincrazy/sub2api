@@ -584,9 +584,124 @@ const (
 	// 留这条中间带是因为清零是**否掉已积累证据**的动作，宁可保守。
 	anthropicHealthyTurnMinProseRunes = 200
 	// anthropicShortTurnStreakThreshold 连续多少发才解绑。
-	// 1 会频繁误伤合法短回答的 prompt-cache 亲和性，见 IncrStickyShortTurnStreak 的说明。
-	anthropicShortTurnStreakThreshold = 2
+	//
+	// 从 2 降到 1 的依据是实测误报率：拿三份真实对话按 message.id 归并成 283 次响应回放，
+	// 被判可疑的 ~110 发**全部**后接「继续」这类人工推动或 Stop hook 把任务推回来，未被判
+	// 的（out=189/227/792/1796）全是实质回答，误报率为 0。阈值 2 意味着客户端必须先吃满
+	// 两发截断才换号；既然误报代价只是丢一次 prompt cache 而漏判代价是用户再吃一发断流，
+	// 1 是更划算的一侧。
+	anthropicShortTurnStreakThreshold = 1
 )
+
+// anthropicHoldbackDecision 是提交窗口内对「这一帧之后怎么办」的三态判定。
+type anthropicHoldbackDecision int
+
+const (
+	// anthropicHoldbackKeep 继续持流：证据还不够，不能提交也不能丢弃。
+	anthropicHoldbackKeep anthropicHoldbackDecision = iota
+	// anthropicHoldbackRelease 放行：把攒下的帧按原样写给客户端，此后正常透传。
+	anthropicHoldbackRelease
+	// anthropicHoldbackDiscard 丢弃重试：这一回合疑似截断，且提交窗口仍完好，
+	// 丢掉缓冲换个账号重来，客户端永远看不到这条截断响应。
+	anthropicHoldbackDiscard
+)
+
+// anthropicHoldbackVerdict 决定持流缓冲的去向。
+//
+// 为什么需要它：解绑只能减少**重复**暴露——检测发生在 message_delta，而正文早在第一个
+// content_block_delta 就 flush 出去了，200 已钉死，第一发截断必然被客户端看到。要做到零
+// 暴露，就必须把提交点推后到「能判定」之后。判定量只有 stop_reason + output_tokens，两者
+// 都在 message_delta 里，所以持流必须一直撑到那一帧。
+//
+// 撑到 message_delta 的代价是首字延迟，所以给三条提前放行的出口，任何一条成立就立刻放行：
+//  1. 出现 tool_use 块——工具回合永远不是截断形态，没有再等的理由；
+//  2. 正文已超过短回合上限——已经不可能被判可疑，再等只是白等；
+//  3. 持流窗口耗尽——拿真实数据标定过，见 GatewayConfig.AnthropicHoldbackWindowMs。
+//
+// retryUsed 是本次请求已经因为持流丢弃过一次的标记。它必须存在：如果用户问的问题**本来**
+// 就只有一句话的答案，每个账号都会给出同样的短回合，不设上限就会一路重试到调度耗尽，最后
+// 把一个完好的短回答变成 502。丢弃一次就够了——真截断换个号大概率就好，真短答案则第二次
+// 原样放行。
+func anthropicHoldbackVerdict(
+	windowElapsed bool,
+	stopReason string,
+	proseRunes int,
+	outputTokens int,
+	sawToolUseBlock bool,
+	retryUsed bool,
+) anthropicHoldbackDecision {
+	if sawToolUseBlock {
+		return anthropicHoldbackRelease
+	}
+	if proseRunes > anthropicShortTurnProseRuneLimit {
+		return anthropicHoldbackRelease
+	}
+	// stop_reason 已知时判定是确定的，优先于窗口：窗口只是「等不起了」的兜底，
+	// 而这里已经拿到了全部判据。
+	if strings.TrimSpace(stopReason) != "" {
+		if !retryUsed && anthropicTurnLooksSuspiciouslyShort(stopReason, proseRunes, outputTokens, sawToolUseBlock) {
+			return anthropicHoldbackDiscard
+		}
+		return anthropicHoldbackRelease
+	}
+	if windowElapsed {
+		return anthropicHoldbackRelease
+	}
+	return anthropicHoldbackKeep
+}
+
+// anthropicHoldbackObserver 在持流期间独立采集判定量。
+//
+// 必须与 handleStreamingResponseAnthropicAPIKeyPassthrough 里的累加器分开：那些量由
+// processLine 累计，而持流期的帧要等 flushPendingPrelude 重放才会过 processLine，
+// 共用就会重复计数。
+type anthropicHoldbackObserver struct {
+	proseRunes         int
+	outputTokens       int
+	stopReason         string
+	sawToolUseBlock    bool
+	firstCommitPointAt time.Time
+}
+
+// observe 吃下一帧已解析的 SSE data。commits 是这一帧在旧行为下会不会提交响应，
+// now 由调用方传入，便于测试注入时钟。
+func (o *anthropicHoldbackObserver) observe(parsed gjson.Result, commits bool, now time.Time) {
+	switch strings.TrimSpace(parsed.Get("type").String()) {
+	case "message_delta":
+		if r := strings.TrimSpace(parsed.Get("delta.stop_reason").String()); r != "" {
+			o.stopReason = r
+		}
+	case "content_block_start":
+		if strings.EqualFold(strings.TrimSpace(parsed.Get("content_block.type").String()), "tool_use") {
+			o.sawToolUseBlock = true
+		}
+	}
+	o.proseRunes += anthropicVisibleProseRunes(parsed)
+	// output_tokens 在 message_start 里是初始小值、在 message_delta 里才是终值，
+	// 两条路径都看并取最大值，避免依赖帧序。
+	for _, path := range []string{"usage.output_tokens", "message.usage.output_tokens"} {
+		if v := parsed.Get(path); v.Exists() {
+			if n := int(v.Int()); n > o.outputTokens {
+				o.outputTokens = n
+			}
+		}
+	}
+	// 窗口从「旧行为下本会提交的那一帧」起算。这样窗口度量的正好是本次改动**新增**的
+	// 延迟，在它之前的持流（message_start / ping / 空思考块 / signature）本来就存在。
+	// 思考模式下这一帧是第一个 thinking_delta，所以长思考回合最多被推迟一个窗口就放行，
+	// 不会出现「整段思考期客户端全黑」——那期间 keepalive 在 !streamCommitted 下不写字节。
+	if commits && o.firstCommitPointAt.IsZero() {
+		o.firstCommitPointAt = now
+	}
+}
+
+// windowElapsed 判断持流窗口是否已耗尽。还没到原提交点时永不算耗尽。
+func (o *anthropicHoldbackObserver) windowElapsed(now time.Time, window time.Duration) bool {
+	if window <= 0 || o.firstCommitPointAt.IsZero() {
+		return false
+	}
+	return now.Sub(o.firstCommitPointAt) >= window
+}
 
 // anthropicTurnLooksSuspiciouslyShort 判定这一回合是否为「协议合法但疑似没把话说完」。
 //
@@ -892,6 +1007,93 @@ func (s *GatewayService) newAnthropicEmptyStreamFailoverError(c *gin.Context, re
 	}
 }
 
+// anthropicHoldbackRetriedKey 标记本次客户端请求已经因为持流判定丢弃过一次上游响应。
+// 放在 gin.Context 上而不是 GatewayService 上：作用域必须是「一次客户端请求」，
+// 跨账号重试共享同一个 gin.Context，正是需要的粒度。
+const anthropicHoldbackRetriedKey = "anthropic_holdback_retried"
+
+func anthropicHoldbackRetryUsed(c *gin.Context) bool {
+	if c == nil {
+		return false
+	}
+	v, ok := c.Get(anthropicHoldbackRetriedKey)
+	if !ok {
+		return false
+	}
+	used, _ := v.(bool)
+	return used
+}
+
+func markAnthropicHoldbackRetryUsed(c *gin.Context) {
+	if c != nil {
+		c.Set(anthropicHoldbackRetriedKey, true)
+	}
+}
+
+const anthropicShortTurnHoldbackMessage = "Anthropic upstream ended the turn after an unusually short reply"
+
+func anthropicShortTurnHoldbackErrorBody() []byte {
+	body, err := json.Marshal(map[string]any{
+		"type": "error",
+		"error": map[string]any{
+			"type":    "upstream_error",
+			"code":    "anthropic_short_turn_holdback",
+			"message": anthropicShortTurnHoldbackMessage,
+		},
+	})
+	if err != nil {
+		return []byte(`{"type":"error","error":{"type":"upstream_error","code":"anthropic_short_turn_holdback","message":"Anthropic upstream ended the turn after an unusually short reply"}}`)
+	}
+	return body
+}
+
+// newAnthropicShortTurnFailoverError 把「协议合法但疑似截断，且提交窗口仍完好」标记为
+// 可 failover 的上游异常，让这条响应在写给客户端之前就被换号重试掉。
+//
+// 与 noteAnthropicShortTurnStreak 的分工：那个是事后解绑，只能让**下一发**落到别的账号，
+// 治不了当前这一发；这个发生在提交之前，客户端根本看不到截断内容——这才是零暴露。
+//
+// 刻意不罚账号：判据是启发式的，Scope=Request + RequestScopedTransient 是这个仓库里
+// 「故障与账号健康无关」的既有标记，会让 TempUnscheduleRetryableError 直接 return，
+// 也让 ShouldReportAccountScheduleFailure 不把它算进调度健康度。换号本身由
+// FailedAccountIDs 保证——本次请求不会再选回这个账号。
+//
+// 不设 RetryableOnSameAccount：同一个坏中转上重试只会再截断一次。
+func (s *GatewayService) newAnthropicShortTurnFailoverError(
+	c *gin.Context, resp *http.Response, account *Account, model string, proseRunes, outputTokens int, stopReason string,
+) *UpstreamFailoverError {
+	markAnthropicHoldbackRetryUsed(c)
+	upstreamRequestID := ""
+	headers := http.Header{}
+	if resp != nil {
+		upstreamRequestID = resp.Header.Get("x-request-id")
+		headers = resp.Header.Clone()
+	}
+	appendOpsUpstreamError(c, OpsUpstreamErrorEvent{
+		Platform:           account.Platform,
+		AccountID:          account.ID,
+		AccountName:        account.Name,
+		UpstreamStatusCode: http.StatusBadGateway,
+		UpstreamRequestID:  upstreamRequestID,
+		Kind:               "short_turn_holdback_failover",
+		Message:            anthropicShortTurnHoldbackMessage,
+		Detail: fmt.Sprintf("stop_reason=%s prose_runes=%d output_tokens=%d",
+			stopReason, proseRunes, outputTokens),
+	})
+	slog.Warn("anthropic_short_turn_holdback_failover",
+		"account_id", account.ID, "account_name", account.Name, "model", model,
+		"stop_reason", stopReason, "prose_runes", proseRunes, "output_tokens", outputTokens,
+		"upstream_request_id", upstreamRequestID)
+	return &UpstreamFailoverError{
+		StatusCode:             http.StatusBadGateway,
+		ResponseBody:           anthropicShortTurnHoldbackErrorBody(),
+		ResponseHeaders:        headers,
+		Scope:                  GatewayFailureScopeRequest,
+		RequestScopedTransient: true,
+		Reason:                 GatewayFailureReason("anthropic_short_turn_holdback"),
+	}
+}
+
 func (s *GatewayService) buildUpstreamRequestAnthropicAPIKeyPassthrough(
 	ctx context.Context,
 	c *gin.Context,
@@ -1102,6 +1304,32 @@ func (s *GatewayService) handleStreamingResponseAnthropicAPIKeyPassthrough(
 	streamCommitted := c.Writer.Written()
 	refusalReported := false
 
+	// 零暴露持流：把原本会提交响应的帧继续攒在 pendingPreludeLines 里，直到能判定这一
+	// 回合是不是疑似截断。见 anthropicHoldbackVerdict。窗口配成 0 就完全退化成旧行为。
+	holdbackWindow := time.Duration(0)
+	if s.cfg != nil && s.cfg.Gateway.AnthropicHoldbackWindowMs > 0 {
+		holdbackWindow = time.Duration(s.cfg.Gateway.AnthropicHoldbackWindowMs) * time.Millisecond
+	}
+	holdbackActive := holdbackWindow > 0
+	holdbackRetryUsed := anthropicHoldbackRetryUsed(c)
+	holdback := &anthropicHoldbackObserver{}
+	// 独立定时器，不复用 keepalive：窗口是毫秒级而 keepalive 默认 10 秒，靠它兜底会让
+	// 「上游吐了两句就长时间静默」的流白等十秒。定时器在首帧可见增量到达时才 arm。
+	var holdbackTimer *time.Timer
+	var holdbackCh <-chan time.Time
+	armHoldbackTimer := func() {
+		if !holdbackActive || holdbackTimer != nil || holdback.firstCommitPointAt.IsZero() {
+			return
+		}
+		holdbackTimer = time.NewTimer(holdbackWindow)
+		holdbackCh = holdbackTimer.C
+	}
+	defer func() {
+		if holdbackTimer != nil {
+			holdbackTimer.Stop()
+		}
+	}()
+
 	processLine := func(line string) {
 		if data, ok := extractAnthropicSSEDataLine(line); ok {
 			trimmed := strings.TrimSpace(data)
@@ -1211,7 +1439,14 @@ func (s *GatewayService) handleStreamingResponseAnthropicAPIKeyPassthrough(
 				if !sawTerminalEvent && !streamCommitted && !clientDisconnected &&
 					c.Request.Context().Err() == nil {
 					pendingPreludeLines = pendingPreludeLines[:0]
-					return nil, s.newAnthropicEmptyStreamFailoverError(c, resp, account, "missing terminal event")
+					reason := "missing terminal event"
+					// 持流期间上游中途死掉：提交窗口仍然完好，所以照样切号，但别把它
+					// 说成空流——正文其实已经吐了一部分，只是还没写给客户端。
+					if holdbackActive && !holdback.firstCommitPointAt.IsZero() {
+						reason = fmt.Sprintf("stream ended mid-content during holdback (prose_runes=%d output_tokens=%d)",
+							holdback.proseRunes, holdback.outputTokens)
+					}
+					return nil, s.newAnthropicEmptyStreamFailoverError(c, resp, account, reason)
 				}
 				flushPendingPrelude()
 				if !clientDisconnected {
@@ -1240,12 +1475,17 @@ func (s *GatewayService) handleStreamingResponseAnthropicAPIKeyPassthrough(
 				// 另排除三类换号无用的情形：客户端取消/超时与账号无关，行超长是本地
 				// MaxLineSize 配置问题。
 				if !sawTerminalEvent && !streamCommitted && !clientDisconnected &&
-					len(pendingPreludeLines) == 0 &&
+					(len(pendingPreludeLines) == 0 || (holdbackActive && !holdback.firstCommitPointAt.IsZero())) &&
 					c.Request.Context().Err() == nil &&
 					!errors.Is(ev.err, context.Canceled) &&
 					!errors.Is(ev.err, context.DeadlineExceeded) &&
 					!errors.Is(ev.err, bufio.ErrTooLong) {
-					return nil, s.newAnthropicEmptyStreamFailoverError(c, resp, account, fmt.Sprintf("stream read error before any data: %v", ev.err))
+					readErrReason := fmt.Sprintf("stream read error before any data: %v", ev.err)
+					if holdbackActive && !holdback.firstCommitPointAt.IsZero() {
+						readErrReason = fmt.Sprintf("stream read error during holdback (prose_runes=%d output_tokens=%d): %v",
+							holdback.proseRunes, holdback.outputTokens, ev.err)
+					}
+					return nil, s.newAnthropicEmptyStreamFailoverError(c, resp, account, readErrReason)
 				}
 				flushPendingPrelude()
 				if sawTerminalEvent {
@@ -1271,6 +1511,10 @@ func (s *GatewayService) handleStreamingResponseAnthropicAPIKeyPassthrough(
 			if !streamCommitted {
 				pendingPreludeLines = append(pendingPreludeLines, line)
 				commitPrelude := false
+				// holdEligible 排除终止帧与错误帧：message_stop / error / [DONE] 到了就说明
+				// 没什么可等的了，继续攥着只是白拖延迟；错误帧更不能压。
+				holdEligible := false
+				var holdFrame gjson.Result
 				if data, ok := extractAnthropicSSEDataLine(line); ok {
 					data = strings.TrimSpace(data)
 					if data != "" && isAnthropicSafetyRefusalResponse(http.StatusForbidden, []byte(data)) {
@@ -1278,6 +1522,14 @@ func (s *GatewayService) handleStreamingResponseAnthropicAPIKeyPassthrough(
 						return nil, s.newAnthropicSafetyFailoverError(c, resp, account, []byte(data))
 					}
 					commitPrelude = data != "" && anthropicSSEPayloadCommitsResponse([]byte(data))
+					if holdbackActive && data != "" && data != "[DONE]" && json.Valid([]byte(data)) {
+						holdFrame = gjson.Parse(data)
+						switch strings.TrimSpace(holdFrame.Get("type").String()) {
+						case "message_stop", "error":
+						default:
+							holdEligible = true
+						}
+					}
 				} else if strings.HasPrefix(strings.ToLower(trimmedLine), "event:") {
 					commitPrelude = anthropicStreamEventIsTerminal(strings.TrimSpace(strings.TrimPrefix(trimmedLine, "event:")), "")
 				}
@@ -1291,6 +1543,29 @@ func (s *GatewayService) handleStreamingResponseAnthropicAPIKeyPassthrough(
 						}
 					}
 				}
+				// 零暴露持流：每一帧都要过判定，不能只看会提交的帧——stop_reason 落在
+				// message_delta 上，而它在 anthropicSSEPayloadCommitsResponse 里返回 false，
+				// 只在提交帧上判就永远拿不到判据。
+				if holdEligible {
+					now := time.Now()
+					holdback.observe(holdFrame, commitPrelude, now)
+					armHoldbackTimer()
+					switch anthropicHoldbackVerdict(
+						holdback.windowElapsed(now, holdbackWindow),
+						holdback.stopReason, holdback.proseRunes, holdback.outputTokens,
+						holdback.sawToolUseBlock, holdbackRetryUsed,
+					) {
+					case anthropicHoldbackKeep:
+						commitPrelude = false
+					case anthropicHoldbackRelease:
+						commitPrelude = true
+					case anthropicHoldbackDiscard:
+						pendingPreludeLines = pendingPreludeLines[:0]
+						return nil, s.newAnthropicShortTurnFailoverError(
+							c, resp, account, model,
+							holdback.proseRunes, holdback.outputTokens, holdback.stopReason)
+					}
+				}
 				if commitPrelude {
 					flushPendingPrelude()
 				} else {
@@ -1299,6 +1574,17 @@ func (s *GatewayService) handleStreamingResponseAnthropicAPIKeyPassthrough(
 				continue
 			}
 			processLine(line)
+
+		case <-holdbackCh:
+			// 持流窗口到点：判定要的 stop_reason 始终没来（上游吐了几句就长时间静默），
+			// 不能让客户端为一个启发式白等，原样放行。
+			holdbackCh = nil
+			if !streamCommitted {
+				flushPendingPrelude()
+				if !clientDisconnected {
+					flusher.Flush()
+				}
+			}
 
 		case <-intervalCh:
 			lastRead := time.Unix(0, atomic.LoadInt64(&lastReadAt))

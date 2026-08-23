@@ -201,6 +201,21 @@ func TestAnthropicVisibleProseRunes(t *testing.T) {
 // 端到端：两条信号都放行的「协议合法但疑似没把话说完」，连续两发后必须解除粘性绑定，
 // 让客户端的下一发重新选号落到同优先级的另一个账号上。
 //
+// requireUnboundOnce 断言阈值 1 下「一发可疑短回合就解绑」这一整套后果。
+//
+// 为什么不再像旧版那样先断言 streaks==1 再跑第二发：阈值 1 下第一发就达标，解绑路径会
+// 顺手把连击清零，所以 streaks 里根本不会留下痕迹。各条用例的诊断价值不受影响——它们靠
+// 的是「这一发到底判没判成可疑」，而 deletedSessions 就是那个信号：如果这一发被误当成
+// 正面证据（旧实现按字节数数中文正是如此），清零之后不会有任何解绑。
+func requireUnboundOnce(t *testing.T, cache *shortTurnStreakCache, groupID int64, sessionKey string) {
+	t.Helper()
+	key := shortTurnStreakKey(groupID, sessionKey)
+	require.Equal(t, 1, cache.deletedSessions[sessionKey], "阈值 1：一发可疑短回合就必须解除粘性绑定")
+	require.NotContains(t, cache.sessionBindings, sessionKey)
+	require.NotContains(t, cache.streaks, key, "解绑后必须清零连击数，否则会来回解绑")
+	require.Equal(t, 1, cache.resets[key], "解绑必须伴随一次清零")
+}
+
 // 这就是修复的核心：stop_reason=end_turn 在白名单里（信号 1 放行）、output_tokens=30>0
 // （信号 2 要求 <=0，放行），旧代码判为健康 → 不罚号 → 粘性把下一发原样送回同一个账号，
 // 表现为「一直断流，自动切回可用账号没起作用」。
@@ -210,20 +225,8 @@ func TestAnthropicPassthrough_ShortTurnStreakUnbindsStickySession(t *testing.T) 
 	cache := newShortTurnStreakCache(sessionKey, 9)
 	svc, repo := newShortTurnTestGatewayService(t, cache)
 
-	// 第一发：只累计，不动绑定。合法的短回答确实存在，一发就解绑会频繁丢 prompt cache。
 	runShortTurnPassthrough(t, svc, groupID, sessionKey, 9, shortTurnSSE("好的，我来看一下这个问题。", 30, false))
-	require.Equal(t, int64(1), cache.streaks[shortTurnStreakKey(groupID, sessionKey)])
-	require.Equal(t, int64(9), cache.sessionBindings[sessionKey], "第一发不得解绑")
-	require.Zero(t, cache.deletedSessions[sessionKey])
-
-	// 第二发：达到阈值，解绑。
-	runShortTurnPassthrough(t, svc, groupID, sessionKey, 9, shortTurnSSE("好的，我来看一下这个问题。", 30, false))
-	require.Equal(t, 1, cache.deletedSessions[sessionKey], "连续两发可疑短回合必须解除粘性绑定")
-	require.NotContains(t, cache.sessionBindings, sessionKey)
-
-	// 解绑后连击数必须清零，否则下一发换到好账号上答一句短话就又达标，会来回解绑。
-	require.NotContains(t, cache.streaks, shortTurnStreakKey(groupID, sessionKey))
-	require.Equal(t, 1, cache.resets[shortTurnStreakKey(groupID, sessionKey)])
+	requireUnboundOnce(t, cache, groupID, sessionKey)
 
 	// 全程不得罚号：判据是启发式的，罚号会把账号从所有会话的调度池里摘掉，误判代价太大。
 	require.Zero(t, repo.tempCalls, "可疑短回合只解绑不罚号")
@@ -240,21 +243,23 @@ func TestAnthropicPassthrough_NormalTurnResetsShortTurnStreak(t *testing.T) {
 	const groupID = int64(1)
 	cache := newShortTurnStreakCache(sessionKey, 9)
 	svc, _ := newShortTurnTestGatewayService(t, cache)
+	key := shortTurnStreakKey(groupID, sessionKey)
 
-	runShortTurnPassthrough(t, svc, groupID, sessionKey, 9, shortTurnSSE("短回答", 30, false))
-	require.Equal(t, int64(1), cache.streaks[shortTurnStreakKey(groupID, sessionKey)])
-
-	// 正常成段回答：清零。
+	// 正常成段回答：主动清零，且绝不解绑。
 	long := strings.Repeat("正常长度的回答内容。", 40)
 	runShortTurnPassthrough(t, svc, groupID, sessionKey, 9, shortTurnSSE(long, 800, false))
-	require.NotContains(t, cache.streaks, shortTurnStreakKey(groupID, sessionKey), "正常回合必须清零连击数")
-
-	// 再来一发短的：连击数重新从 1 开始，不得解绑。
-	runShortTurnPassthrough(t, svc, groupID, sessionKey, 9, shortTurnSSE("短回答", 30, false))
-	require.Equal(t, int64(1), cache.streaks[shortTurnStreakKey(groupID, sessionKey)])
-	require.Zero(t, cache.deletedSessions[sessionKey], "被正常回合隔开的两次短回答不构成连击")
+	require.Equal(t, 1, cache.resets[key], "正常回合必须主动清零连击数")
+	require.Zero(t, cache.deletedSessions[sessionKey], "正常回合不得解绑")
 	require.Equal(t, int64(9), cache.sessionBindings[sessionKey])
+
+	// 再来几发正常回合：一直清零，一直不解绑。
+	for i := 0; i < 3; i++ {
+		runShortTurnPassthrough(t, svc, groupID, sessionKey, 9, shortTurnSSE(long, 800, false))
+	}
+	require.Zero(t, cache.deletedSessions[sessionKey], "连续正常回合不得解绑")
+	require.Empty(t, cache.streaks, "正常回合之后不得留下连击数")
 }
+
 
 // 开了 tool_use 块的短回合是标准 agent 行为，不得累计——否则每一次工具调用都在打断粘性。
 func TestAnthropicPassthrough_ToolUseShortTurnNotCounted(t *testing.T) {
@@ -363,17 +368,8 @@ func TestRegularPath_ShortTurnStreakUnbindsStickySession(t *testing.T) {
 	cache := newShortTurnStreakCache(sessionKey, 9)
 	svc, repo := newShortTurnTestGatewayService(t, cache)
 
-	// 第一发：只累计，不动绑定。
 	runShortTurnRegularPath(t, svc, groupID, sessionKey, 9, shortTurnSSE("好的，我来看一下这个问题。", 30, false))
-	require.Equal(t, int64(1), cache.streaks[shortTurnStreakKey(groupID, sessionKey)],
-		"常规链路必须观测到可疑短回合")
-	require.Equal(t, int64(9), cache.sessionBindings[sessionKey], "第一发不得解绑")
-
-	// 第二发：达到阈值，解绑，下一发才能换号。
-	runShortTurnRegularPath(t, svc, groupID, sessionKey, 9, shortTurnSSE("好的，我来看一下这个问题。", 30, false))
-	require.Equal(t, 1, cache.deletedSessions[sessionKey], "连续两发可疑短回合必须解除粘性绑定")
-	require.NotContains(t, cache.sessionBindings, sessionKey)
-	require.NotContains(t, cache.streaks, shortTurnStreakKey(groupID, sessionKey), "解绑后必须清零")
+	requireUnboundOnce(t, cache, groupID, sessionKey)
 
 	// 全程不罚号：判据是启发式的，罚号会把账号从所有会话的调度池摘掉。
 	require.Zero(t, repo.tempCalls, "可疑短回合只解绑不罚号")
@@ -385,14 +381,14 @@ func TestRegularPath_NormalTurnResetsShortTurnStreak(t *testing.T) {
 	const groupID = int64(1)
 	cache := newShortTurnStreakCache(sessionKey, 9)
 	svc, _ := newShortTurnTestGatewayService(t, cache)
-
-	runShortTurnRegularPath(t, svc, groupID, sessionKey, 9, shortTurnSSE("短回答", 30, false))
-	require.Equal(t, int64(1), cache.streaks[shortTurnStreakKey(groupID, sessionKey)])
+	key := shortTurnStreakKey(groupID, sessionKey)
 
 	long := strings.Repeat("正常长度的回答内容。", 40)
 	runShortTurnRegularPath(t, svc, groupID, sessionKey, 9, shortTurnSSE(long, 800, false))
-	require.NotContains(t, cache.streaks, shortTurnStreakKey(groupID, sessionKey), "正常回合必须清零")
-	require.Equal(t, int64(9), cache.sessionBindings[sessionKey], "正常回合不得解绑")
+	require.Equal(t, 1, cache.resets[key], "正常回合必须主动清零")
+	require.Empty(t, cache.streaks, "正常回合之后不得留下连击数")
+	require.Zero(t, cache.deletedSessions[sessionKey], "正常回合不得解绑")
+	require.Equal(t, int64(9), cache.sessionBindings[sessionKey])
 }
 
 // 常规链路上开了 tool_use 块的短回合不得累计——agent 的每次工具调用都是这个形状。
@@ -534,7 +530,11 @@ func TestShortTurnPredicatesAreMutuallyExclusive(t *testing.T) {
 
 // 账号 9 的线上复现（21:23:19 out=63/chars=132 截断 → 几发 tool_use → 21:26:34
 // out=34/chars=81 又截断）。改动前 tool_use 回合会把连击清零，streak 永远停在 1，
-// 解绑是死代码；改动后中间回合不表态，第二发短回合必须解绑。
+// 解绑是死代码；改动后中间回合不表态。
+//
+// 阈值降到 1 之后第一发就解绑，所以这条用例守的不再是「连击跨过 tool_use」，而是三态
+// 判定本身：tool_use 回合既不累计也**不清零**。清零次数卡在 1（解绑自带的那一次）就是
+// 证据——旧的二元判断会让它涨到 4。
 func TestAnthropicPassthrough_ToolUseTurnBetweenShortTurnsStillUnbinds(t *testing.T) {
 	const sessionKey = "sticky-interleaved"
 	const groupID = int64(1)
@@ -542,23 +542,21 @@ func TestAnthropicPassthrough_ToolUseTurnBetweenShortTurnsStillUnbinds(t *testin
 	svc, repo := newShortTurnTestGatewayService(t, cache)
 	key := shortTurnStreakKey(groupID, sessionKey)
 
-	// 第一发截断。
+	// 第一发截断：解绑。
 	runShortTurnPassthrough(t, svc, groupID, sessionKey, 9, shortTurnSSE("临时文件都已清理删除，现在只剩部署目录。更新记", 63, false))
-	require.Equal(t, int64(1), cache.streaks[key])
+	requireUnboundOnce(t, cache, groupID, sessionKey)
 
 	// 中间几发正常的 agent 工具调用回合：不得清零，也不得累计。
 	for i := 0; i < 3; i++ {
 		runShortTurnPassthrough(t, svc, groupID, sessionKey, 9,
 			turnSSEWithStopReason(strings.Repeat("读日志抓数据。", 30), 761, "tool_use", true))
 	}
-	require.Equal(t, int64(1), cache.streaks[key], "tool_use 中间回合不得清零连击数")
-	require.Zero(t, cache.resets[key], "tool_use 中间回合不得触发 reset")
-	require.Equal(t, int64(9), cache.sessionBindings[sessionKey])
+	require.Equal(t, 1, cache.resets[key], "tool_use 中间回合不得触发清零")
+	require.Empty(t, cache.streaks, "tool_use 中间回合不得累计连击")
 
-	// 第二发截断：达到阈值，必须解绑。
+	// 第二发截断：再次解绑（解绑后连击已清零，所以又是从 1 开始达标）。
 	runShortTurnPassthrough(t, svc, groupID, sessionKey, 9, shortTurnSSE("日志键都在那个函数里。抓前后日志", 34, false))
-	require.Equal(t, 1, cache.deletedSessions[sessionKey], "被 tool_use 隔开的两发短回合仍必须解绑")
-	require.NotContains(t, cache.sessionBindings, sessionKey)
+	require.Equal(t, 2, cache.deletedSessions[sessionKey], "第二发截断必须再解绑一次")
 	require.Zero(t, repo.tempCalls, "只解绑不罚号")
 }
 
@@ -571,18 +569,17 @@ func TestRegularPath_ToolUseTurnBetweenShortTurnsStillUnbinds(t *testing.T) {
 	key := shortTurnStreakKey(groupID, sessionKey)
 
 	runShortTurnRegularPath(t, svc, groupID, sessionKey, 9, shortTurnSSE("短回答", 63, false))
-	require.Equal(t, int64(1), cache.streaks[key])
+	requireUnboundOnce(t, cache, groupID, sessionKey)
 
 	for i := 0; i < 3; i++ {
 		runShortTurnRegularPath(t, svc, groupID, sessionKey, 9,
 			turnSSEWithStopReason(strings.Repeat("读日志抓数据。", 30), 761, "tool_use", true))
 	}
-	require.Equal(t, int64(1), cache.streaks[key], "tool_use 中间回合不得清零连击数")
-	require.Zero(t, cache.resets[key])
+	require.Equal(t, 1, cache.resets[key], "tool_use 中间回合不得触发清零")
+	require.Empty(t, cache.streaks, "tool_use 中间回合不得累计连击")
 
 	runShortTurnRegularPath(t, svc, groupID, sessionKey, 9, shortTurnSSE("又一句短回答", 34, false))
-	require.Equal(t, 1, cache.deletedSessions[sessionKey], "被 tool_use 隔开的两发短回合仍必须解绑")
-	require.NotContains(t, cache.sessionBindings, sessionKey)
+	require.Equal(t, 2, cache.deletedSessions[sessionKey], "第二发截断必须再解绑一次")
 	require.Zero(t, repo.tempCalls)
 }
 
@@ -616,17 +613,12 @@ func TestAnthropicPassthrough_CJKTruncationUnbinds(t *testing.T) {
 	const groupID = int64(1)
 	cache := newShortTurnStreakCache(sessionKey, 9)
 	svc, repo := newShortTurnTestGatewayService(t, cache)
-	key := shortTurnStreakKey(groupID, sessionKey)
 	text := cjkTruncationText(t)
 
+	// 解绑发生了，就证明这一发被判成了可疑：旧实现把 247 个汉字数成 741 字节，会反过来
+	// 当成「上游把话说完了」的正面证据去清零，那样一次解绑都不会有。
 	runShortTurnPassthrough(t, svc, groupID, sessionKey, 9, shortTurnSSE(text, 106, false))
-	require.Equal(t, int64(1), cache.streaks[key], "中文截断必须被观测到（旧实现按字节数会漏掉）")
-	require.Zero(t, cache.resets[key], "中文截断绝不能被当成正面证据清零连击")
-	require.Equal(t, int64(9), cache.sessionBindings[sessionKey], "第一发不得解绑")
-
-	runShortTurnPassthrough(t, svc, groupID, sessionKey, 9, shortTurnSSE(text, 106, false))
-	require.Equal(t, 1, cache.deletedSessions[sessionKey], "连续两发中文截断必须解除粘性绑定")
-	require.NotContains(t, cache.sessionBindings, sessionKey)
+	requireUnboundOnce(t, cache, groupID, sessionKey)
 	require.Zero(t, repo.tempCalls, "只解绑不罚号")
 }
 
@@ -636,16 +628,10 @@ func TestRegularPath_CJKTruncationUnbinds(t *testing.T) {
 	const groupID = int64(1)
 	cache := newShortTurnStreakCache(sessionKey, 9)
 	svc, repo := newShortTurnTestGatewayService(t, cache)
-	key := shortTurnStreakKey(groupID, sessionKey)
 	text := cjkTruncationText(t)
 
 	runShortTurnRegularPath(t, svc, groupID, sessionKey, 9, shortTurnSSE(text, 106, false))
-	require.Equal(t, int64(1), cache.streaks[key])
-	require.Zero(t, cache.resets[key])
-
-	runShortTurnRegularPath(t, svc, groupID, sessionKey, 9, shortTurnSSE(text, 106, false))
-	require.Equal(t, 1, cache.deletedSessions[sessionKey], "连续两发中文截断必须解除粘性绑定")
-	require.NotContains(t, cache.sessionBindings, sessionKey)
+	requireUnboundOnce(t, cache, groupID, sessionKey)
 	require.Zero(t, repo.tempCalls)
 }
 
@@ -664,10 +650,7 @@ func TestAnthropicPassthrough_ShortCJKTruncationUnbinds(t *testing.T) {
 	require.Greater(t, len(text), 200, "前提：字节数必须超过旧实现那条 200 的线")
 
 	runShortTurnPassthrough(t, svc, groupID, sessionKey, 9, shortTurnSSE(text, 70, false))
-	require.Equal(t, int64(1), cache.streaks[shortTurnStreakKey(groupID, sessionKey)])
-
-	runShortTurnPassthrough(t, svc, groupID, sessionKey, 9, shortTurnSSE(text, 70, false))
-	require.Equal(t, 1, cache.deletedSessions[sessionKey])
+	requireUnboundOnce(t, cache, groupID, sessionKey)
 	require.Zero(t, repo.tempCalls)
 }
 
@@ -705,10 +688,6 @@ func TestAnthropicPassthrough_LongThinkingShortProseStillUnbinds(t *testing.T) {
 	}
 
 	runShortTurnPassthrough(t, svc, groupID, sessionKey, 9, resp())
-	require.Equal(t, int64(1), cache.streaks[shortTurnStreakKey(groupID, sessionKey)],
-		"长思考不构成正文，这一发仍是可疑短回合")
-
-	runShortTurnPassthrough(t, svc, groupID, sessionKey, 9, resp())
-	require.Equal(t, 1, cache.deletedSessions[sessionKey])
+	requireUnboundOnce(t, cache, groupID, sessionKey)
 	require.Zero(t, repo.tempCalls)
 }
