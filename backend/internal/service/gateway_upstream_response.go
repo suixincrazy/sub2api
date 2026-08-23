@@ -839,6 +839,8 @@ func (s *GatewayService) handleStreamingResponse(ctx context.Context, resp *http
 	// 的合法短回合」在这里完全不被观测——中转账号走的正是这条路，短回合解绑对它是死代码。
 	sawStopReason := ""
 	visibleChars := 0
+	// proseRunes 与 visibleChars 分开累计，理由同透传链路：见 anthropicVisibleProseRunes。
+	proseRunes := 0
 	sawContentBlockStart := false
 	sawToolUseBlock := false
 	useNoopDeltaKeepalive := c != nil && c.Request != nil && shouldUseClaudeCodeNoopDeltaKeepalive(c.GetHeader("User-Agent"))
@@ -1005,6 +1007,7 @@ func (s *GatewayService) handleStreamingResponse(ctx context.Context, resp *http
 				}
 			}
 			visibleChars += anthropicVisibleDeltaChars(parsedFrame)
+			proseRunes += anthropicVisibleProseRunes(parsedFrame)
 		}
 		if !eventChanged {
 			block := ""
@@ -1050,9 +1053,9 @@ func (s *GatewayService) handleStreamingResponse(ctx context.Context, resp *http
 			// 这条路径只累计连击 / 到阈值解绑，绝不罚号，见 noteAnthropicShortTurnStreak。
 			// 三态：可疑 -> 累计连击；有正面证据 -> 清零；其余（典型是 tool_use 中间回合）
 			// -> 不表态，保留连击。见 anthropicTurnProvesUpstreamHealthy。
-			if anthropicTurnLooksSuspiciouslyShort(sawStopReason, visibleChars, usage.OutputTokens, sawToolUseBlock) {
-				s.noteAnthropicShortTurnStreak(ctx, account, originalModel, visibleChars, usage.OutputTokens)
-			} else if anthropicTurnProvesUpstreamHealthy(sawStopReason, visibleChars, sawToolUseBlock) {
+			if anthropicTurnLooksSuspiciouslyShort(sawStopReason, proseRunes, usage.OutputTokens, sawToolUseBlock) {
+				s.noteAnthropicShortTurnStreak(ctx, account, originalModel, proseRunes, usage.OutputTokens)
+			} else if anthropicTurnProvesUpstreamHealthy(sawStopReason, proseRunes, usage.OutputTokens, sawToolUseBlock) {
 				s.clearAnthropicShortTurnStreak(ctx)
 			}
 			return

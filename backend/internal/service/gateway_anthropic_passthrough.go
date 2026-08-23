@@ -17,6 +17,7 @@ import (
 	"strings"
 	"sync/atomic"
 	"time"
+	"unicode/utf8"
 
 	"github.com/Wei-Shaw/sub2api/internal/pkg/logger"
 	"github.com/Wei-Shaw/sub2api/internal/util/responseheaders"
@@ -482,6 +483,33 @@ func anthropicVisibleDeltaChars(parsed gjson.Result) int {
 	}
 }
 
+// anthropicVisibleProseRunes 取这一帧给用户看的**正文**贡献的字符数（rune，不是字节）。
+//
+// 与 anthropicVisibleDeltaChars 刻意分开的两个理由，都是线上实证打出来的：
+//
+//  1. 单位。anthropicVisibleDeltaChars 用 len()，数的是 UTF-8 字节。中文一字三字节，
+//     于是「200 字符上限」对中文实际只有 66 字。2026-08-23 22:31:21 账号 9 那一发截断
+//     正文 131 字（≈289 字节），不但躲过了短回合判定，还因为 289>200 被
+//     anthropicTurnProvesUpstreamHealthy 当成「上游把话说完了」的正面证据**清零了连击**，
+//     比漏判更糟。日志里 visible_chars=54 对应的是 18 个汉字，54=18×3，就是这个单位。
+//
+//  2. 口径。thinking_delta 和 input_json_delta 也被 anthropicVisibleDeltaChars 计入，
+//     但思考链和工具入参都不是「把话说完」的证据：模型可以想很久然后只吐一句就收尾，
+//     那恰恰是要抓的形态。这里只认 text_delta。
+//
+// anthropicVisibleDeltaChars 保持原样不动：它唯一的用途是
+// anthropicStreamLooksIncompleteDespiteTerminal 里的 `== 0` 判零，与单位无关，而那条
+// 路径**会罚号**，不能借这次改动改变它的行为。
+func anthropicVisibleProseRunes(parsed gjson.Result) int {
+	if strings.TrimSpace(parsed.Get("type").String()) != "content_block_delta" {
+		return 0
+	}
+	if !strings.EqualFold(strings.TrimSpace(parsed.Get("delta.type").String()), "text_delta") {
+		return 0
+	}
+	return utf8.RuneCountInString(parsed.Get("delta.text").String())
+}
+
 // anthropicStreamLooksIncompleteDespiteTerminal 是「协议层收尾了但内容不完整」的启发式判定。
 //
 // 存在的理由：sawTerminalEvent 只证明上游送来了 message_stop，不证明它把话说完。实测主号
@@ -534,10 +562,27 @@ type stickyShortTurnStreakStore interface {
 }
 
 const (
-	// anthropicShortTurnVisibleCharLimit 判定「短回合」的可见字符上限。
-	// 实测两次故障分别是 19 和 30 个 output_token，对应正文都在 100 字符以内；
-	// 取 200 留出余量，同时远低于一次正常的工具调用或成段回答。
-	anthropicShortTurnVisibleCharLimit = 200
+	// anthropicShortTurnProseRuneLimit 判定「短回合」的正文上限，单位是 rune。
+	//
+	// 从 200 字节改成 400 rune 的依据：拿三份真实对话里 165 发
+	// end_turn + 无 tool_use + output_tokens>0 的回合回放，按字节 200 命中 47 发，
+	// 按 rune 400 命中 51 发，且是严格超集——多出来的 4 发正是被漏掉的中文截断
+	// （out=58 对 127 字、out=90 对 183 字、out=73 对 150 字、out=70 对 131 字）。
+	// 400 rune 对英文约等于 60~80 词，仍远低于一次成段回答。
+	anthropicShortTurnProseRuneLimit = 400
+	// anthropicShortTurnOutputTokenLimit 判定「短回合」的 output_tokens 上限。
+	//
+	// 单靠正文长度分不开两类回合，token 数才是干净的分界：同一批样本里所有截断的
+	// output_tokens 都 ≤112（19/30/34/58/63/70/73/83/90/104/106/112），而所有正常
+	// 短回答都 ≥133（133/138/161/189/227/355/587/792/1796）。取 128 落在这条缝里，
+	// 两侧都有余量。
+	anthropicShortTurnOutputTokenLimit = 128
+	// anthropicHealthyTurnMinProseRunes 清零连击所需的最小正文长度，单位 rune。
+	//
+	// 刻意比 anthropicShortTurnProseRuneLimit 低（400 vs 200）：两者之间那一段
+	// （201~400 rune 且 token 数不小）既不算可疑、也不算「说完了」，一律不表态。
+	// 留这条中间带是因为清零是**否掉已积累证据**的动作，宁可保守。
+	anthropicHealthyTurnMinProseRunes = 200
 	// anthropicShortTurnStreakThreshold 连续多少发才解绑。
 	// 1 会频繁误伤合法短回答的 prompt-cache 亲和性，见 IncrStickyShortTurnStreak 的说明。
 	anthropicShortTurnStreakThreshold = 2
@@ -550,16 +595,17 @@ const (
 // 只用来累计连击、到阈值后解绑，绝不罚号。两者必须分开，否则可疑形态会被当成确定故障
 // 把健康账号罚下线——那正是当初否掉「输出长度突降基线」的理由。
 //
-// 四个条件同时成立才算可疑：
+// 五个条件同时成立才算可疑：
 //  1. stop_reason 恰好是 end_turn。tool_use/max_tokens/stop_sequence 都说明模型
 //     确实干了活或是被限制截断，pause_turn 是协议级续传，都不算。
 //  2. 没有开过 tool_use 块。开了工具块的回合无论正文多短都是正常的 agent 行为。
-//  3. 可见字符低于上限。
-//  4. 上游确实报了正的 output_tokens。为 0 的情形归 anthropicStreamLooksIncomplete-
+//  3. 上游确实报了正的 output_tokens。为 0 的情形归 anthropicStreamLooksIncomplete-
 //     DespiteTerminal 管，这里放行避免同一次故障被两套逻辑各记一次。
+//  4. output_tokens 不超过上限。这是主判据，见 anthropicShortTurnOutputTokenLimit。
+//  5. 正文长度不超过上限。兜住 token 计费口径异常（压缩/复用 token 的兼容层）的情形。
 func anthropicTurnLooksSuspiciouslyShort(
 	stopReason string,
-	visibleChars int,
+	proseRunes int,
 	outputTokens int,
 	sawToolUseBlock bool,
 ) bool {
@@ -569,10 +615,10 @@ func anthropicTurnLooksSuspiciouslyShort(
 	if sawToolUseBlock {
 		return false
 	}
-	if outputTokens <= 0 {
+	if outputTokens <= 0 || outputTokens > anthropicShortTurnOutputTokenLimit {
 		return false
 	}
-	return visibleChars > 0 && visibleChars <= anthropicShortTurnVisibleCharLimit
+	return proseRunes > 0 && proseRunes <= anthropicShortTurnProseRuneLimit
 }
 
 // anthropicTurnProvesUpstreamHealthy 判定这一回合能否作为「上游把话说完了」的正面证据，
@@ -585,12 +631,13 @@ func anthropicTurnLooksSuspiciouslyShort(
 // 死代码，两条链路都一样。线上实证：账号 9 在 21:23:19（out=63/chars=132）与 21:26:34
 // （out=34/chars=81）各截断一次，中间隔着几发 tool_use，日志里只留下 streak=1。
 //
-// 所以清零要的是正面证据：这一回合确实产出了成段正文（可见字符超过短回合上限），且
-// stop_reason 属于健康白名单。tool_use 回合只是 agent 流程的中间步骤，既不可疑、也不
-// 构成「narrative 回合不会被截断」的证据，对连击数一律不表态。
+// 所以清零要的是正面证据：这一回合确实产出了成段正文，**且** output_tokens 也确实上了
+// 量。两个都要，是因为 22:31:21 那一发就是只满足了「字节数够多」（131 个汉字 ≈289 字节）
+// 就把连击清零的——单看长度会被中文的字节膨胀骗过去，加上 token 数才骗不过。
 func anthropicTurnProvesUpstreamHealthy(
 	stopReason string,
-	visibleChars int,
+	proseRunes int,
+	outputTokens int,
 	sawToolUseBlock bool,
 ) bool {
 	// 白名单刻意比 anthropicStopReasonIsHealthy 窄。那个白名单答的是「这条流算不算残缺」，
@@ -605,7 +652,10 @@ func anthropicTurnProvesUpstreamHealthy(
 	if sawToolUseBlock {
 		return false
 	}
-	return visibleChars > anthropicShortTurnVisibleCharLimit
+	if outputTokens <= anthropicShortTurnOutputTokenLimit {
+		return false
+	}
+	return proseRunes > anthropicHealthyTurnMinProseRunes
 }
 
 // noteAnthropicShortTurnStreak 累计可疑短回合，达到阈值就解除本会话的粘性绑定。
@@ -614,7 +664,7 @@ func anthropicTurnProvesUpstreamHealthy(
 // 误判代价太大。解绑只影响这一条会话的账号亲和性，误判的代价仅是丢一次 prompt cache，
 // 而收益是客户端下一发能落到同优先级的另一个账号上——正是「自动切换到别的号继续」。
 func (s *GatewayService) noteAnthropicShortTurnStreak(
-	ctx context.Context, account *Account, model string, visibleChars, outputTokens int,
+	ctx context.Context, account *Account, model string, proseRunes, outputTokens int,
 ) {
 	groupID, sessionKey, ok := StickySessionScopeFromContext(ctx)
 	if !ok {
@@ -632,7 +682,7 @@ func (s *GatewayService) noteAnthropicShortTurnStreak(
 	if streak < anthropicShortTurnStreakThreshold {
 		slog.Info("sticky_short_turn_observed",
 			"account_id", account.ID, "model", model, "streak", streak,
-			"visible_chars", visibleChars, "output_tokens", outputTokens)
+			"prose_runes", proseRunes, "output_tokens", outputTokens)
 		return
 	}
 	if err := s.cache.DeleteSessionAccountID(ctx, groupID, sessionKey); err != nil {
@@ -645,7 +695,7 @@ func (s *GatewayService) noteAnthropicShortTurnStreak(
 	}
 	slog.Warn("sticky_short_turn_unbound",
 		"account_id", account.ID, "model", model, "streak", streak,
-		"visible_chars", visibleChars, "output_tokens", outputTokens,
+		"prose_runes", proseRunes, "output_tokens", outputTokens,
 		"reason", "consecutive protocol-legal but suspiciously short turns")
 }
 
@@ -961,6 +1011,10 @@ func (s *GatewayService) handleStreamingResponseAnthropicAPIKeyPassthrough(
 	// reportStreamIncompleteAfterCommit 的说明。
 	sawStopReason := ""
 	visibleChars := 0
+	// proseRunes 与 visibleChars 分开累计：前者只数正文 rune，供短回合解绑判定用；
+	// 后者含思考链与工具入参、单位是字节，只供会罚号的残缺判定判零。见
+	// anthropicVisibleProseRunes 的说明。
+	proseRunes := 0
 	sawContentBlockStart := false
 	sawToolUseBlock := false
 
@@ -1079,6 +1133,7 @@ func (s *GatewayService) handleStreamingResponseAnthropicAPIKeyPassthrough(
 					}
 				}
 				visibleChars += anthropicVisibleDeltaChars(parsedFrame)
+				proseRunes += anthropicVisibleProseRunes(parsedFrame)
 			}
 			if firstTokenMs == nil && trimmed != "" && trimmed != "[DONE]" {
 				ms := int(time.Since(startTime).Milliseconds())
@@ -1135,9 +1190,9 @@ func (s *GatewayService) handleStreamingResponseAnthropicAPIKeyPassthrough(
 			// 这条路径只累计连击 / 到阈值解绑，绝不罚号，见 noteAnthropicShortTurnStreak。
 			// 三态：可疑 -> 累计连击；有正面证据 -> 清零；其余（典型是 tool_use 中间回合）
 			// -> 不表态，保留连击。见 anthropicTurnProvesUpstreamHealthy。
-			if anthropicTurnLooksSuspiciouslyShort(sawStopReason, visibleChars, usage.OutputTokens, sawToolUseBlock) {
-				s.noteAnthropicShortTurnStreak(ctx, account, model, visibleChars, usage.OutputTokens)
-			} else if anthropicTurnProvesUpstreamHealthy(sawStopReason, visibleChars, sawToolUseBlock) {
+			if anthropicTurnLooksSuspiciouslyShort(sawStopReason, proseRunes, usage.OutputTokens, sawToolUseBlock) {
+				s.noteAnthropicShortTurnStreak(ctx, account, model, proseRunes, usage.OutputTokens)
+			} else if anthropicTurnProvesUpstreamHealthy(sawStopReason, proseRunes, usage.OutputTokens, sawToolUseBlock) {
 				s.clearAnthropicShortTurnStreak(ctx)
 			}
 			return
