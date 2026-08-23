@@ -81,6 +81,11 @@ func shortTurnSSE(text string, outputTokens int, toolUse bool) *http.Response {
 			fmt.Sprintf(`data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":%d}}`, outputTokens),
 			"",
 			`data: {"type":"message_stop"}`,
+			// sseBody 用单个换行符连接各元素，而 SSE 的事件终止符是一个空行（连续两个换行）。
+			// 所以最后一个事件必须跟两个空元素：常规链路 handleStreamingResponse
+			// 是按空行切事件的，少一个 message_stop 就永远不会被处理，
+			// 判定拿不到 stop_reason。透传链路是逐行读的，所以不受影响。
+			"",
 			"",
 		),
 	}
@@ -279,4 +284,111 @@ func TestStickySessionScopeRoundTrip(t *testing.T) {
 	retry, ok := SingleAccountRetryFromContext(ctx)
 	require.True(t, ok)
 	require.True(t, retry)
+}
+
+// runShortTurnRegularPath 跑一次常规（非透传）链路的流式转发，带粘性会话坐标。
+//
+// 这条链路是 handleStreamingResponse，第三方中转账号（不开 anthropic_passthrough 的
+// apikey 号，如 upstream.example.invalid）走的就是它。与透传分支用同一组判定函数，但原先
+// 完全没有采集判定所需的输入，所以短回合解绑对这条路是死代码。
+func runShortTurnRegularPath(
+	t *testing.T, svc *GatewayService, groupID int64, sessionKey string,
+	accountID int64, resp *http.Response,
+) {
+	t.Helper()
+	c, _ := newRefusalTestContext(t)
+	ctx := WithStickySessionScope(context.Background(), groupID, sessionKey, false)
+	_, err := svc.handleStreamingResponse(
+		ctx, resp, c, &Account{ID: accountID, Name: "relay", Platform: PlatformAnthropic},
+		time.Now(), "claude-opus-5", "claude-opus-5", false)
+	require.NoError(t, err)
+}
+
+// 常规链路的回归锚点：这正是 2026-08-23 19:55:48 账号 9 那次断流的复现。
+//
+// 那次故障的形状与透传分支已修的完全一致（end_turn + output_tokens=30 + 一句开场白），
+// 但账号 9 是第三方中转号、不走透传，于是请求进的是 handleStreamingResponse。该函数
+// 收尾只判 sawTerminalEvent（有没有 message_stop），根本不看 stop_reason 和可见字符量，
+// 所以 0.1.189 上线的短回合解绑对它一次都没生效：不解绑 → 粘性把下一发原样送回账号 9
+// → 用户看到「断流依旧出在账号 9 上」。
+func TestRegularPath_ShortTurnStreakUnbindsStickySession(t *testing.T) {
+	const sessionKey = "regular-short-turn"
+	const groupID = int64(1)
+	cache := newShortTurnStreakCache(sessionKey, 9)
+	svc, repo := newShortTurnTestGatewayService(t, cache)
+
+	// 第一发：只累计，不动绑定。
+	runShortTurnRegularPath(t, svc, groupID, sessionKey, 9, shortTurnSSE("好的，我来看一下这个问题。", 30, false))
+	require.Equal(t, int64(1), cache.streaks[shortTurnStreakKey(groupID, sessionKey)],
+		"常规链路必须观测到可疑短回合")
+	require.Equal(t, int64(9), cache.sessionBindings[sessionKey], "第一发不得解绑")
+
+	// 第二发：达到阈值，解绑，下一发才能换号。
+	runShortTurnRegularPath(t, svc, groupID, sessionKey, 9, shortTurnSSE("好的，我来看一下这个问题。", 30, false))
+	require.Equal(t, 1, cache.deletedSessions[sessionKey], "连续两发可疑短回合必须解除粘性绑定")
+	require.NotContains(t, cache.sessionBindings, sessionKey)
+	require.NotContains(t, cache.streaks, shortTurnStreakKey(groupID, sessionKey), "解绑后必须清零")
+
+	// 全程不罚号：判据是启发式的，罚号会把账号从所有会话的调度池摘掉。
+	require.Zero(t, repo.tempCalls, "可疑短回合只解绑不罚号")
+}
+
+// 常规链路上的正常回合同样要清零连击数。
+func TestRegularPath_NormalTurnResetsShortTurnStreak(t *testing.T) {
+	const sessionKey = "regular-reset"
+	const groupID = int64(1)
+	cache := newShortTurnStreakCache(sessionKey, 9)
+	svc, _ := newShortTurnTestGatewayService(t, cache)
+
+	runShortTurnRegularPath(t, svc, groupID, sessionKey, 9, shortTurnSSE("短回答", 30, false))
+	require.Equal(t, int64(1), cache.streaks[shortTurnStreakKey(groupID, sessionKey)])
+
+	long := strings.Repeat("正常长度的回答内容。", 40)
+	runShortTurnRegularPath(t, svc, groupID, sessionKey, 9, shortTurnSSE(long, 800, false))
+	require.NotContains(t, cache.streaks, shortTurnStreakKey(groupID, sessionKey), "正常回合必须清零")
+	require.Equal(t, int64(9), cache.sessionBindings[sessionKey], "正常回合不得解绑")
+}
+
+// 常规链路上开了 tool_use 块的短回合不得累计——agent 的每次工具调用都是这个形状。
+func TestRegularPath_ToolUseShortTurnNotCounted(t *testing.T) {
+	const sessionKey = "regular-tool-use"
+	const groupID = int64(1)
+	cache := newShortTurnStreakCache(sessionKey, 9)
+	svc, _ := newShortTurnTestGatewayService(t, cache)
+
+	for i := 0; i < 3; i++ {
+		runShortTurnRegularPath(t, svc, groupID, sessionKey, 9, shortTurnSSE("我来查一下", 30, true))
+	}
+	require.Empty(t, cache.streaks, "工具调用回合不得累计连击")
+	require.Zero(t, cache.deletedSessions[sessionKey])
+	require.Equal(t, int64(9), cache.sessionBindings[sessionKey])
+}
+
+// 常规链路的确定性残缺判定也必须接上：开了正文块却零可见字符且 output_tokens<=0
+// 是无歧义的截断，这条要罚号（与只解绑的可疑短回合分开）。
+func TestRegularPath_TerminalButEmptyContentIsPenalized(t *testing.T) {
+	const sessionKey = "regular-empty"
+	const groupID = int64(1)
+	cache := newShortTurnStreakCache(sessionKey, 9)
+	svc, repo := newShortTurnTestGatewayService(t, cache)
+
+	resp := &http.Response{
+		StatusCode: http.StatusOK,
+		Header:     http.Header{"Content-Type": []string{"text/event-stream"}},
+		Body: sseBody(
+			`data: {"type":"message_start","message":{"usage":{"input_tokens":129000}}}`,
+			"",
+			`data: {"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}`,
+			"",
+			`data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":0}}`,
+			"",
+			`data: {"type":"message_stop"}`,
+			"",
+			"",
+		),
+	}
+	runShortTurnRegularPath(t, svc, groupID, sessionKey, 9, resp)
+
+	require.Positive(t, repo.tempCalls, "开了块却零输出是确定性残缺，必须罚号")
+	require.Empty(t, cache.streaks, "确定性残缺不走连击路径，避免同一次故障记两次")
 }

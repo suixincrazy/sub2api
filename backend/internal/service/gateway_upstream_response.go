@@ -834,6 +834,13 @@ func (s *GatewayService) handleStreamingResponse(ctx context.Context, resp *http
 	clientDisconnected := false // 客户端断开标志，断开后继续读取上游以获取完整usage
 	sawTerminalEvent := false
 	refusalReported := false // 非透传路径没有提交前拒答检测，任何位置的 refusal 都只能事后归因
+	// 内容完整性启发式所需的四个量。透传分支（gateway_anthropic_passthrough.go）早就在采，
+	// 这条常规链路原先只判 sawTerminalEvent（有没有 message_stop），于是「带 message_stop
+	// 的合法短回合」在这里完全不被观测——中转账号走的正是这条路，短回合解绑对它是死代码。
+	sawStopReason := ""
+	visibleChars := 0
+	sawContentBlockStart := false
+	sawToolUseBlock := false
 	useNoopDeltaKeepalive := c != nil && c.Request != nil && shouldUseClaudeCodeNoopDeltaKeepalive(c.GetHeader("User-Agent"))
 	noopDeltaKeepaliveBlockIndex := -1
 	noopDeltaKeepaliveDeltaType := ""
@@ -980,6 +987,25 @@ func (s *GatewayService) handleStreamingResponse(ctx context.Context, resp *http
 		if anthropicStreamEventIsTerminal(eventName, dataLine) {
 			sawTerminalEvent = true
 		}
+		// 采集完整性启发式所需的四个量。与透传分支 (gateway_anthropic_passthrough.go)
+		// 用同一组判定函数，这里只是把常规链路缺失的输入补上：这条路径原先只记
+		// sawTerminalEvent，于是「带 message_stop 的合法短回合」一路放行，粘性把下一发
+		// 原样送回同一个坏号。dataLine 是本帧原始 JSON，重新用 gjson 取字段以复用纯判定。
+		{
+			parsedFrame := gjson.Parse(dataLine)
+			switch eventType {
+			case "message_delta":
+				if r := strings.TrimSpace(parsedFrame.Get("delta.stop_reason").String()); r != "" {
+					sawStopReason = r
+				}
+			case "content_block_start":
+				sawContentBlockStart = true
+				if strings.EqualFold(strings.TrimSpace(parsedFrame.Get("content_block.type").String()), "tool_use") {
+					sawToolUseBlock = true
+				}
+			}
+			visibleChars += anthropicVisibleDeltaChars(parsedFrame)
+		}
 		if !eventChanged {
 			block := ""
 			if eventName != "" {
@@ -1008,6 +1034,30 @@ func (s *GatewayService) handleStreamingResponse(ctx context.Context, resp *http
 		return []string{block}, string(newData), usagePatch, nil
 	}
 
+	// reportIfTerminalButIncomplete 与透传分支同名闭包等价（gateway_anthropic_passthrough.go）：
+	// 在「协议层收尾了」的成功返回点上再判一次内容完整性。缺了它，这条链路对带 message_stop
+	// 的残缺流和合法短回合都一无所知，粘性会把下一发原样送回同一个坏号。
+	// 客户端自己断开/请求被取消一律不判——那时残缺是客户端造成的，罚号只会误伤；
+	// 已按拒答归因过的流也不再判，同一次故障不能记两次。
+	reportIfTerminalButIncomplete := func() {
+		if clientDisconnected || refusalReported || c.Request.Context().Err() != nil {
+			return
+		}
+		reason, incomplete := anthropicStreamLooksIncompleteDespiteTerminal(
+			sawStopReason, visibleChars, usage.OutputTokens, sawContentBlockStart)
+		if !incomplete {
+			// 确定性判定放行之后，再看这一回合是否「协议合法但疑似没把话说完」。
+			// 这条路径只累计连击 / 到阈值解绑，绝不罚号，见 noteAnthropicShortTurnStreak。
+			if anthropicTurnLooksSuspiciouslyShort(sawStopReason, visibleChars, usage.OutputTokens, sawToolUseBlock) {
+				s.noteAnthropicShortTurnStreak(ctx, account, originalModel, visibleChars, usage.OutputTokens)
+			} else {
+				s.clearAnthropicShortTurnStreak(ctx)
+			}
+			return
+		}
+		s.reportStreamIncompleteAfterCommit(ctx, c, resp, account, originalModel, reason)
+	}
+
 	for {
 		select {
 		case ev, ok := <-events:
@@ -1019,10 +1069,12 @@ func (s *GatewayService) handleStreamingResponse(ctx context.Context, resp *http
 					}
 					return &streamingResult{usage: usage, firstTokenMs: firstTokenMs, clientDisconnect: clientDisconnected}, fmt.Errorf("stream usage incomplete: missing terminal event")
 				}
+				reportIfTerminalButIncomplete()
 				return &streamingResult{usage: usage, firstTokenMs: firstTokenMs, clientDisconnect: clientDisconnected}, nil
 			}
 			if ev.err != nil {
 				if sawTerminalEvent {
+					reportIfTerminalButIncomplete()
 					return &streamingResult{usage: usage, firstTokenMs: firstTokenMs, clientDisconnect: clientDisconnected}, nil
 				}
 				// 检测 context 取消（客户端断开会导致 context 取消，进而影响上游读取）
