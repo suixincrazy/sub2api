@@ -392,3 +392,113 @@ func TestRegularPath_TerminalButEmptyContentIsPenalized(t *testing.T) {
 	require.Positive(t, repo.tempCalls, "开了块却零输出是确定性残缺，必须罚号")
 	require.Empty(t, cache.streaks, "确定性残缺不走连击路径，避免同一次故障记两次")
 }
+
+// turnSSEWithStopReason 与 shortTurnSSE 同形，但可以指定 stop_reason，用来复刻线上
+// 真实的 tool_use 中间回合（那种回合的 stop_reason 是 tool_use，不是 end_turn）。
+func turnSSEWithStopReason(text string, outputTokens int, stopReason string, toolUse bool) *http.Response {
+	blockStart := `data: {"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}`
+	if toolUse {
+		blockStart = `data: {"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"t1","name":"Bash","input":{}}}`
+	}
+	return &http.Response{
+		StatusCode: http.StatusOK,
+		Header:     http.Header{"Content-Type": []string{"text/event-stream"}},
+		Body: sseBody(
+			`data: {"type":"message_start","message":{"usage":{"input_tokens":129000}}}`,
+			"",
+			blockStart,
+			"",
+			fmt.Sprintf(`data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":%q}}`, text),
+			"",
+			fmt.Sprintf(`data: {"type":"message_delta","delta":{"stop_reason":%q},"usage":{"output_tokens":%d}}`, stopReason, outputTokens),
+			"",
+			`data: {"type":"message_stop"}`,
+			"",
+			"",
+		),
+	}
+}
+
+// anthropicTurnProvesUpstreamHealthy 的边界。这是唯一决定「哪种回合能清零连击」的地方。
+// 放宽（比如让 tool_use 回合也算正面证据）会让解绑重新变成死代码——那正是账号 9 在
+// 0.1.190 上依然断流的原因。
+func TestAnthropicTurnProvesUpstreamHealthy(t *testing.T) {
+	long := anthropicShortTurnVisibleCharLimit + 1
+	for _, tc := range []struct {
+		name       string
+		stopReason string
+		chars      int
+		toolUse    bool
+		want       bool
+	}{
+		{"成段正文的 end_turn 是正面证据", "end_turn", long, false, true},
+		{"被 max_tokens 截断但产出成段正文，也是正面证据", "max_tokens", long, false, true},
+		{"stop_sequence 收尾且正文成段", "stop_sequence", long, false, true},
+		{"短回合不是正面证据", "end_turn", 10, false, false},
+		{"刚好等于上限仍算短，不清零", "end_turn", anthropicShortTurnVisibleCharLimit, false, false},
+		{"tool_use 回合一律不表态，正文再长也不清零", "end_turn", long, true, false},
+		{"stop_reason 为 tool_use 的中间回合不表态", "tool_use", long, false, false},
+		{"pause_turn 是协议级续传，不表态", "pause_turn", long, false, false},
+		{"没有 stop_reason 不表态", "", long, false, false},
+		{"异常 stop_reason 不表态", "refusal", long, false, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			require.Equal(t, tc.want,
+				anthropicTurnProvesUpstreamHealthy(tc.stopReason, tc.chars, tc.toolUse))
+		})
+	}
+}
+
+// 账号 9 的线上复现（21:23:19 out=63/chars=132 截断 → 几发 tool_use → 21:26:34
+// out=34/chars=81 又截断）。改动前 tool_use 回合会把连击清零，streak 永远停在 1，
+// 解绑是死代码；改动后中间回合不表态，第二发短回合必须解绑。
+func TestAnthropicPassthrough_ToolUseTurnBetweenShortTurnsStillUnbinds(t *testing.T) {
+	const sessionKey = "sticky-interleaved"
+	const groupID = int64(1)
+	cache := newShortTurnStreakCache(sessionKey, 9)
+	svc, repo := newShortTurnTestGatewayService(t, cache)
+	key := shortTurnStreakKey(groupID, sessionKey)
+
+	// 第一发截断。
+	runShortTurnPassthrough(t, svc, groupID, sessionKey, 9, shortTurnSSE("临时文件都已清理删除，现在只剩部署目录。更新记", 63, false))
+	require.Equal(t, int64(1), cache.streaks[key])
+
+	// 中间几发正常的 agent 工具调用回合：不得清零，也不得累计。
+	for i := 0; i < 3; i++ {
+		runShortTurnPassthrough(t, svc, groupID, sessionKey, 9,
+			turnSSEWithStopReason(strings.Repeat("读日志抓数据。", 30), 761, "tool_use", true))
+	}
+	require.Equal(t, int64(1), cache.streaks[key], "tool_use 中间回合不得清零连击数")
+	require.Zero(t, cache.resets[key], "tool_use 中间回合不得触发 reset")
+	require.Equal(t, int64(9), cache.sessionBindings[sessionKey])
+
+	// 第二发截断：达到阈值，必须解绑。
+	runShortTurnPassthrough(t, svc, groupID, sessionKey, 9, shortTurnSSE("日志键都在那个函数里。抓前后日志", 34, false))
+	require.Equal(t, 1, cache.deletedSessions[sessionKey], "被 tool_use 隔开的两发短回合仍必须解绑")
+	require.NotContains(t, cache.sessionBindings, sessionKey)
+	require.Zero(t, repo.tempCalls, "只解绑不罚号")
+}
+
+// 常规链路上的同一条复现。
+func TestRegularPath_ToolUseTurnBetweenShortTurnsStillUnbinds(t *testing.T) {
+	const sessionKey = "regular-interleaved"
+	const groupID = int64(1)
+	cache := newShortTurnStreakCache(sessionKey, 9)
+	svc, repo := newShortTurnTestGatewayService(t, cache)
+	key := shortTurnStreakKey(groupID, sessionKey)
+
+	runShortTurnRegularPath(t, svc, groupID, sessionKey, 9, shortTurnSSE("短回答", 63, false))
+	require.Equal(t, int64(1), cache.streaks[key])
+
+	for i := 0; i < 3; i++ {
+		runShortTurnRegularPath(t, svc, groupID, sessionKey, 9,
+			turnSSEWithStopReason(strings.Repeat("读日志抓数据。", 30), 761, "tool_use", true))
+	}
+	require.Equal(t, int64(1), cache.streaks[key], "tool_use 中间回合不得清零连击数")
+	require.Zero(t, cache.resets[key])
+
+	runShortTurnRegularPath(t, svc, groupID, sessionKey, 9, shortTurnSSE("又一句短回答", 34, false))
+	require.Equal(t, 1, cache.deletedSessions[sessionKey], "被 tool_use 隔开的两发短回合仍必须解绑")
+	require.NotContains(t, cache.sessionBindings, sessionKey)
+	require.Zero(t, repo.tempCalls)
+}

@@ -575,6 +575,39 @@ func anthropicTurnLooksSuspiciouslyShort(
 	return visibleChars > 0 && visibleChars <= anthropicShortTurnVisibleCharLimit
 }
 
+// anthropicTurnProvesUpstreamHealthy 判定这一回合能否作为「上游把话说完了」的正面证据，
+// 也就是能不能拿它去清零短回合连击数。
+//
+// 为什么不能直接用 !anthropicTurnLooksSuspiciouslyShort 当清零条件：agent 流量里每次
+// 截断后面必然跟着一串 tool_use 回合（客户端去读日志、抓数据、再问一次），而 tool_use
+// 回合在 anthropicTurnLooksSuspiciouslyShort 里直接 return false，于是落进 else 分支
+// 把连击清零。结果 streak 永远停在 1，永远到不了阈值 2——解绑在真实 agent 流量下仍是
+// 死代码，两条链路都一样。线上实证：账号 9 在 21:23:19（out=63/chars=132）与 21:26:34
+// （out=34/chars=81）各截断一次，中间隔着几发 tool_use，日志里只留下 streak=1。
+//
+// 所以清零要的是正面证据：这一回合确实产出了成段正文（可见字符超过短回合上限），且
+// stop_reason 属于健康白名单。tool_use 回合只是 agent 流程的中间步骤，既不可疑、也不
+// 构成「narrative 回合不会被截断」的证据，对连击数一律不表态。
+func anthropicTurnProvesUpstreamHealthy(
+	stopReason string,
+	visibleChars int,
+	sawToolUseBlock bool,
+) bool {
+	// 白名单刻意比 anthropicStopReasonIsHealthy 窄。那个白名单答的是「这条流算不算残缺」，
+	// 含 tool_use 和 pause_turn；这里答的是「这一回合把话说完了没有」，那两个恰恰都表示
+	// 回合还没说完——tool_use 要等工具结果再续，pause_turn 是协议级续传。把它们当成正面
+	// 证据就会重演「tool_use 清零连击」这个 bug。
+	switch strings.ToLower(strings.TrimSpace(stopReason)) {
+	case "end_turn", "max_tokens", "stop_sequence":
+	default:
+		return false
+	}
+	if sawToolUseBlock {
+		return false
+	}
+	return visibleChars > anthropicShortTurnVisibleCharLimit
+}
+
 // noteAnthropicShortTurnStreak 累计可疑短回合，达到阈值就解除本会话的粘性绑定。
 //
 // 为什么解绑而不是罚号：罚号会把账号从所有会话的调度池里摘掉，而这里的判据是启发式的，
@@ -1100,9 +1133,11 @@ func (s *GatewayService) handleStreamingResponseAnthropicAPIKeyPassthrough(
 		if !incomplete {
 			// 确定性判定放行之后，再看这一回合是否属于「协议合法但疑似没把话说完」。
 			// 这条路径只累计连击 / 到阈值解绑，绝不罚号，见 noteAnthropicShortTurnStreak。
+			// 三态：可疑 -> 累计连击；有正面证据 -> 清零；其余（典型是 tool_use 中间回合）
+			// -> 不表态，保留连击。见 anthropicTurnProvesUpstreamHealthy。
 			if anthropicTurnLooksSuspiciouslyShort(sawStopReason, visibleChars, usage.OutputTokens, sawToolUseBlock) {
 				s.noteAnthropicShortTurnStreak(ctx, account, model, visibleChars, usage.OutputTokens)
-			} else {
+			} else if anthropicTurnProvesUpstreamHealthy(sawStopReason, visibleChars, sawToolUseBlock) {
 				s.clearAnthropicShortTurnStreak(ctx)
 			}
 			return

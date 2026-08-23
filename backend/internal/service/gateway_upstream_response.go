@@ -1048,9 +1048,11 @@ func (s *GatewayService) handleStreamingResponse(ctx context.Context, resp *http
 		if !incomplete {
 			// 确定性判定放行之后，再看这一回合是否「协议合法但疑似没把话说完」。
 			// 这条路径只累计连击 / 到阈值解绑，绝不罚号，见 noteAnthropicShortTurnStreak。
+			// 三态：可疑 -> 累计连击；有正面证据 -> 清零；其余（典型是 tool_use 中间回合）
+			// -> 不表态，保留连击。见 anthropicTurnProvesUpstreamHealthy。
 			if anthropicTurnLooksSuspiciouslyShort(sawStopReason, visibleChars, usage.OutputTokens, sawToolUseBlock) {
 				s.noteAnthropicShortTurnStreak(ctx, account, originalModel, visibleChars, usage.OutputTokens)
-			} else {
+			} else if anthropicTurnProvesUpstreamHealthy(sawStopReason, visibleChars, sawToolUseBlock) {
 				s.clearAnthropicShortTurnStreak(ctx)
 			}
 			return
