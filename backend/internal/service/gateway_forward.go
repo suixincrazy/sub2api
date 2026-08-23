@@ -33,6 +33,11 @@ const (
 	maxRetryElapsed = 10 * time.Second
 )
 
+// anthropicTransportFailoverBody 是传输层失败（代理/DNS/TCP/TLS，没拿到任何 HTTP
+// 状态码）时挂在 UpstreamFailoverError 上的 Anthropic 格式错误体。内容与历史上
+// 内联写出的 502 完全一致，因此 failover 真正耗尽时客户端看到的载荷不变。
+var anthropicTransportFailoverBody = []byte(`{"type":"error","error":{"type":"upstream_error","message":"Upstream request failed"}}`)
+
 func (s *GatewayService) shouldRetryUpstreamError(account *Account, statusCode int) bool {
 	// OAuth/Setup Token 账号：仅 403 重试
 	if account.IsOAuth() {
@@ -392,11 +397,6 @@ func (s *GatewayService) Forward(ctx context.Context, c *gin.Context, account *A
 			if resp != nil && resp.Body != nil {
 				_ = resp.Body.Close()
 			}
-			// Transport attempt left local validation; count Ollama Cloud activity.
-			if !errors.Is(err, context.Canceled) {
-				scheduleOllamaCloudUsageActivity(s.deferredService, account)
-			}
-			// Ensure the client receives an error response (handlers assume Forward writes on non-failover errors).
 			safeErr := sanitizeUpstreamErrorMessage(err.Error())
 			setOpsUpstreamError(c, 0, safeErr, "")
 			appendOpsUpstreamError(c, OpsUpstreamErrorEvent{
@@ -408,14 +408,23 @@ func (s *GatewayService) Forward(ctx context.Context, c *gin.Context, account *A
 				Kind:               "request_error",
 				Message:            safeErr,
 			})
-			c.JSON(http.StatusBadGateway, gin.H{
-				"type": "error",
-				"error": gin.H{
-					"type":    "upstream_error",
-					"message": "Upstream request failed",
-				},
-			})
-			return nil, fmt.Errorf("upstream request failed: %s", safeErr)
+			// 客户端主动断开：上游没有表现出任何故障，不换号也不写响应。
+			if errors.Is(err, context.Canceled) {
+				return nil, err
+			}
+			// Transport attempt left local validation; count Ollama Cloud activity.
+			scheduleOllamaCloudUsageActivity(s.deferredService, account)
+			// 传输层失败（代理/DNS/TCP/TLS，没拿到任何 HTTP 状态码）与账号本身的
+			// 可用性无关：同一分组里换个走别的代理的账号往往立刻就能成。这里必须
+			// 包成 UpstreamFailoverError 并且**不写响应体**，否则 handler 的
+			// errors.As 匹配不到 failover 错误，会把这一发直接当终态返回给客户端
+			// ——即「代理被 reset 就 502，一个号都不换」。响应由 handler 在
+			// failover 耗尽后统一写出。
+			return nil, &UpstreamFailoverError{
+				StatusCode:   http.StatusBadGateway,
+				ResponseBody: anthropicTransportFailoverBody,
+				Reason:       GatewayFailureReason("anthropic_forward_transport"),
+			}
 		}
 
 		// 优先检测thinking block签名错误（400）并重试一次

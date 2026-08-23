@@ -212,14 +212,18 @@ func (s *GatewayService) executeBedrockUpstream(
 				Kind:               "request_error",
 				Message:            safeErr,
 			})
-			c.JSON(http.StatusBadGateway, gin.H{
-				"type": "error",
-				"error": gin.H{
-					"type":    "upstream_error",
-					"message": "Upstream request failed",
-				},
-			})
-			return nil, fmt.Errorf("upstream request failed: %s", safeErr)
+			// 客户端主动断开：上游没有表现出任何故障，不换号也不写响应。
+			if errors.Is(err, context.Canceled) {
+				return nil, err
+			}
+			// 传输层失败与账号可用性无关，必须包成 UpstreamFailoverError 交给 handler
+			// 换号；同时不写响应，否则 handler 会把这一发当终态返回。详见
+			// gateway_forward.go 中 anthropicTransportFailoverBody 的注释。
+			return nil, &UpstreamFailoverError{
+				StatusCode:   http.StatusBadGateway,
+				ResponseBody: anthropicTransportFailoverBody,
+				Reason:       GatewayFailureReason("bedrock_transport"),
+			}
 		}
 
 		if resp.StatusCode >= 400 && resp.StatusCode != 400 && s.shouldRetryUpstreamError(account, resp.StatusCode) {
