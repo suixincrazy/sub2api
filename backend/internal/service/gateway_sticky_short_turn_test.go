@@ -132,10 +132,15 @@ func TestAnthropicTurnLooksSuspiciouslyShort(t *testing.T) {
 		{"刚好卡在正文上限仍算可疑", "end_turn", anthropicShortTurnProseRuneLimit, 100, false, true, 0},
 		{"刚好卡在 token 上限仍算可疑", "end_turn", 100, anthropicShortTurnOutputTokenLimit, false, true, 0},
 
-		// 两条上限各自都要能独立否掉。token 数是主判据：实测所有正常短回答都 >=133。
+		// 两条上限各自都要能独立否掉。
 		{"超过正文上限不算可疑", "end_turn", anthropicShortTurnProseRuneLimit + 1, 100, false, false, 0},
 		{"超过 token 上限不算可疑", "end_turn", 100, anthropicShortTurnOutputTokenLimit + 1, false, false, 0},
-		{"实测正常短回答 out=133 不算可疑", "end_turn", 120, 133, false, false, 0},
+		// out=133 曾是「正常短回答」的下界锚点（旧标定：截断全 ≤112、正常短回答全 ≥133）。
+		// 那条缝是假的：重新打标的 150 发样本里 out=131/142/143/148/156 配正文 252~394 rune
+		// 的 5 发确确实实是截断，与 133 这一带完全重叠，token 数分不开两类。闸门抬到 320
+		// 之后这一档归可疑，是拿误报换漏判的刻意选择——误报代价被丢弃额度封顶（用满即放行），
+		// 漏判代价是用户再吃一发断流。
+		{"out=133 现在归可疑带", "end_turn", 120, 133, false, true, 0},
 
 		// 其余 stop_reason 都自带「模型确实干了活 / 被限制截断」的语义。
 		{"tool_use 不算", "tool_use", 20, 10, false, false, 0},
@@ -197,10 +202,13 @@ func TestAnthropicTurnLooksSuspiciouslyShort(t *testing.T) {
 		// 19:46:49 实证形态：思考 454 / 正文 114 / out 286，宣布下一步就收尾。
 		// 286 > 128 让原值闸门免检，折算后 57 才判得住。
 		{"想很久+正文上百 rune 仍算可疑", "end_turn", 114, 286, false, true, 454},
-		// 折算不能吃掉真正的成段回答：正文 300 rune 时折算回到 250 > 128，照旧放行。
-		// 这才是「思考很长但正文成段是真答案」原本想守的性质。
-		{"思考很长但正文成段是真答案", "end_turn", 300, 1000, false, false, 900},
-		{"思考很长正文刚过健康下限也放行", "end_turn", 260, 800, false, false, 900},
+		// 折算不能吃掉真正的成段回答。闸门 320 时，thinking 900/out 1000 要正文过
+		// ~424 rune 折算值才够 320，所以放行的门槛落在 500 rune 这一带（折算 357）。
+		// 这才是「思考很长但正文成段是真答案」想守的性质；正文退到 300 rune（折算 250）
+		// 归可疑带，与 anthropicTurnProvesUpstreamHealthy 那侧同口径，两者互否。
+		{"思考很长且正文成段是真答案", "end_turn", 500, 1000, false, false, 900},
+		{"思考很长但正文只到 300 rune 仍可疑", "end_turn", 300, 1000, false, true, 900},
+		{"思考很长正文刚过健康下限仍可疑", "end_turn", 260, 800, false, true, 900},
 		// 思考判据不该松掉别的闸门：tool_use 和非 end_turn 收尾一律照旧放行。
 		{"想很久+tool_use 块仍不算", "end_turn", 2, 577, true, false, 900},
 		{"想很久但 max_tokens 收尾不算", "max_tokens", 2, 577, false, false, 900},
@@ -606,6 +614,9 @@ func turnSSEWithStopReason(text string, outputTokens int, stopReason string, too
 //
 // 清零要两个条件同时成立（正文成段 + token 上量），是因为 22:31:21 那一发就是只靠
 // 「字节数够多」（131 个汉字 ≈289 字节 > 200）就把连击清零的。少任何一条都会重演。
+//
+// token 那一侧比的是 anthropicVisibleOutputTokens 折算值、且与可疑判据共用
+// anthropicShortTurnOutputTokenLimit，这是互斥的构造条件，见下面那个穷举用例。
 func TestAnthropicTurnProvesUpstreamHealthy(t *testing.T) {
 	const longProse = anthropicHealthyTurnMinProseRunes + 1
 	const manyTokens = anthropicShortTurnOutputTokenLimit + 1
@@ -615,52 +626,75 @@ func TestAnthropicTurnProvesUpstreamHealthy(t *testing.T) {
 		proseRunes int
 		tokens     int
 		toolUse    bool
+		thinking   int
 		want       bool
 	}{
-		{"成段正文的 end_turn 是正面证据", "end_turn", longProse, manyTokens, false, true},
-		{"被 max_tokens 截断但产出成段正文，也是正面证据", "max_tokens", longProse, manyTokens, false, true},
-		{"stop_sequence 收尾且正文成段", "stop_sequence", longProse, manyTokens, false, true},
-		{"实测正常回答 out=133/正文 210 字", "end_turn", 210, 133, false, true},
+		{"成段正文的 end_turn 是正面证据", "end_turn", longProse, manyTokens, false, 0, true},
+		{"被 max_tokens 截断但产出成段正文，也是正面证据", "max_tokens", longProse, manyTokens, false, 0, true},
+		{"stop_sequence 收尾且正文成段", "stop_sequence", longProse, manyTokens, false, 0, true},
 
-		{"短回合不是正面证据", "end_turn", 10, 20, false, false},
-		{"刚好等于正文下限仍不清零", "end_turn", anthropicHealthyTurnMinProseRunes, manyTokens, false, false},
-		{"刚好等于 token 上限仍不清零", "end_turn", longProse, anthropicShortTurnOutputTokenLimit, false, false},
+		{"短回合不是正面证据", "end_turn", 10, 20, false, 0, false},
+		{"刚好等于正文下限仍不清零", "end_turn", anthropicHealthyTurnMinProseRunes, manyTokens, false, 0, false},
+		{"刚好等于 token 上限仍不清零", "end_turn", longProse, anthropicShortTurnOutputTokenLimit, false, 0, false},
 		// 22:31:21 的回归锚点：131 字放到旧的字节口径里是 289，会被判成正面证据。
-		{"22:31:21 中文截断绝不能清零连击", "end_turn", 131, 70, false, false},
+		{"22:31:21 中文截断绝不能清零连击", "end_turn", 131, 70, false, 0, false},
 		// 中间带（正文超过清零下限、但 token 数还在短回合上限内）一律不表态。
-		{"正文够长但 token 数偏低不表态", "end_turn", longProse, 100, false, false},
+		{"正文够长但 token 数偏低不表态", "end_turn", longProse, 100, false, 0, false},
+		// out=133 在 token 闸门抬到 320 之前是「正常短回答」的锚点，现在落进可疑带，
+		// 于是这一侧必须同步变成不清零——否则两个判定同时为真。是刻意的：见
+		// anthropicShortTurnOutputTokenLimit 上那段网格结论（漏判 27→12，误报恒为 4）。
+		{"out=133/正文 210 字现在归可疑带，不再清零", "end_turn", 210, 133, false, 0, false},
 
-		{"tool_use 回合一律不表态，正文再长也不清零", "end_turn", longProse, manyTokens, true, false},
-		{"stop_reason 为 tool_use 的中间回合不表态", "tool_use", longProse, manyTokens, false, false},
-		{"pause_turn 是协议级续传，不表态", "pause_turn", longProse, manyTokens, false, false},
-		{"没有 stop_reason 不表态", "", longProse, manyTokens, false, false},
-		{"异常 stop_reason 不表态", "refusal", longProse, manyTokens, false, false},
+		// 折算对这一侧同样生效。thinking 900 时正文要过 ~424 rune 才够 320，
+		// 这是「思考很长但确实写了成段正文」的正面证据形态。
+		{"思考很长但正文成段仍是正面证据", "end_turn", 500, 1000, false, 900, true},
+		// 同一组 out/thinking，正文退到 300 就落进可疑带（折算 250），不能清零。
+		{"思考很长而正文只到 300 rune 不清零", "end_turn", 300, 1000, false, 900, false},
+
+		{"tool_use 回合一律不表态，正文再长也不清零", "end_turn", longProse, manyTokens, true, 0, false},
+		{"stop_reason 为 tool_use 的中间回合不表态", "tool_use", longProse, manyTokens, false, 0, false},
+		{"pause_turn 是协议级续传，不表态", "pause_turn", longProse, manyTokens, false, 0, false},
+		{"没有 stop_reason 不表态", "", longProse, manyTokens, false, 0, false},
+		{"异常 stop_reason 不表态", "refusal", longProse, manyTokens, false, 0, false},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			require.Equal(t, tc.want, anthropicTurnProvesUpstreamHealthy(
-				tc.stopReason, tc.proseRunes, tc.tokens, tc.toolUse))
+				tc.stopReason, tc.proseRunes, tc.tokens, tc.toolUse, tc.thinking))
 		})
 	}
 }
 
 // 三态判定不得有重叠：同一个回合不可能既可疑又是正面证据，否则调用点的 if/else-if
 // 顺序就成了隐式的优先级，改动顺序会静默改变行为。
+//
+// 必须连 thinkingRunes 一起枚举。2026-08-24 可疑侧改成比 anthropicVisibleOutputTokens
+// 折算值时，清零侧还在比 output_tokens 原值，互斥当场就破了（prose 300/thinking 900/
+// out 1000 折算 250 判可疑、原值 1000 判健康，两边同真），而这个用例当时把 thinking 恒定
+// 传 0，折算在无思考回合上恒等于原值，于是全程绿灯。
 func TestShortTurnPredicatesAreMutuallyExclusive(t *testing.T) {
 	stopReasons := []string{"end_turn", "max_tokens", "stop_sequence", "tool_use", "pause_turn", "refusal", ""}
 	runeCounts := []int{0, 1, 50,
+		anthropicPostThinkingProseRuneCeiling, anthropicPostThinkingProseRuneCeiling + 1,
 		anthropicHealthyTurnMinProseRunes, anthropicHealthyTurnMinProseRunes + 1,
+		300, 500,
 		anthropicShortTurnProseRuneLimit, anthropicShortTurnProseRuneLimit + 1, 5000}
-	tokenCounts := []int{-1, 0, 1, 70,
-		anthropicShortTurnOutputTokenLimit, anthropicShortTurnOutputTokenLimit + 1, 4096}
+	tokenCounts := []int{-1, 0, 1, 70, 133,
+		anthropicShortTurnOutputTokenLimit, anthropicShortTurnOutputTokenLimit + 1, 1000, 4096}
+	thinkingCounts := []int{0, 1,
+		anthropicShortTurnThinkingRuneFloor - 1, anthropicShortTurnThinkingRuneFloor,
+		900, 5739}
 
 	for _, sr := range stopReasons {
 		for _, runes := range runeCounts {
 			for _, tokens := range tokenCounts {
-				for _, toolUse := range []bool{false, true} {
-					short := anthropicTurnLooksSuspiciouslyShort(sr, runes, tokens, toolUse, 0)
-					healthy := anthropicTurnProvesUpstreamHealthy(sr, runes, tokens, toolUse)
-					require.False(t, short && healthy,
-						"stop_reason=%q prose=%d tokens=%d toolUse=%v 同时命中两个判定", sr, runes, tokens, toolUse)
+				for _, thinking := range thinkingCounts {
+					for _, toolUse := range []bool{false, true} {
+						short := anthropicTurnLooksSuspiciouslyShort(sr, runes, tokens, toolUse, thinking)
+						healthy := anthropicTurnProvesUpstreamHealthy(sr, runes, tokens, toolUse, thinking)
+						require.False(t, short && healthy,
+							"stop_reason=%q prose=%d tokens=%d thinking=%d toolUse=%v 同时命中两个判定",
+							sr, runes, tokens, thinking, toolUse)
+					}
 				}
 			}
 		}
@@ -722,17 +756,20 @@ func TestRegularPath_ToolUseTurnBetweenShortTurnsStillUnbinds(t *testing.T) {
 	require.Zero(t, repo.tempCalls)
 }
 
-// cjkTruncationText 复刻实测中文截断的正文形状：247 个汉字、UTF-8 下 741 字节。
+// cjkTruncationText 复刻实测中文截断的正文形状，长度按 anthropicShortTurnProseRuneLimit
+// 反推，保证「字节数越界、rune 数没越界」这条前提跟着常量一起动。
 //
-// 刻意不用 22:31:21 那一发的 131 字：131 字 ≈393 字节，仍小于新的 400 上限，所以那一发
-// 光靠「上限从 200 抬到 400」就能抓住，验不出单位有没有改对。247 字才卡在缝里——
-// rune 数 247 落在窗口内，字节数 741 早已越界，只有按 rune 数才判得出来。
-// 这一组（out=106 对 247 字）同样是实测样本。
+// 实测样本是 247 个汉字 / out=106（UTF-8 下 741 字节）。上限从 400 抬到 800 之后 741 字节
+// 不再越界，写死 247 就验不出单位有没有改对了。所以长度改成从常量算：中文一字 3 字节，
+// 取「上限/3 + 40」个汉字，字节数必然过界而 rune 数仍落在窗口内。out 保持实测的 106，
+// 密度 0.35 仍在实测截断那一带（0.35~0.62）。
 func cjkTruncationText(t *testing.T) string {
 	t.Helper()
-	// 20 字一句 × 12 句 + 7 字 = 247 字。
-	text := strings.Repeat("临时文件都已清理删除，现在只剩部署目录。", 12) + "接下来我看日志"
-	require.Equal(t, 247, utf8.RuneCountInString(text), "回归锚点：必须正好是 247 个汉字")
+	const sentence = "临时文件都已清理删除，现在只剩部署目录。" // 20 字
+	target := anthropicShortTurnProseRuneLimit/3 + 40
+	repeats := target/utf8.RuneCountInString(sentence) + 1
+	text := string([]rune(strings.Repeat(sentence, repeats))[:target])
+	require.Equal(t, target, utf8.RuneCountInString(text), "回归锚点：rune 数必须正好是算出来的目标值")
 	require.LessOrEqual(t, utf8.RuneCountInString(text), anthropicShortTurnProseRuneLimit,
 		"前提：rune 数必须落在短回合窗口内")
 	require.Greater(t, len(text), anthropicShortTurnProseRuneLimit,
@@ -743,10 +780,10 @@ func cjkTruncationText(t *testing.T) string {
 // 实测中文截断的复现（透传链路），锚定的是「按字节数还是按 rune 数」这个单位错。
 //
 // 改动前 anthropicVisibleDeltaChars 用 len() 数 UTF-8 字节，中文一字三字节，于是
-// 「200 字符上限」对中文实际只有 66 字。这一发 247 个汉字被数成 741，既躲过短回合判定，
-// 又（在旧的 visibleChars>200 口径下）满足 anthropicTurnProvesUpstreamHealthy，
-// **反过来把已积累的连击清零**——比单纯漏判更糟：解绑永远触发不了，粘性把下一发原样
-// 送回同一个坏号。改动后按 rune 数判定，两发必须解绑。
+// 「200 字符上限」对中文实际只有 66 字。这一发的汉字数落在窗口内、字节数早已越界，
+// 旧口径下既躲过短回合判定，又（在旧的 visibleChars>200 口径下）满足
+// anthropicTurnProvesUpstreamHealthy，**反过来把已积累的连击清零**——比单纯漏判更糟：
+// 解绑永远触发不了，粘性把下一发原样送回同一个坏号。改动后按 rune 数判定，必须解绑。
 func TestAnthropicPassthrough_CJKTruncationUnbinds(t *testing.T) {
 	const sessionKey = "sticky-cjk"
 	const groupID = int64(1)
@@ -754,8 +791,8 @@ func TestAnthropicPassthrough_CJKTruncationUnbinds(t *testing.T) {
 	svc, repo := newShortTurnTestGatewayService(t, cache)
 	text := cjkTruncationText(t)
 
-	// 解绑发生了，就证明这一发被判成了可疑：旧实现把 247 个汉字数成 741 字节，会反过来
-	// 当成「上游把话说完了」的正面证据去清零，那样一次解绑都不会有。
+	// 解绑发生了，就证明这一发被判成了可疑：旧实现按字节数会反过来把它当成「上游把话
+	// 说完了」的正面证据去清零，那样一次解绑都不会有。
 	runShortTurnPassthrough(t, svc, groupID, sessionKey, 9, shortTurnSSE(text, 106, false))
 	requireUnboundOnce(t, cache, groupID, sessionKey)
 	require.Zero(t, repo.tempCalls, "只解绑不罚号")

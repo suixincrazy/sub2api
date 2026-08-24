@@ -1064,7 +1064,7 @@ func (s *GatewayService) handleStreamingResponse(ctx context.Context, resp *http
 					s.reportAnthropicEmptyAnswerTurn(ctx, c, resp, account, originalModel,
 						usage.OutputTokens, sawStopReason, "delivered")
 				}
-			} else if anthropicTurnProvesUpstreamHealthy(sawStopReason, proseRunes, usage.OutputTokens, sawToolUseBlock) {
+			} else if anthropicTurnProvesUpstreamHealthy(sawStopReason, proseRunes, usage.OutputTokens, sawToolUseBlock, thinkingRunes) {
 				s.clearAnthropicShortTurnStreak(ctx)
 			}
 			return

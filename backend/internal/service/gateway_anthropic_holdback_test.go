@@ -603,12 +603,13 @@ func TestAnthropicPassthrough_HoldbackWindowTimeoutReleasesUndecidedTurn(t *test
 // id=9523 out=445，账号 10）：思考链很长，正文只有 "d." 两个字符就 end_turn 收尾。
 //
 // 这一形态是把窗口从 3000 调到 15000 之后**依然**漏掉的那一类，而原因不在窗口：思考
-// token 计入 output_tokens，577 越过 anthropicShortTurnOutputTokenLimit(128) 那道闸门，
-// anthropicTurnLooksSuspiciouslyShort 直接 return false，于是它压根没被判为可疑，持流
-// 一律判 Release、三个检测器全部沉默、连解绑都不触发。两发的 duration_ms - first_token_ms
-// 都是 6.1 秒，窗口再宽也拦不住一个免检的形态。
+// token 计入 output_tokens，577 越过当时 128 的 anthropicShortTurnOutputTokenLimit 那道
+// 闸门，anthropicTurnLooksSuspiciouslyShort 直接 return false，于是它压根没被判为可疑，
+// 持流一律判 Release、三个检测器全部沉默、连解绑都不触发。两发的
+// duration_ms - first_token_ms 都是 6.1 秒，窗口再宽也拦不住一个免检的形态。
 //
-// 所以这条用例守的是「思考判据排在 token 闸门之前」这个顺序，与窗口大小无关。
+// 所以这条用例守的是「思考判据排在 token 闸门之前」这个顺序，与窗口大小无关。闸门后来
+// 抬到 320，577 仍在它之上，这条用例的前提不受影响。
 func TestAnthropicPassthrough_HoldbackDiscardsThinkingInflatedTurnWithoutExposure(t *testing.T) {
 	const sessionKey = "holdback-thinking-inflated"
 	const groupID = int64(1)

@@ -584,23 +584,39 @@ const (
 	// end_turn + 无 tool_use + output_tokens>0 的回合回放，按字节 200 命中 47 发，
 	// 按 rune 400 命中 51 发，且是严格超集——多出来的 4 发正是被漏掉的中文截断
 	// （out=58 对 127 字、out=90 对 183 字、out=73 对 150 字、out=70 对 131 字）。
-	// 400 rune 对英文约等于 60~80 词，仍远低于一次成段回答。
-	anthropicShortTurnProseRuneLimit = 400
+	//
+	// 2026-08-24 再从 400 放到 800：400 之上完全免检，而实测截断里正文 446~2325 rune
+	// 的有 9 发（12:20:23 prose 529、14:15:48 prose 592、14:20:13 prose 813 等），
+	// 全都是「宣布下一步就 end_turn、零 tool_use」的形态。放宽的代价用 150 发带标样本
+	// 量过：T×P 网格里误报数在 T=128..448 / P=400..4000 整片区间恒为 4，放宽不新增误报，
+	// 漏判则从 27 降到 12。
+	//
+	// 没有取网格最优的 P=4000：负样本只有 15 发，其中 12 发正文集中在 838~2079 rune，
+	// 400~800 这一带的正常回答样本几乎是空的，那片「误报恒为 4」的平台更可能是样本没
+	// 覆盖到、而不是真的无风险。800 之下有实测截断支撑，之上不碰那 12 发长回答一簇。
+	anthropicShortTurnProseRuneLimit = 800
 	// anthropicShortTurnOutputTokenLimit 判定「短回合」的输出 token 上限。
 	//
 	// 单靠正文长度分不开两类回合，token 数才是干净的分界：同一批样本里所有截断的
 	// output_tokens 都 ≤112（19/30/34/58/63/70/73/83/90/104/106/112），而所有正常
-	// 短回答都 ≥133（133/138/161/189/227/355/587/792/1796）。取 128 落在这条缝里，
-	// 两侧都有余量。
+	// 短回答都 ≥133（133/138/161/189/227/355/587/792/1796）。128 曾落在这条缝里。
+	//
+	// 2026-08-24 从 128 放到 320：那条缝是拿无思考、正文偏短的样本标的，对中文长正文
+	// 太紧。实测漏判里 out=131/142/143/148/156 配正文 252~394 rune 的有 5 发
+	// （12:13:29 out=148/prose=256、12:46:25 out=143/prose=321），密度 0.42~0.62，
+	// 落在 128 之上却确确实实是截断。同一张网格：320 把漏判从 27 压到 12，误报仍是 4。
+	//
+	// 320 对 15 发正常样本仍有余量——它们的 out 是 461~1718 那一簇，最小的 3 发
+	// （out=123/42/16）在 128 时就已经判可疑，不是这次放宽新增的。
 	//
 	// 注意比的不是 output_tokens 原值，而是 anthropicVisibleOutputTokens 折算出的
-	// 「说出来的那部分」：原值含思考 token，思考一长就把闸门顶穿。标定这个阈值的 165 发
-	// 样本全是无思考回合，折算在那种回合上恒等于原值，所以标定仍然成立。
-	anthropicShortTurnOutputTokenLimit = 128
+	// 「说出来的那部分」：原值含思考 token，思考一长就把闸门顶穿。标定这个阈值的样本
+	// 全是无思考回合，折算在那种回合上恒等于原值，所以标定仍然成立。
+	anthropicShortTurnOutputTokenLimit = 320
 	// anthropicHealthyTurnMinProseRunes 清零连击所需的最小正文长度，单位 rune。
 	//
-	// 刻意比 anthropicShortTurnProseRuneLimit 低（400 vs 200）：两者之间那一段
-	// （201~400 rune 且 token 数不小）既不算可疑、也不算「说完了」，一律不表态。
+	// 刻意比 anthropicShortTurnProseRuneLimit 低（800 vs 200）：两者之间那一段
+	// （201~800 rune 且 token 数不小）既不算可疑、也不算「说完了」，一律不表态。
 	// 留这条中间带是因为清零是**否掉已积累证据**的动作，宁可保守。
 	anthropicHealthyTurnMinProseRunes = 200
 	// anthropicShortTurnStreakThreshold 连续多少发才解绑。
@@ -615,18 +631,20 @@ const (
 	//
 	// 只用来给下面这条上限解锁，不单独构成判据。取 200 与
 	// anthropicHealthyTurnMinProseRunes 同量级：思考短于这个数的回合，output_tokens 不会
-	// 被思考显著撑大，128 那道 token 闸门本来就有效，不需要绕。
+	// 被思考显著撑大，anthropicShortTurnOutputTokenLimit 那道闸门本来就有效，不需要绕。
 	anthropicShortTurnThinkingRuneFloor = 200
 	// anthropicPostThinkingProseRuneCeiling 思考充分的回合里，正文短到这个程度就不可能是
 	// 真答案，单位 rune。
 	//
-	// 刻意取得比 anthropicShortTurnProseRuneLimit(400) 紧得多：那个上限配合 token 闸门
+	// 刻意取得比 anthropicShortTurnProseRuneLimit(800) 紧得多：那个上限配合 token 闸门
 	// 使用，误判有 token 数兜着；这条要绕过 token 闸门，只剩正文长度一个判据，所以必须
 	// 收到「几个字，不可能是任何问题的答案」的量级。40 rune 约合 13 个汉字。
 	//
 	// 2026-08-24 16:42:55 实证（usage_logs id=9514，账号 10）：output_tokens=577 而客户端
-	// 只收到 "d." 两个字符。577 里绝大部分是思考 token，于是 outputTokens>128 让判定直接
-	// return false，这一形态全程免检——窗口调到多大都拦不住，因为压根没被判为可疑。
+	// 只收到 "d." 两个字符。577 里绝大部分是思考 token，于是 outputTokens 越过当时 128 的
+	// 闸门让判定直接 return false，这一形态全程免检——窗口调到多大都拦不住，因为压根没被
+	// 判为可疑。闸门后来抬到 320 并改比折算值，577 原值仍在 320 之上，所以这条旁路照旧
+	// 是这一形态唯一的入口。
 	anthropicPostThinkingProseRuneCeiling = 40
 	// anthropicShortTurnDiscardBudget 一次客户端请求里，「短但有正文」的可疑回合最多丢弃几次。
 	//
@@ -862,30 +880,33 @@ func anthropicTurnLooksSuspiciouslyShort(
 // anthropicVisibleOutputTokens 从 output_tokens 里估算「说出来的那部分」占多少 token。
 //
 // 为什么要折算：output_tokens 是思考与正文的合计，而 anthropicShortTurnOutputTokenLimit
-// 那道闸门想问的一直是「模型到底说了多少」。思考一长合计就被顶过 128，闸门恒为假，于是
+// 那道闸门想问的一直是「模型到底说了多少」。思考一长合计就把闸门顶穿、闸门恒为假，于是
 // 「想了很久却只说半句」这一整类截断全程免检——上面那条 anthropicPostThinkingProseRuneCeiling
 // 旁路是拿正文 2 rune 的极端形态标定的，兜不住正文上百 rune 的同类形态。
 //
 // 2026-08-24 19:46:49 实证：thinking 454 rune / 正文 114 rune / output_tokens 286，
 // stop_reason=end_turn 且无 tool_use，正文内容是宣布下一步（「先把上游状态和技能副本对齐」）
-// 之后就收尾，思考里明说要并行推进几个方向。286 > 128 让它免检，折算后是 57，回到闸门
-// 的有效区间内。
+// 之后就收尾，思考里明说要并行推进几个方向。286 越过当时 128 的闸门让它免检，折算后是 57，
+// 回到闸门的有效区间内。
 //
 // 按 rune 数比例切分：思考与正文出自同一次生成、同一种语言，token/rune 密度可以当成相同，
 // 所以 visible ≈ out × prose/(prose+thinking)。这是估算而非精确值——上游不单独报正文
 // token（那一发的 output_tokens_details.thinking_tokens 是 0），拿不到精确切分。作为闸门
-// 输入够用：两类回合的分界有 112 对 133 这么宽的缝，估算误差吃不掉它。
+// 输入够用：折算误差远小于闸门本身的余量。
 //
 // 折算与 anthropicPostThinkingProseRuneCeiling 那条旁路共用同一道下限
 // anthropicShortTurnThinkingRuneFloor，理由也是同一条：思考短于下限时 output_tokens 没被
-// 显著撑大，128 那道闸门本来就有效，此时折算只会凭空削弱它。下限以下返回原值，所以
-// 无思考（以及思考很短）的回合行为与改动前逐位相同，128 背后那 165 发样本的标定不受影响。
+// 显著撑大，闸门本来就有效，此时折算只会凭空削弱它。下限以下返回原值，所以无思考
+// （以及思考很短）的回合行为与改动前逐位相同，闸门背后那批样本的标定不受影响。
 //
-// 折算后闸门的实际语义：中文 token/rune 密度约 0.6，128 token 对应正文约 213 rune，与本文件
-// 里「说够了」的下限 anthropicHealthyTurnMinProseRunes(200) 基本重合。也就是说思考很长时，
-// 「正文低于健康下限」才算可疑，正文一旦成段（≥250 rune 左右）折算值就回到 128 以上：
-// thinking 1000/正文 350/out 800 折算 207 放行，thinking 3000/正文 300/out 2000 折算 181
-// 放行，正文再长则先被 anthropicShortTurnProseRuneLimit 拦下。
+// 折算后闸门的实际语义（闸门 320、中文 token/rune 密度约 0.6）：320 token 对应正文约
+// 533 rune，也就是思考很长时「正文没到五百来字」都算可疑。举几组：thinking 900/正文 300/
+// out 1000 折算 250 判可疑，thinking 900/正文 500/out 1000 折算 357 放行，
+// thinking 3000/正文 600/out 2000 折算 333 放行；正文再长则先被
+// anthropicShortTurnProseRuneLimit(800) 拦下。
+//
+// 这道闸门与 anthropicTurnProvesUpstreamHealthy 那侧共用常量、也共用这个折算函数，
+// 两者由此构成直接互否，见那边的注释。
 func anthropicVisibleOutputTokens(outputTokens, proseRunes, thinkingRunes int) int {
 	if outputTokens <= 0 || proseRunes <= 0 {
 		return outputTokens
@@ -928,11 +949,24 @@ func anthropicTurnIsEmptyAnswer(
 // 所以清零要的是正面证据：这一回合确实产出了成段正文，**且** output_tokens 也确实上了
 // 量。两个都要，是因为 22:31:21 那一发就是只满足了「字节数够多」（131 个汉字 ≈289 字节）
 // 就把连击清零的——单看长度会被中文的字节膨胀骗过去，加上 token 数才骗不过。
+//
+// token 那道闸门必须与 anthropicTurnLooksSuspiciouslyShort **共用同一个常量、且同样比
+// 折算值**，这不是巧合而是三态互斥的构造：可疑要求 folded <= 上限，清零要求 folded > 上限，
+// 同一个常量下两者是直接互否，不可能同时成立。一旦拆成两个数（试过 128/320），out 落在
+// 129~320 且正文 201~800 的回合会同时命中两个判定，调用点 if/else-if 的书写顺序就变成
+// 隐式优先级，改动顺序会静默改变行为——TestShortTurnPredicatesAreMutuallyExclusive 正是
+// 为了钉死这一点。
+//
+// 同理必须收 thinkingRunes：可疑侧自 2026-08-24 起比的是 anthropicVisibleOutputTokens
+// 折算值，这一侧要是继续比原值，互斥就已经破了。prose 300 / thinking 900 / out 1000
+// 折算成 250 判可疑，原值 1000 又判成健康，两边同时为真。互斥测试当时枚举 thinking 恒为 0，
+// 折算在那种回合上恒等于原值，所以看不见这个洞。
 func anthropicTurnProvesUpstreamHealthy(
 	stopReason string,
 	proseRunes int,
 	outputTokens int,
 	sawToolUseBlock bool,
+	thinkingRunes int,
 ) bool {
 	// 白名单刻意比 anthropicStopReasonIsHealthy 窄。那个白名单答的是「这条流算不算残缺」，
 	// 含 tool_use 和 pause_turn；这里答的是「这一回合把话说完了没有」，那两个恰恰都表示
@@ -946,7 +980,8 @@ func anthropicTurnProvesUpstreamHealthy(
 	if sawToolUseBlock {
 		return false
 	}
-	if outputTokens <= anthropicShortTurnOutputTokenLimit {
+	if anthropicVisibleOutputTokens(outputTokens, proseRunes, thinkingRunes) <=
+		anthropicShortTurnOutputTokenLimit {
 		return false
 	}
 	return proseRunes > anthropicHealthyTurnMinProseRunes
@@ -1661,7 +1696,7 @@ func (s *GatewayService) handleStreamingResponseAnthropicAPIKeyPassthrough(
 					s.reportAnthropicEmptyAnswerTurn(ctx, c, resp, account, model,
 						usage.OutputTokens, sawStopReason, "delivered")
 				}
-			} else if anthropicTurnProvesUpstreamHealthy(sawStopReason, proseRunes, usage.OutputTokens, sawToolUseBlock) {
+			} else if anthropicTurnProvesUpstreamHealthy(sawStopReason, proseRunes, usage.OutputTokens, sawToolUseBlock, thinkingRunes) {
 				s.clearAnthropicShortTurnStreak(ctx)
 			}
 			return
