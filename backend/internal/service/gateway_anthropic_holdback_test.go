@@ -65,8 +65,10 @@ func runHoldbackPassthrough(
 // 两条容易写错的顺序在这里被钉住：
 //   - stop_reason 已知时优先于窗口。窗口只是「等不起了」的兜底，拿到全部判据就该直接定案，
 //     否则一条 3 秒才吐完的截断会因为窗口先到而被放行。
-//   - retryUsed 必须能一票否决 Discard。用户问的问题本来就只有一句话答案时，每个账号都会
+//   - 丢弃额度必须能一票否决 Discard。用户问的问题本来就只有一句话答案时，每个账号都会
 //     给同样的短回合，不设上限会一路重试到调度耗尽，把一个完好的短回答变成 502。
+//   - 额度按形态分档。空回合不存在「本来就该是空的答案」这种合法解释，所以它的上限比短回合
+//     宽；两档共用同一个计数器，各自比自己的上限。
 func TestAnthropicHoldbackVerdict(t *testing.T) {
 	cases := []struct {
 		name         string
@@ -75,7 +77,7 @@ func TestAnthropicHoldbackVerdict(t *testing.T) {
 		proseRunes   int
 		outputTokens int
 		toolUse      bool
-		retryUsed    bool
+		discards     int
 		thinking     int
 		want         anthropicHoldbackDecision
 	}{
@@ -133,20 +135,52 @@ func TestAnthropicHoldbackVerdict(t *testing.T) {
 			windowGone: true, proseRunes: 0, outputTokens: 40,
 			want: anthropicHoldbackRelease,
 		},
+		// 4 条 disposition=delivered（2026-08-24 15:04:12 / 15:12:13 / 18:09:58 / 18:14:40）
+		// 的根因就在这里：两档共用一次性额度时，第一个坏号把额度吃光，第二个坏号的空响应必然
+		// 放行。下一条才是真正区分两档的那一行：discards 已经到了短回合的上限，空回合仍然丢。
 		{
-			name:       "零正文但已重试过一次：放行，避免一路重试到调度耗尽",
-			stopReason: "end_turn", proseRunes: 0, outputTokens: 1, retryUsed: true,
-			want: anthropicHoldbackRelease,
+			name:       "零正文且已丢弃过一次：仍然丢弃，这是 4 条 delivered 的根因",
+			stopReason: "end_turn", proseRunes: 0, outputTokens: 1, discards: 1,
+			want: anthropicHoldbackDiscard,
+		},
+		{
+			name:       "零正文额度用满前的最后一次仍然丢弃",
+			stopReason: "end_turn", proseRunes: 0, outputTokens: 1,
+			discards: anthropicEmptyAnswerDiscardBudget - 1,
+			want:     anthropicHoldbackDiscard,
+		},
+		// 仍然留上限：额度耗尽后退化成放行（等于改动前的行为），不会把池子重试到 502。
+		{
+			name:       "零正文丢满额度后放行，不能一路重试到调度耗尽",
+			stopReason: "end_turn", proseRunes: 0, outputTokens: 1,
+			discards: anthropicEmptyAnswerDiscardBudget,
+			want:     anthropicHoldbackRelease,
 		},
 		{
 			name:       "stop_reason 优先于窗口：窗口已过但判据齐了仍然丢弃",
 			windowGone: true, stopReason: "end_turn", proseRunes: 131, outputTokens: 70,
 			want: anthropicHoldbackDiscard,
 		},
+		// 19:22:03（prose 287 / out 69）与 19:23:58（prose 217 / out 54）这两发之所以交付，
+		// 就是因为额度只有一次、已被前一个坏号吃光。同时坏掉两个号是常态，所以第二次仍要丢。
 		{
-			name:       "已经重试过一次：同样的可疑形态必须放行，不能把短回答变成 502",
-			stopReason: "end_turn", proseRunes: 131, outputTokens: 70, retryUsed: true,
-			want: anthropicHoldbackRelease,
+			name:       "短回合已丢弃过一次：仍然丢弃，这是 19:2x 两发交付的根因",
+			stopReason: "end_turn", proseRunes: 131, outputTokens: 70, discards: 1,
+			want: anthropicHoldbackDiscard,
+		},
+		{
+			name:       "短回合丢满额度后放行，不能把真短答案变成 502",
+			stopReason: "end_turn", proseRunes: 131, outputTokens: 70,
+			discards: anthropicShortTurnDiscardBudget,
+			want:     anthropicHoldbackRelease,
+		},
+		// 两档共用一个计数器，所以顺序无关：为空回合丢满之后，短回合那一档立刻判定额度已尽，
+		// 短回合上限的保护不会因为空回合放宽而失效。
+		{
+			name:       "空回合丢满之后短回合不再丢",
+			stopReason: "end_turn", proseRunes: 131, outputTokens: 70,
+			discards: anthropicEmptyAnswerDiscardBudget,
+			want:     anthropicHoldbackRelease,
 		},
 		{
 			name:       "token 上量的短正文是正常回答，放行",
@@ -203,7 +237,7 @@ func TestAnthropicHoldbackVerdict(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			got := anthropicHoldbackVerdict(
-				tc.windowGone, tc.stopReason, tc.proseRunes, tc.outputTokens, tc.toolUse, tc.retryUsed,
+				tc.windowGone, tc.stopReason, tc.proseRunes, tc.outputTokens, tc.toolUse, tc.discards,
 				tc.thinking)
 			require.Equal(t, tc.want, got)
 		})
@@ -280,8 +314,8 @@ func TestAnthropicPassthrough_HoldbackDiscardsShortTurnWithoutExposure(t *testin
 	require.Empty(t, rec.Body.String(), "截断内容一个字节都不能写给客户端")
 	require.False(t, c.Writer.Written())
 
-	// 本次请求的重试额度已经用掉，第二次不能再丢。
-	require.True(t, anthropicHoldbackRetryUsed(c))
+	// 本次请求已经丢弃过一次。短回合额度是 1，所以第二次同形态就得放行。
+	require.Equal(t, 1, anthropicHoldbackDiscardsUsed(c))
 
 	// 丢弃的同时必须解绑。这一条是「不会自动切号」的根因：非破坏性绑定
 	// （gateway_service.go 里 existingAccountID != accountID 时直接 return nil）加上
@@ -317,7 +351,7 @@ func TestAnthropicPassthrough_HoldbackDiscardsEmptyAnswerWithoutExposure(t *test
 	// 零暴露：空响应一个字节都不能到客户端。
 	require.Empty(t, rec.Body.String(), "空回合一个字节都不能写给客户端")
 	require.False(t, c.Writer.Written())
-	require.True(t, anthropicHoldbackRetryUsed(c))
+	require.Equal(t, 1, anthropicHoldbackDiscardsUsed(c))
 
 	// 解绑：让重试那一发之后的请求也别再回到这个号。
 	require.Equal(t, 1, cache.deletedSessions[sessionKey])
@@ -348,27 +382,108 @@ func TestAnthropicPassthrough_HoldbackDiscardShortButNonEmptyDoesNotPenalize(t *
 	require.Zero(t, repo.tempCalls, "有正文就可能是合法短回答，只解绑不罚号")
 }
 
-// 同一发响应，在「本次请求已经丢过一次」之后必须原样交付，并回落到解绑。
+// 短回合（有正文）丢过一次之后仍要继续丢，这是 19:2x 那两发交付的直接修复。
 //
-// 没有这条兜底，问题本来就只有一句话答案时会一路重试到调度耗尽，最后把一个完好的短回答
-// 变成 502——那比断流更糟。
-func TestAnthropicPassthrough_HoldbackRetryUsedDeliversAndUnbinds(t *testing.T) {
-	const sessionKey = "holdback-retry-used"
+// 实证形态：账号 10 连续五发短回合都被成功丢弃，但其中两发的重试落到账号 9 上就交付了——
+// 19:22:03（prose 287 / out 69）与 19:23:58（prose 217 / out 54）都只留下
+// sticky_short_turn_unbound、没有配对的 holdback_failover。一次性额度的隐含假设是「第二个
+// 号大概率是好的」，而同时坏掉两个号是常态。这里先记一次丢弃（模拟账号 10 那一发），再喂
+// 一条短回合，必须仍然丢弃。
+func TestAnthropicPassthrough_HoldbackShortTurnStillDiscardedAfterFirstDiscard(t *testing.T) {
+	const sessionKey = "holdback-short-second-account"
 	const groupID = int64(1)
 	cache := newShortTurnStreakCache(sessionKey, 9)
 	svc, repo := newHoldbackTestGatewayService(t, cache, 3000)
 
-	rec, _, err := runHoldbackPassthrough(t, svc, groupID, sessionKey, 9,
+	rec, c, err := runHoldbackPassthrough(t, svc, groupID, sessionKey, 9,
 		shortTurnSSE("临时文件都已清理删除，现在只剩部署目录。接下来我看日志", 70, false),
-		markAnthropicHoldbackRetryUsed)
+		noteAnthropicHoldbackDiscard)
 
-	require.NoError(t, err)
-	require.Contains(t, rec.Body.String(), "接下来我看日志", "第二次必须原样交付")
+	var failoverErr *UpstreamFailoverError
+	require.True(t, errors.As(err, &failoverErr),
+		"第二个坏号的短回合必须继续丢弃，这正是 19:2x 两发交付的成因")
+	require.True(t, failoverErr.ShouldRetryNextAccount())
+	require.Empty(t, rec.Body.String(), "一个字节都不能写给客户端")
+	require.Equal(t, 2, anthropicHoldbackDiscardsUsed(c), "计数要累加，不是布尔")
+	require.Zero(t, repo.tempCalls, "有正文就可能是合法短回答，只解绑不罚号")
+}
+
+// 短回合的额度不是无限：丢满 anthropicShortTurnDiscardBudget 次之后必须原样交付并回落到解绑。
+//
+// 没有这条兜底，问题本来就只有一句话答案时会一路重试到调度耗尽，最后把一个完好的短回答
+// 变成 502——那比断流更糟。所以「短但有正文」这一档的上限刻意小于空回合那一档。
+func TestAnthropicPassthrough_HoldbackShortTurnBudgetExhaustedDeliversAndUnbinds(t *testing.T) {
+	const sessionKey = "holdback-short-budget-used"
+	const groupID = int64(1)
+	cache := newShortTurnStreakCache(sessionKey, 9)
+	svc, repo := newHoldbackTestGatewayService(t, cache, 3000)
+
+	rec, c, err := runHoldbackPassthrough(t, svc, groupID, sessionKey, 9,
+		shortTurnSSE("临时文件都已清理删除，现在只剩部署目录。接下来我看日志", 70, false),
+		func(c *gin.Context) {
+			c.Set(anthropicHoldbackDiscardsKey, anthropicShortTurnDiscardBudget)
+		})
+
+	require.NoError(t, err, "额度耗尽后不得再产生 failover，否则会把短回答变成 502")
+	require.Contains(t, rec.Body.String(), "接下来我看日志", "额度用尽必须原样交付")
 	require.Contains(t, rec.Body.String(), "message_stop")
+	require.Equal(t, anthropicShortTurnDiscardBudget, anthropicHoldbackDiscardsUsed(c),
+		"放行不消耗额度")
 
 	// 交付了就回落到解绑，让下一发换号。
 	requireUnboundOnce(t, cache, groupID, sessionKey)
 	require.Zero(t, repo.tempCalls)
+}
+
+// 空回合的额度比短回合宽，这是 4 条 disposition=delivered 的直接修复。
+//
+// 实证形态：账号 9 被丢弃后 5~6 秒，账号 12 的空回合落地成一个 200。两档共用一次性额度时
+// 第一个坏号把额度吃光，第二个坏号必然放行。这里先记一次丢弃（模拟账号 9 那一发），再喂
+// 一条空回合，必须仍然丢弃。
+func TestAnthropicPassthrough_HoldbackEmptyAnswerStillDiscardedAfterFirstDiscard(t *testing.T) {
+	const sessionKey = "holdback-empty-second-account"
+	const groupID = int64(1)
+	cache := newShortTurnStreakCache(sessionKey, 12)
+	svc, repo := newHoldbackTestGatewayService(t, cache, 3000)
+
+	rec, c, err := runHoldbackPassthrough(t, svc, groupID, sessionKey, 12, emptyAnswerSSE(1),
+		noteAnthropicHoldbackDiscard)
+
+	var failoverErr *UpstreamFailoverError
+	require.True(t, errors.As(err, &failoverErr),
+		"第二个坏号的空回合必须继续丢弃，这正是 4 条 delivered 的成因")
+	require.Equal(t, GatewayFailureReason("anthropic_short_turn_holdback"), failoverErr.Reason)
+	require.True(t, failoverErr.ShouldRetryNextAccount())
+
+	require.Empty(t, rec.Body.String(), "空响应一个字节都不能写给客户端")
+	require.False(t, c.Writer.Written())
+	require.Equal(t, 2, anthropicHoldbackDiscardsUsed(c), "计数要累加，不是布尔")
+	require.Positive(t, repo.tempCalls, "空回合照旧冷却账号")
+}
+
+// 空回合的额度也不是无限：丢满 anthropicEmptyAnswerDiscardBudget 次之后必须退化成放行。
+//
+// 这条守的是「不新增 502」——额度耗尽后回到今天的行为（交付 + 解绑 + 冷却），而不是把
+// 请求一路重试到调度池耗尽。
+func TestAnthropicPassthrough_HoldbackEmptyAnswerBudgetExhaustedDelivers(t *testing.T) {
+	const sessionKey = "holdback-empty-budget-used"
+	const groupID = int64(1)
+	cache := newShortTurnStreakCache(sessionKey, 12)
+	svc, repo := newHoldbackTestGatewayService(t, cache, 3000)
+
+	rec, c, err := runHoldbackPassthrough(t, svc, groupID, sessionKey, 12, emptyAnswerSSE(1),
+		func(c *gin.Context) {
+			c.Set(anthropicHoldbackDiscardsKey, anthropicEmptyAnswerDiscardBudget)
+		})
+
+	require.NoError(t, err, "额度耗尽后不得再产生 failover，否则会新增 502")
+	require.Contains(t, rec.Body.String(), "message_stop")
+	require.Equal(t, anthropicEmptyAnswerDiscardBudget, anthropicHoldbackDiscardsUsed(c),
+		"放行不消耗额度")
+
+	// 交付了就回落到解绑 + 冷却，与 delivered 那一档同口径。
+	requireUnboundOnce(t, cache, groupID, sessionKey)
+	require.Positive(t, repo.tempCalls, "交付出去的空回合仍要冷却账号")
 }
 
 // 成段回答必须照常交付，且不能因为持流丢帧或乱序。
@@ -403,7 +518,7 @@ func TestAnthropicPassthrough_HoldbackReleasesToolUseTurn(t *testing.T) {
 
 	require.NoError(t, err)
 	require.Contains(t, rec.Body.String(), "tool_use")
-	require.False(t, anthropicHoldbackRetryUsed(c), "工具回合不得消耗重试额度")
+	require.Zero(t, anthropicHoldbackDiscardsUsed(c), "工具回合不得消耗丢弃额度")
 }
 
 // 窗口配 0 就必须完全退化成旧行为：短回合照常交付，只走解绑。
@@ -419,7 +534,7 @@ func TestAnthropicPassthrough_HoldbackDisabledPreservesLegacyDelivery(t *testing
 
 	require.NoError(t, err, "关掉持流后不得再产生 failover")
 	require.Contains(t, rec.Body.String(), "接下来我看日志")
-	require.False(t, anthropicHoldbackRetryUsed(c))
+	require.Zero(t, anthropicHoldbackDiscardsUsed(c))
 	requireUnboundOnce(t, cache, groupID, sessionKey)
 }
 
@@ -537,7 +652,7 @@ func TestAnthropicPassthrough_HoldbackDiscardsThinkingInflatedTurnWithoutExposur
 	// 零暴露：这一形态原先是原样交付的，客户端亲眼看到过那两个字符。
 	require.Empty(t, rec.Body.String(), `"d." 一个字节都不能写给客户端`)
 	require.False(t, c.Writer.Written())
-	require.True(t, anthropicHoldbackRetryUsed(c))
+	require.Equal(t, 1, anthropicHoldbackDiscardsUsed(c))
 
 	require.Equal(t, 1, cache.deletedSessions[sessionKey], "丢弃必须同时解绑，否则下一发还是这个号")
 	// 有正文（哪怕只有两个字符）就不是空回合：只解绑，不罚号。
@@ -569,7 +684,7 @@ func TestAnthropicPassthrough_HoldbackDiscardsZeroUsageWithProseWithoutExposure(
 
 	require.Empty(t, rec.Body.String(), "截断内容一个字节都不能写给客户端")
 	require.False(t, c.Writer.Written())
-	require.True(t, anthropicHoldbackRetryUsed(c))
+	require.Equal(t, 1, anthropicHoldbackDiscardsUsed(c))
 
 	require.Equal(t, 1, cache.deletedSessions[sessionKey])
 	// 不罚号：这一档由正文长度说话，与「开了块却零输出」的确定性残缺分开，

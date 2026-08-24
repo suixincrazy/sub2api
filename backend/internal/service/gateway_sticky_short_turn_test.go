@@ -189,7 +189,18 @@ func TestAnthropicTurnLooksSuspiciouslyShort(t *testing.T) {
 		{"思考刚好够长仍算可疑", "end_turn", 2, 577, false, true, anthropicShortTurnThinkingRuneFloor},
 		// 两侧边界各自都要能独立否掉，否则这条判据会开始吃正常回合。
 		{"思考不够长时仍由 token 闸门说话", "end_turn", 2, 577, false, false, anthropicShortTurnThinkingRuneFloor - 1},
-		{"思考很长但正文过了上限是真答案", "end_turn", anthropicPostThinkingProseRuneCeiling + 1, 577, false, false, 900},
+		// 正文过了思考后上限，旁路关闭，但常规判据会用折算过的 token 数接手：
+		// 577 里 900/941 归思考，正文只剩 ~25 token（13 个汉字），仍然不可能是真答案。
+		// 这一行以前期望「放行」，那是折算之前只有 40 rune 旁路一个判据时的盲区，
+		// 不是想守住的性质——19:46:49 那一发（正文 114 rune）就是从这个盲区漏过去的。
+		{"正文过了思考后上限但折算后仍可疑", "end_turn", anthropicPostThinkingProseRuneCeiling + 1, 577, false, true, 900},
+		// 19:46:49 实证形态：思考 454 / 正文 114 / out 286，宣布下一步就收尾。
+		// 286 > 128 让原值闸门免检，折算后 57 才判得住。
+		{"想很久+正文上百 rune 仍算可疑", "end_turn", 114, 286, false, true, 454},
+		// 折算不能吃掉真正的成段回答：正文 300 rune 时折算回到 250 > 128，照旧放行。
+		// 这才是「思考很长但正文成段是真答案」原本想守的性质。
+		{"思考很长但正文成段是真答案", "end_turn", 300, 1000, false, false, 900},
+		{"思考很长正文刚过健康下限也放行", "end_turn", 260, 800, false, false, 900},
 		// 思考判据不该松掉别的闸门：tool_use 和非 end_turn 收尾一律照旧放行。
 		{"想很久+tool_use 块仍不算", "end_turn", 2, 577, true, false, 900},
 		{"想很久但 max_tokens 收尾不算", "max_tokens", 2, 577, false, false, 900},

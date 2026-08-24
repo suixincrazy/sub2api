@@ -586,12 +586,16 @@ const (
 	// （out=58 对 127 字、out=90 对 183 字、out=73 对 150 字、out=70 对 131 字）。
 	// 400 rune 对英文约等于 60~80 词，仍远低于一次成段回答。
 	anthropicShortTurnProseRuneLimit = 400
-	// anthropicShortTurnOutputTokenLimit 判定「短回合」的 output_tokens 上限。
+	// anthropicShortTurnOutputTokenLimit 判定「短回合」的输出 token 上限。
 	//
 	// 单靠正文长度分不开两类回合，token 数才是干净的分界：同一批样本里所有截断的
 	// output_tokens 都 ≤112（19/30/34/58/63/70/73/83/90/104/106/112），而所有正常
 	// 短回答都 ≥133（133/138/161/189/227/355/587/792/1796）。取 128 落在这条缝里，
 	// 两侧都有余量。
+	//
+	// 注意比的不是 output_tokens 原值，而是 anthropicVisibleOutputTokens 折算出的
+	// 「说出来的那部分」：原值含思考 token，思考一长就把闸门顶穿。标定这个阈值的 165 发
+	// 样本全是无思考回合，折算在那种回合上恒等于原值，所以标定仍然成立。
 	anthropicShortTurnOutputTokenLimit = 128
 	// anthropicHealthyTurnMinProseRunes 清零连击所需的最小正文长度，单位 rune。
 	//
@@ -624,6 +628,38 @@ const (
 	// 只收到 "d." 两个字符。577 里绝大部分是思考 token，于是 outputTokens>128 让判定直接
 	// return false，这一形态全程免检——窗口调到多大都拦不住，因为压根没被判为可疑。
 	anthropicPostThinkingProseRuneCeiling = 40
+	// anthropicShortTurnDiscardBudget 一次客户端请求里，「短但有正文」的可疑回合最多丢弃几次。
+	//
+	// 必须有上限：如果用户问的问题**本来**就只有一句话的答案，每个账号都会给出同样的短回合，
+	// 不设上限就会一路把池子重试穿，最后把一个完好的短回答变成 502。
+	//
+	// 为什么是 2 而不是 1（2026-08-24 19:2x 实证）：账号 10 连续五发短回合都被成功丢弃
+	// （prose 91/138/169/200/200，out 22/34/42/48/49），但其中两发的重试落到账号 9 上之后
+	// 就交付了 —— 19:22:03（prose 287 / out 69）与 19:23:58（prose 217 / out 54）都只留下
+	// sticky_short_turn_unbound、没有配对的 holdback_failover，正是「额度已被第一个坏号吃光
+	// 所以放行」的签名。一次性额度的隐含假设是「第二个号大概率是好的」，而实测同时坏掉两个
+	// 号是常态，所以这个假设不成立。
+	//
+	// 上限仍然远小于池子（当前 8 个可调度透传账号）：最坏情况用掉 3 个号就放行，
+	// FailedAccountIDs 不会被掏空，因此额度耗尽退化成放行而不是 502。
+	anthropicShortTurnDiscardBudget = 2
+	// anthropicEmptyAnswerDiscardBudget 一次客户端请求里，「零正文」回合最多丢弃几次。
+	//
+	// 刻意比 anthropicShortTurnDiscardBudget 宽：那条上限的全部理由是保护「真的只有一句话
+	// 的答案」，而零正文回合不存在这种合法解释（同一判断与对照数据见
+	// reportAnthropicEmptyAnswerTurn 的注释），所以也就不存在「额度用尽后要原样放行」的
+	// 理由——放行的结果一定是客户端吃到一个没有答案的 200。
+	//
+	// 2026-08-24 实证：4 条 disposition=delivered（15:04:12 / 15:12:13 / 18:09:58 /
+	// 18:14:40）全是账号 12 在账号 9 被丢弃后 5~6 秒落地的空回合。两档共用一次性额度时，
+	// 第一个坏号把额度吃光，第二个坏号的空响应就必然放行，窗口调到多大都没用。
+	//
+	// 仍然留上限而不是无限重试：空回合这一档会走 HandleStreamTruncated 把账号冷却一分钟，
+	// 每丢弃一次池子就小一圈，3 次足以跨过连续两个坏号（实测最长连击是 2）。额度耗尽后是
+	// 退化成放行（等于今天的行为），不会新增 502；只有池子先被 FailedAccountIDs 掏空才会
+	// 走到 502（当前 8 个可调度透传账号，3 次远够不着），那时带明确错误体的 502 也比一个
+	// 空的 200 诚实。
+	anthropicEmptyAnswerDiscardBudget = 3
 )
 
 // anthropicHoldbackDecision 是提交窗口内对「这一帧之后怎么办」的三态判定。
@@ -651,17 +687,17 @@ const (
 //  2. 正文已超过短回合上限——已经不可能被判可疑，再等只是白等；
 //  3. 持流窗口耗尽——拿真实数据标定过，见 GatewayConfig.AnthropicHoldbackWindowMs。
 //
-// retryUsed 是本次请求已经因为持流丢弃过一次的标记。它必须存在：如果用户问的问题**本来**
-// 就只有一句话的答案，每个账号都会给出同样的短回合，不设上限就会一路重试到调度耗尽，最后
-// 把一个完好的短回答变成 502。丢弃一次就够了——真截断换个号大概率就好，真短答案则第二次
-// 原样放行。
+// discardsUsed 是本次请求已经因为持流判定丢弃过几次上游响应。额度按形态分档，不是一刀切：
+// 「短但有正文」丢满 anthropicShortTurnDiscardBudget 次后就原样放行，因为真短答案确实存在；
+// 「零正文」可以多丢几次，因为不存在「本来就该是空的答案」这种合法解释。见
+// anthropicShortTurnDiscardBudget 与 anthropicEmptyAnswerDiscardBudget。
 func anthropicHoldbackVerdict(
 	windowElapsed bool,
 	stopReason string,
 	proseRunes int,
 	outputTokens int,
 	sawToolUseBlock bool,
-	retryUsed bool,
+	discardsUsed int,
 	thinkingRunes int,
 ) anthropicHoldbackDecision {
 	if sawToolUseBlock {
@@ -673,7 +709,8 @@ func anthropicHoldbackVerdict(
 	// stop_reason 已知时判定是确定的，优先于窗口：窗口只是「等不起了」的兜底，
 	// 而这里已经拿到了全部判据。
 	if strings.TrimSpace(stopReason) != "" {
-		if !retryUsed && anthropicTurnLooksSuspiciouslyShort(stopReason, proseRunes, outputTokens, sawToolUseBlock, thinkingRunes) {
+		if anthropicTurnLooksSuspiciouslyShort(stopReason, proseRunes, outputTokens, sawToolUseBlock, thinkingRunes) &&
+			discardsUsed < anthropicHoldbackDiscardBudget(stopReason, proseRunes, outputTokens, sawToolUseBlock) {
 			return anthropicHoldbackDiscard
 		}
 		return anthropicHoldbackRelease
@@ -682,6 +719,20 @@ func anthropicHoldbackVerdict(
 		return anthropicHoldbackRelease
 	}
 	return anthropicHoldbackKeep
+}
+
+// anthropicHoldbackDiscardBudget 给出这一形态在一次客户端请求里允许丢弃的次数。
+//
+// 两档共用同一个计数器、各自比自己的上限，顺序无关：先为短回合丢满 2 次之后，空回合仍能
+// 继续丢（2 < 3）；反过来为空回合丢满 3 次之后，短回合那一档立刻判定额度已尽（3 >= 2），
+// 短回合上限的保护不会因为空回合放宽而失效。
+func anthropicHoldbackDiscardBudget(
+	stopReason string, proseRunes, outputTokens int, sawToolUseBlock bool,
+) int {
+	if anthropicTurnIsEmptyAnswer(stopReason, proseRunes, outputTokens, sawToolUseBlock) {
+		return anthropicEmptyAnswerDiscardBudget
+	}
+	return anthropicShortTurnDiscardBudget
 }
 
 // anthropicHoldbackObserver 在持流期间独立采集判定量。
@@ -801,10 +852,48 @@ func anthropicTurnLooksSuspiciouslyShort(
 		proseRunes <= anthropicPostThinkingProseRuneCeiling {
 		return true
 	}
-	if outputTokens > anthropicShortTurnOutputTokenLimit {
+	if anthropicVisibleOutputTokens(outputTokens, proseRunes, thinkingRunes) >
+		anthropicShortTurnOutputTokenLimit {
 		return false
 	}
 	return proseRunes <= anthropicShortTurnProseRuneLimit
+}
+
+// anthropicVisibleOutputTokens 从 output_tokens 里估算「说出来的那部分」占多少 token。
+//
+// 为什么要折算：output_tokens 是思考与正文的合计，而 anthropicShortTurnOutputTokenLimit
+// 那道闸门想问的一直是「模型到底说了多少」。思考一长合计就被顶过 128，闸门恒为假，于是
+// 「想了很久却只说半句」这一整类截断全程免检——上面那条 anthropicPostThinkingProseRuneCeiling
+// 旁路是拿正文 2 rune 的极端形态标定的，兜不住正文上百 rune 的同类形态。
+//
+// 2026-08-24 19:46:49 实证：thinking 454 rune / 正文 114 rune / output_tokens 286，
+// stop_reason=end_turn 且无 tool_use，正文内容是宣布下一步（「先把上游状态和技能副本对齐」）
+// 之后就收尾，思考里明说要并行推进几个方向。286 > 128 让它免检，折算后是 57，回到闸门
+// 的有效区间内。
+//
+// 按 rune 数比例切分：思考与正文出自同一次生成、同一种语言，token/rune 密度可以当成相同，
+// 所以 visible ≈ out × prose/(prose+thinking)。这是估算而非精确值——上游不单独报正文
+// token（那一发的 output_tokens_details.thinking_tokens 是 0），拿不到精确切分。作为闸门
+// 输入够用：两类回合的分界有 112 对 133 这么宽的缝，估算误差吃不掉它。
+//
+// 折算与 anthropicPostThinkingProseRuneCeiling 那条旁路共用同一道下限
+// anthropicShortTurnThinkingRuneFloor，理由也是同一条：思考短于下限时 output_tokens 没被
+// 显著撑大，128 那道闸门本来就有效，此时折算只会凭空削弱它。下限以下返回原值，所以
+// 无思考（以及思考很短）的回合行为与改动前逐位相同，128 背后那 165 发样本的标定不受影响。
+//
+// 折算后闸门的实际语义：中文 token/rune 密度约 0.6，128 token 对应正文约 213 rune，与本文件
+// 里「说够了」的下限 anthropicHealthyTurnMinProseRunes(200) 基本重合。也就是说思考很长时，
+// 「正文低于健康下限」才算可疑，正文一旦成段（≥250 rune 左右）折算值就回到 128 以上：
+// thinking 1000/正文 350/out 800 折算 207 放行，thinking 3000/正文 300/out 2000 折算 181
+// 放行，正文再长则先被 anthropicShortTurnProseRuneLimit 拦下。
+func anthropicVisibleOutputTokens(outputTokens, proseRunes, thinkingRunes int) int {
+	if outputTokens <= 0 || proseRunes <= 0 {
+		return outputTokens
+	}
+	if thinkingRunes < anthropicShortTurnThinkingRuneFloor {
+		return outputTokens
+	}
+	return outputTokens * proseRunes / (proseRunes + thinkingRunes)
 }
 
 // anthropicTurnIsEmptyAnswer 从可疑形态里再切出「空回合」这一档。
@@ -1144,26 +1233,30 @@ func (s *GatewayService) newAnthropicEmptyStreamFailoverError(c *gin.Context, re
 	}
 }
 
-// anthropicHoldbackRetriedKey 标记本次客户端请求已经因为持流判定丢弃过一次上游响应。
+// anthropicHoldbackDiscardsKey 记录本次客户端请求已经因为持流判定丢弃过几次上游响应。
 // 放在 gin.Context 上而不是 GatewayService 上：作用域必须是「一次客户端请求」，
 // 跨账号重试共享同一个 gin.Context，正是需要的粒度。
-const anthropicHoldbackRetriedKey = "anthropic_holdback_retried"
+//
+// 是计数而不是布尔：布尔只能表达「额度用过了」，而额度按形态分档（空回合比短回合宽）。
+// 共用一个布尔时，第一个坏号无论什么形态都把额度吃光，第二个坏号的空响应必然放行——
+// 那正是 4 条 disposition=delivered 的成因，见 anthropicEmptyAnswerDiscardBudget。
+const anthropicHoldbackDiscardsKey = "anthropic_holdback_discards"
 
-func anthropicHoldbackRetryUsed(c *gin.Context) bool {
+func anthropicHoldbackDiscardsUsed(c *gin.Context) int {
 	if c == nil {
-		return false
+		return 0
 	}
-	v, ok := c.Get(anthropicHoldbackRetriedKey)
+	v, ok := c.Get(anthropicHoldbackDiscardsKey)
 	if !ok {
-		return false
+		return 0
 	}
-	used, _ := v.(bool)
+	used, _ := v.(int)
 	return used
 }
 
-func markAnthropicHoldbackRetryUsed(c *gin.Context) {
+func noteAnthropicHoldbackDiscard(c *gin.Context) {
 	if c != nil {
-		c.Set(anthropicHoldbackRetriedKey, true)
+		c.Set(anthropicHoldbackDiscardsKey, anthropicHoldbackDiscardsUsed(c)+1)
 	}
 }
 
@@ -1199,7 +1292,7 @@ func anthropicShortTurnHoldbackErrorBody() []byte {
 func (s *GatewayService) newAnthropicShortTurnFailoverError(
 	c *gin.Context, resp *http.Response, account *Account, model string, proseRunes, outputTokens int, stopReason string,
 ) *UpstreamFailoverError {
-	markAnthropicHoldbackRetryUsed(c)
+	noteAnthropicHoldbackDiscard(c)
 	upstreamRequestID := ""
 	headers := http.Header{}
 	if resp != nil {
@@ -1451,7 +1544,7 @@ func (s *GatewayService) handleStreamingResponseAnthropicAPIKeyPassthrough(
 		holdbackWindow = time.Duration(s.cfg.Gateway.AnthropicHoldbackWindowMs) * time.Millisecond
 	}
 	holdbackActive := holdbackWindow > 0
-	holdbackRetryUsed := anthropicHoldbackRetryUsed(c)
+	holdbackDiscardsUsed := anthropicHoldbackDiscardsUsed(c)
 	holdback := &anthropicHoldbackObserver{}
 	// 独立定时器，不复用 keepalive：窗口是毫秒级而 keepalive 默认 10 秒，靠它兜底会让
 	// 「上游吐了两句就长时间静默」的流白等十秒。定时器在首帧可见增量到达时才 arm。
@@ -1701,7 +1794,7 @@ func (s *GatewayService) handleStreamingResponseAnthropicAPIKeyPassthrough(
 					switch anthropicHoldbackVerdict(
 						holdback.windowElapsed(now, holdbackWindow),
 						holdback.stopReason, holdback.proseRunes, holdback.outputTokens,
-						holdback.sawToolUseBlock, holdbackRetryUsed, holdback.thinkingRunes,
+						holdback.sawToolUseBlock, holdbackDiscardsUsed, holdback.thinkingRunes,
 					) {
 					case anthropicHoldbackKeep:
 						commitPrelude = false
