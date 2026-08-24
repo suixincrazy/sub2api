@@ -510,6 +510,22 @@ func anthropicVisibleProseRunes(parsed gjson.Result) int {
 	return utf8.RuneCountInString(parsed.Get("delta.text").String())
 }
 
+// anthropicThinkingRunes 取这一帧的**思考链**贡献的 rune 数。
+//
+// 与 anthropicVisibleProseRunes 严格分开：那个只认 text_delta，这个只认 thinking_delta。
+// 两个口径都要，才能分辨「想了很久但正文被切掉」——这一形态下 output_tokens 被思考撑得
+// 很大，而正文近乎为零，单看任何一个量都判不出来。见
+// anthropicTurnLooksSuspiciouslyShort 里的思考分支。
+func anthropicThinkingRunes(parsed gjson.Result) int {
+	if strings.TrimSpace(parsed.Get("type").String()) != "content_block_delta" {
+		return 0
+	}
+	if !strings.EqualFold(strings.TrimSpace(parsed.Get("delta.type").String()), "thinking_delta") {
+		return 0
+	}
+	return utf8.RuneCountInString(parsed.Get("delta.thinking").String())
+}
+
 // anthropicStreamLooksIncompleteDespiteTerminal 是「协议层收尾了但内容不完整」的启发式判定。
 //
 // 存在的理由：sawTerminalEvent 只证明上游送来了 message_stop，不证明它把话说完。实测主号
@@ -591,6 +607,23 @@ const (
 	// 两发截断才换号；既然误报代价只是丢一次 prompt cache 而漏判代价是用户再吃一发断流，
 	// 1 是更划算的一侧。
 	anthropicShortTurnStreakThreshold = 1
+	// anthropicShortTurnThinkingRuneFloor 判定「想得很久」所需的最小思考链长度，单位 rune。
+	//
+	// 只用来给下面这条上限解锁，不单独构成判据。取 200 与
+	// anthropicHealthyTurnMinProseRunes 同量级：思考短于这个数的回合，output_tokens 不会
+	// 被思考显著撑大，128 那道 token 闸门本来就有效，不需要绕。
+	anthropicShortTurnThinkingRuneFloor = 200
+	// anthropicPostThinkingProseRuneCeiling 思考充分的回合里，正文短到这个程度就不可能是
+	// 真答案，单位 rune。
+	//
+	// 刻意取得比 anthropicShortTurnProseRuneLimit(400) 紧得多：那个上限配合 token 闸门
+	// 使用，误判有 token 数兜着；这条要绕过 token 闸门，只剩正文长度一个判据，所以必须
+	// 收到「几个字，不可能是任何问题的答案」的量级。40 rune 约合 13 个汉字。
+	//
+	// 2026-08-24 16:42:55 实证（usage_logs id=9514，账号 10）：output_tokens=577 而客户端
+	// 只收到 "d." 两个字符。577 里绝大部分是思考 token，于是 outputTokens>128 让判定直接
+	// return false，这一形态全程免检——窗口调到多大都拦不住，因为压根没被判为可疑。
+	anthropicPostThinkingProseRuneCeiling = 40
 )
 
 // anthropicHoldbackDecision 是提交窗口内对「这一帧之后怎么办」的三态判定。
@@ -629,6 +662,7 @@ func anthropicHoldbackVerdict(
 	outputTokens int,
 	sawToolUseBlock bool,
 	retryUsed bool,
+	thinkingRunes int,
 ) anthropicHoldbackDecision {
 	if sawToolUseBlock {
 		return anthropicHoldbackRelease
@@ -639,7 +673,7 @@ func anthropicHoldbackVerdict(
 	// stop_reason 已知时判定是确定的，优先于窗口：窗口只是「等不起了」的兜底，
 	// 而这里已经拿到了全部判据。
 	if strings.TrimSpace(stopReason) != "" {
-		if !retryUsed && anthropicTurnLooksSuspiciouslyShort(stopReason, proseRunes, outputTokens, sawToolUseBlock) {
+		if !retryUsed && anthropicTurnLooksSuspiciouslyShort(stopReason, proseRunes, outputTokens, sawToolUseBlock, thinkingRunes) {
 			return anthropicHoldbackDiscard
 		}
 		return anthropicHoldbackRelease
@@ -657,6 +691,7 @@ func anthropicHoldbackVerdict(
 // 共用就会重复计数。
 type anthropicHoldbackObserver struct {
 	proseRunes         int
+	thinkingRunes      int
 	outputTokens       int
 	stopReason         string
 	sawToolUseBlock    bool
@@ -677,6 +712,7 @@ func (o *anthropicHoldbackObserver) observe(parsed gjson.Result, commits bool, n
 		}
 	}
 	o.proseRunes += anthropicVisibleProseRunes(parsed)
+	o.thinkingRunes += anthropicThinkingRunes(parsed)
 	// output_tokens 在 message_start 里是初始小值、在 message_delta 里才是终值，
 	// 两条路径都看并取最大值，避免依赖帧序。
 	for _, path := range []string{"usage.output_tokens", "message.usage.output_tokens"} {
@@ -737,6 +773,7 @@ func anthropicTurnLooksSuspiciouslyShort(
 	proseRunes int,
 	outputTokens int,
 	sawToolUseBlock bool,
+	thinkingRunes int,
 ) bool {
 	if !strings.EqualFold(strings.TrimSpace(stopReason), "end_turn") {
 		return false
@@ -744,10 +781,24 @@ func anthropicTurnLooksSuspiciouslyShort(
 	if sawToolUseBlock {
 		return false
 	}
-	if outputTokens <= 0 {
+	// output_tokens<=0 且正文也是空的：那是 anthropicStreamLooksIncompleteDespiteTerminal
+	// 的确定形态（开了块却零输出），让给它罚号，避免同一次故障记两次。
+	//
+	// 但 output_tokens<=0 **配着有正文**是另一回事：上游把 usage 报成 0 而实际吐了字节，
+	// 两套判定都不认它——残缺判定要求 visibleChars==0，这里旧代码又直接 return false。
+	// 2026-08-24 17:02:33 实证（usage_logs id=9544，账号 10）：output_tokens=0、
+	// first_token_ms=10808 之后还跑了 2680ms，说明内容块和字节都出去了，却全程零信号、
+	// 零记账。所以这一档必须留在短回合判据里，由正文长度说话。
+	if outputTokens <= 0 && proseRunes == 0 {
 		return false
 	}
 	if proseRunes == 0 {
+		return true
+	}
+	// 想了很久却只吐出几个字：这一档必须在 token 闸门**之前**判，因为思考 token 计入
+	// output_tokens，闸门在这里恒为假。见 anthropicPostThinkingProseRuneCeiling 上的实证。
+	if thinkingRunes >= anthropicShortTurnThinkingRuneFloor &&
+		proseRunes <= anthropicPostThinkingProseRuneCeiling {
 		return true
 	}
 	if outputTokens > anthropicShortTurnOutputTokenLimit {
@@ -768,8 +819,11 @@ func anthropicTurnIsEmptyAnswer(
 	outputTokens int,
 	sawToolUseBlock bool,
 ) bool {
+	// 刻意传 thinkingRunes=0：空回合走的是 proseRunes==0 那条短路，与思考长度无关。
+	// 传 0 保证这里判的严格是「空」，不会把「想很久+几个字」也算成空回合去罚号——
+	// 那一档只解绑、只丢弃，不进冷却。
 	return proseRunes == 0 &&
-		anthropicTurnLooksSuspiciouslyShort(stopReason, proseRunes, outputTokens, sawToolUseBlock)
+		anthropicTurnLooksSuspiciouslyShort(stopReason, proseRunes, outputTokens, sawToolUseBlock, 0)
 }
 
 // anthropicTurnProvesUpstreamHealthy 判定这一回合能否作为「上游把话说完了」的正面证据，
@@ -1300,6 +1354,9 @@ func (s *GatewayService) handleStreamingResponseAnthropicAPIKeyPassthrough(
 	// 后者含思考链与工具入参、单位是字节，只供会罚号的残缺判定判零。见
 	// anthropicVisibleProseRunes 的说明。
 	proseRunes := 0
+	// thinkingRunes 单独累计：用来识别「想了很久却只吐几个字」，那一形态下 output_tokens
+	// 被思考撑大，token 闸门恒为假。见 anthropicPostThinkingProseRuneCeiling。
+	thinkingRunes := 0
 	sawContentBlockStart := false
 	sawToolUseBlock := false
 
@@ -1445,6 +1502,7 @@ func (s *GatewayService) handleStreamingResponseAnthropicAPIKeyPassthrough(
 				}
 				visibleChars += anthropicVisibleDeltaChars(parsedFrame)
 				proseRunes += anthropicVisibleProseRunes(parsedFrame)
+				thinkingRunes += anthropicThinkingRunes(parsedFrame)
 			}
 			if firstTokenMs == nil && trimmed != "" && trimmed != "[DONE]" {
 				ms := int(time.Since(startTime).Milliseconds())
@@ -1501,7 +1559,7 @@ func (s *GatewayService) handleStreamingResponseAnthropicAPIKeyPassthrough(
 			// 这条路径只累计连击 / 到阈值解绑，绝不罚号，见 noteAnthropicShortTurnStreak。
 			// 三态：可疑 -> 累计连击；有正面证据 -> 清零；其余（典型是 tool_use 中间回合）
 			// -> 不表态，保留连击。见 anthropicTurnProvesUpstreamHealthy。
-			if anthropicTurnLooksSuspiciouslyShort(sawStopReason, proseRunes, usage.OutputTokens, sawToolUseBlock) {
+			if anthropicTurnLooksSuspiciouslyShort(sawStopReason, proseRunes, usage.OutputTokens, sawToolUseBlock, thinkingRunes) {
 				s.noteAnthropicShortTurnStreak(ctx, account, model, proseRunes, usage.OutputTokens)
 				// 走到这里说明空回合没被持流拦住（窗口配 0、窗口耗尽、或本请求的重试额度
 				// 已经用掉），客户端已经吃到一个没有答案的 200。解绑只管下一发落在哪，
@@ -1643,7 +1701,7 @@ func (s *GatewayService) handleStreamingResponseAnthropicAPIKeyPassthrough(
 					switch anthropicHoldbackVerdict(
 						holdback.windowElapsed(now, holdbackWindow),
 						holdback.stopReason, holdback.proseRunes, holdback.outputTokens,
-						holdback.sawToolUseBlock, holdbackRetryUsed,
+						holdback.sawToolUseBlock, holdbackRetryUsed, holdback.thinkingRunes,
 					) {
 					case anthropicHoldbackKeep:
 						commitPrelude = false

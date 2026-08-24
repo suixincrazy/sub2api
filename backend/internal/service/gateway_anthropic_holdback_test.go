@@ -76,6 +76,7 @@ func TestAnthropicHoldbackVerdict(t *testing.T) {
 		outputTokens int
 		toolUse      bool
 		retryUsed    bool
+		thinking     int
 		want         anthropicHoldbackDecision
 	}{
 		{
@@ -162,11 +163,48 @@ func TestAnthropicHoldbackVerdict(t *testing.T) {
 			stopReason: "tool_use", proseRunes: 20, outputTokens: 30, toolUse: true,
 			want: anthropicHoldbackRelease,
 		},
+		// 账号 10 的形态（usage_logs id=9514 / id=9523）：想了很久，正文只有 "d." 两个字符。
+		// 思考 token 把 output_tokens 撑到 577，128 那道闸门恒为假，这一形态在加思考判据之前
+		// 全程免检——窗口调到 15s 也拦不住，因为压根没被判为可疑。
+		{
+			name:       "想很久却只吐几个字：丢弃重试",
+			stopReason: "end_turn", proseRunes: 2, outputTokens: 577, thinking: 900,
+			want: anthropicHoldbackDiscard,
+		},
+		// 下面两条守住这条新判据的两侧边界，防止它把正常回合也吃掉。
+		{
+			name:       "思考不够长时仍由 token 闸门说话，放行",
+			stopReason: "end_turn", proseRunes: 2, outputTokens: 577,
+			thinking: anthropicShortTurnThinkingRuneFloor - 1,
+			want:     anthropicHoldbackRelease,
+		},
+		{
+			name:       "思考很长但正文过了上限：是真答案，放行",
+			stopReason: "end_turn", proseRunes: anthropicPostThinkingProseRuneCeiling + 1,
+			outputTokens: 577, thinking: 900,
+			want: anthropicHoldbackRelease,
+		},
+		// 账号 10 的另一形态（usage_logs id=9544）：上游把 usage 报成 0，而字节**确实**出去了。
+		// 旧代码在 output_tokens<=0 处无条件让位给残缺判定，可那边要求 visibleChars==0，于是
+		// 两套判定都不认它，零信号零记账。现在这一档由正文长度说话。
+		{
+			name:       "usage 报 0 但有正文：仍按短回合丢弃",
+			stopReason: "end_turn", proseRunes: 2, outputTokens: 0,
+			want: anthropicHoldbackDiscard,
+		},
+		// 而 usage 报 0 **且**零正文是另一回事：那是「开了块却零输出」的确定形态，让给
+		// anthropicStreamLooksIncompleteDespiteTerminal 去罚号，避免同一次故障记两次。
+		{
+			name:       "usage 报 0 且零正文：让给残缺判定，这里放行",
+			stopReason: "end_turn", proseRunes: 0, outputTokens: 0,
+			want: anthropicHoldbackRelease,
+		},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			got := anthropicHoldbackVerdict(
-				tc.windowGone, tc.stopReason, tc.proseRunes, tc.outputTokens, tc.toolUse, tc.retryUsed)
+				tc.windowGone, tc.stopReason, tc.proseRunes, tc.outputTokens, tc.toolUse, tc.retryUsed,
+				tc.thinking)
 			require.Equal(t, tc.want, got)
 		})
 	}
@@ -444,4 +482,97 @@ func TestAnthropicPassthrough_HoldbackWindowTimeoutReleasesUndecidedTurn(t *test
 	var failoverErr *UpstreamFailoverError
 	require.False(t, errors.As(err, &failoverErr), "窗口到点是放行，不是丢弃重试")
 	require.Contains(t, rec.Body.String(), "先看一眼日志。", "窗口到点必须把攒下的帧放出去")
+}
+
+// 2026-08-24 16:42:55 / 16:51:15 两发的端到端复现（usage_logs id=9514 out=577、
+// id=9523 out=445，账号 10）：思考链很长，正文只有 "d." 两个字符就 end_turn 收尾。
+//
+// 这一形态是把窗口从 3000 调到 15000 之后**依然**漏掉的那一类，而原因不在窗口：思考
+// token 计入 output_tokens，577 越过 anthropicShortTurnOutputTokenLimit(128) 那道闸门，
+// anthropicTurnLooksSuspiciouslyShort 直接 return false，于是它压根没被判为可疑，持流
+// 一律判 Release、三个检测器全部沉默、连解绑都不触发。两发的 duration_ms - first_token_ms
+// 都是 6.1 秒，窗口再宽也拦不住一个免检的形态。
+//
+// 所以这条用例守的是「思考判据排在 token 闸门之前」这个顺序，与窗口大小无关。
+func TestAnthropicPassthrough_HoldbackDiscardsThinkingInflatedTurnWithoutExposure(t *testing.T) {
+	const sessionKey = "holdback-thinking-inflated"
+	const groupID = int64(1)
+	cache := newShortTurnStreakCache(sessionKey, 10)
+	svc, repo := newHoldbackTestGatewayService(t, cache, 3000)
+
+	resp := &http.Response{
+		StatusCode: http.StatusOK,
+		Header:     http.Header{"Content-Type": []string{"text/event-stream"}},
+		Body: sseBody(
+			`data: {"type":"message_start","message":{"usage":{"input_tokens":129000,"output_tokens":2}}}`,
+			"",
+			`data: {"type":"content_block_start","index":0,"content_block":{"type":"thinking","thinking":""}}`,
+			"",
+			// 14 rune × 60 = 840 rune，远超 anthropicShortTurnThinkingRuneFloor。
+			fmt.Sprintf(`data: {"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":%q}}`,
+				strings.Repeat("我得先想清楚这里的因果链条。", 60)),
+			"",
+			`data: {"type":"content_block_stop","index":0}`,
+			"",
+			`data: {"type":"content_block_start","index":1,"content_block":{"type":"text","text":""}}`,
+			"",
+			`data: {"type":"content_block_delta","index":1,"delta":{"type":"text_delta","text":"d."}}`,
+			"",
+			`data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":577}}`,
+			"",
+			`data: {"type":"message_stop"}`,
+			"",
+			"",
+		),
+	}
+
+	rec, c, err := runHoldbackPassthrough(t, svc, groupID, sessionKey, 10, resp, nil)
+
+	var failoverErr *UpstreamFailoverError
+	require.True(t, errors.As(err, &failoverErr),
+		"思考撑大 output_tokens 的截断必须可 failover，否则 token 闸门会让它全程免检")
+	require.Equal(t, GatewayFailureReason("anthropic_short_turn_holdback"), failoverErr.Reason)
+	require.True(t, failoverErr.ShouldRetryNextAccount())
+
+	// 零暴露：这一形态原先是原样交付的，客户端亲眼看到过那两个字符。
+	require.Empty(t, rec.Body.String(), `"d." 一个字节都不能写给客户端`)
+	require.False(t, c.Writer.Written())
+	require.True(t, anthropicHoldbackRetryUsed(c))
+
+	require.Equal(t, 1, cache.deletedSessions[sessionKey], "丢弃必须同时解绑，否则下一发还是这个号")
+	// 有正文（哪怕只有两个字符）就不是空回合：只解绑，不罚号。
+	require.Zero(t, repo.tempCalls, "有正文就可能是合法短回答，不得罚号")
+}
+
+// 2026-08-24 17:02:33 那一发的端到端复现（usage_logs id=9544，账号 10）：上游把
+// output_tokens 报成 0，而字节**确实**出去了——first_token_ms=10808 之后还跑了 2680ms。
+//
+// 改动前这一档落在两套判定之间的缝里：anthropicTurnLooksSuspiciouslyShort 见
+// output_tokens<=0 就无条件 return false（让给残缺判定），而
+// anthropicStreamLooksIncompleteDespiteTerminal 要求 visibleChars==0（这里有字节）也不认。
+// 两边都不认，于是零信号、零记账、原样交付。收紧成 outputTokens<=0 && proseRunes==0 之后，
+// 有正文的这一档回到短回合判据里，由正文长度说话。
+func TestAnthropicPassthrough_HoldbackDiscardsZeroUsageWithProseWithoutExposure(t *testing.T) {
+	const sessionKey = "holdback-zero-usage"
+	const groupID = int64(1)
+	cache := newShortTurnStreakCache(sessionKey, 10)
+	svc, repo := newHoldbackTestGatewayService(t, cache, 3000)
+
+	rec, c, err := runHoldbackPassthrough(t, svc, groupID, sessionKey, 10,
+		shortTurnSSE("我看一下日志。", 0, false), nil)
+
+	var failoverErr *UpstreamFailoverError
+	require.True(t, errors.As(err, &failoverErr),
+		"usage 报 0 却吐了字节，必须仍按短回合判，否则两套判定都不认它")
+	require.Equal(t, GatewayFailureReason("anthropic_short_turn_holdback"), failoverErr.Reason)
+	require.True(t, failoverErr.ShouldRetryNextAccount())
+
+	require.Empty(t, rec.Body.String(), "截断内容一个字节都不能写给客户端")
+	require.False(t, c.Writer.Written())
+	require.True(t, anthropicHoldbackRetryUsed(c))
+
+	require.Equal(t, 1, cache.deletedSessions[sessionKey])
+	// 不罚号：这一档由正文长度说话，与「开了块却零输出」的确定性残缺分开，
+	// 避免同一次故障被两套逻辑各记一次。
+	require.Zero(t, repo.tempCalls, "有正文就只解绑不罚号")
 }

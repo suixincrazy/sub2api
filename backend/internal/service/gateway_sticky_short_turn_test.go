@@ -118,39 +118,47 @@ func TestAnthropicTurnLooksSuspiciouslyShort(t *testing.T) {
 		outputTokens int
 		sawToolUse   bool
 		suspicious   bool
+		thinking     int
 	}{
 		// 线上实测的故障：end_turn + 几十个 output_token + 一两句话就收尾。
-		{"实测故障形态 output_tokens=30", "end_turn", 60, 30, false, true},
-		{"实测故障形态 output_tokens=19", "end_turn", 41, 19, false, true},
+		{"实测故障形态 output_tokens=30", "end_turn", 60, 30, false, true, 0},
+		{"实测故障形态 output_tokens=19", "end_turn", 41, 19, false, true, 0},
 		// 2026-08-23 22:31:21 账号 9 那一发：131 个汉字（≈289 字节）+ out=70。
 		// 旧实现按字节数，289>200 既漏判、又被当成正面证据清零了连击，是这次改动的锚点。
-		{"22:31:21 中文截断 131 字/out=70", "end_turn", 131, 70, false, true},
-		{"同批漏判样本 183 字/out=90", "end_turn", 183, 90, false, true},
-		{"同批漏判样本 150 字/out=73", "end_turn", 150, 73, false, true},
-		{"大小写与空格不影响判定", "  End_Turn  ", 60, 30, false, true},
-		{"刚好卡在正文上限仍算可疑", "end_turn", anthropicShortTurnProseRuneLimit, 100, false, true},
-		{"刚好卡在 token 上限仍算可疑", "end_turn", 100, anthropicShortTurnOutputTokenLimit, false, true},
+		{"22:31:21 中文截断 131 字/out=70", "end_turn", 131, 70, false, true, 0},
+		{"同批漏判样本 183 字/out=90", "end_turn", 183, 90, false, true, 0},
+		{"同批漏判样本 150 字/out=73", "end_turn", 150, 73, false, true, 0},
+		{"大小写与空格不影响判定", "  End_Turn  ", 60, 30, false, true, 0},
+		{"刚好卡在正文上限仍算可疑", "end_turn", anthropicShortTurnProseRuneLimit, 100, false, true, 0},
+		{"刚好卡在 token 上限仍算可疑", "end_turn", 100, anthropicShortTurnOutputTokenLimit, false, true, 0},
 
 		// 两条上限各自都要能独立否掉。token 数是主判据：实测所有正常短回答都 >=133。
-		{"超过正文上限不算可疑", "end_turn", anthropicShortTurnProseRuneLimit + 1, 100, false, false},
-		{"超过 token 上限不算可疑", "end_turn", 100, anthropicShortTurnOutputTokenLimit + 1, false, false},
-		{"实测正常短回答 out=133 不算可疑", "end_turn", 120, 133, false, false},
+		{"超过正文上限不算可疑", "end_turn", anthropicShortTurnProseRuneLimit + 1, 100, false, false, 0},
+		{"超过 token 上限不算可疑", "end_turn", 100, anthropicShortTurnOutputTokenLimit + 1, false, false, 0},
+		{"实测正常短回答 out=133 不算可疑", "end_turn", 120, 133, false, false, 0},
 
 		// 其余 stop_reason 都自带「模型确实干了活 / 被限制截断」的语义。
-		{"tool_use 不算", "tool_use", 20, 10, false, false},
-		{"max_tokens 不算", "max_tokens", 20, 10, false, false},
-		{"stop_sequence 不算", "stop_sequence", 20, 10, false, false},
-		{"pause_turn 不算", "pause_turn", 20, 10, false, false},
-		{"异常 stop_reason 归确定性判定管", "upstream_error", 20, 10, false, false},
-		{"空 stop_reason 不算", "", 20, 10, false, false},
+		{"tool_use 不算", "tool_use", 20, 10, false, false, 0},
+		{"max_tokens 不算", "max_tokens", 20, 10, false, false, 0},
+		{"stop_sequence 不算", "stop_sequence", 20, 10, false, false, 0},
+		{"pause_turn 不算", "pause_turn", 20, 10, false, false, 0},
+		{"异常 stop_reason 归确定性判定管", "upstream_error", 20, 10, false, false, 0},
+		{"空 stop_reason 不算", "", 20, 10, false, false, 0},
 
 		// 开了工具块的短回合是标准 agent 行为，绝不能解绑——否则每次工具调用都在打断粘性。
-		{"开了 tool_use 块不算", "end_turn", 20, 10, true, false},
+		{"开了 tool_use 块不算", "end_turn", 20, 10, true, false, 0},
 
-		// output_tokens<=0 归 anthropicStreamLooksIncompleteDespiteTerminal，在这里放行，
-		// 避免同一次故障被两套逻辑各记一次。
-		{"output_tokens 为零不算", "end_turn", 20, 0, false, false},
-		{"output_tokens 为负不算", "end_turn", 20, -1, false, false},
+		// output_tokens<=0 **且零正文**才归 anthropicStreamLooksIncompleteDespiteTerminal，
+		// 在这里放行，避免同一次故障被两套逻辑各记一次。
+		{"output_tokens 为零且零正文不算", "end_turn", 0, 0, false, false, 0},
+		{"output_tokens 为负且零正文不算", "end_turn", 0, -1, false, false, 0},
+
+		// 但 output_tokens<=0 **配着有正文**是另一回事：上游把 usage 报成 0 而字节确实出去了，
+		// 残缺判定要求 visibleChars==0 所以不认，旧代码这里又直接放行，于是零信号零记账。
+		// 2026-08-24 17:02:33 实证（usage_logs id=9544，账号 10）：output_tokens=0、
+		// first_token_ms=10808 之后还跑了 2680ms，字节和内容块都出去了。
+		{"usage 报 0 但有正文仍算可疑", "end_turn", 20, 0, false, true, 0},
+		{"usage 报负数但有正文仍算可疑", "end_turn", 20, -1, false, true, 0},
 
 		// 零正文 + output_tokens>0：账号 12（sotamodel）的实测形态，也是两套判定之间那条缝。
 		// anthropicStreamLooksIncompleteDespiteTerminal 要求 output_tokens<=0（实际拿到 1），
@@ -161,21 +169,36 @@ func TestAnthropicTurnLooksSuspiciouslyShort(t *testing.T) {
 		// 48h 统计（output_tokens=1 占该账号流式请求的比例）：账号 12 = 35.9%（51/142），
 		// 账号 5/9 = 0.1%，账号 10/11 = 0%。健康账号几乎不产生这个形态，所以它是确定性的
 		// 上游故障，判可疑不会误伤。
-		{"零正文 out=1 是空回合", "end_turn", 0, 1, false, true},
-		{"零正文 out=30 是空回合", "end_turn", 0, 30, false, true},
+		{"零正文 out=1 是空回合", "end_turn", 0, 1, false, true, 0},
+		{"零正文 out=30 是空回合", "end_turn", 0, 30, false, true, 0},
 		// 空回合刻意**不**受 output_tokens 上限约束：思考 token 也计入 output_tokens，
 		// 「想了很久一句没说」正是最典型的截断形态，卡上限反而会把它漏掉。
-		{"零正文即使 token 上量仍算空回合", "end_turn", 0, anthropicShortTurnOutputTokenLimit + 1, false, true},
-		{"零正文即使 token 很多仍算空回合", "end_turn", 0, 4096, false, true},
+		{"零正文即使 token 上量仍算空回合", "end_turn", 0, anthropicShortTurnOutputTokenLimit + 1, false, true, 0},
+		{"零正文即使 token 很多仍算空回合", "end_turn", 0, 4096, false, true, 0},
 		// 其余闸门对空回合一视同仁：工具回合与非 end_turn 收尾都不算。
-		{"零正文 + tool_use 块不算", "end_turn", 0, 1, true, false},
-		{"零正文但 max_tokens 收尾不算", "max_tokens", 0, 1, false, false},
+		{"零正文 + tool_use 块不算", "end_turn", 0, 1, true, false, 0},
+		{"零正文但 max_tokens 收尾不算", "max_tokens", 0, 1, false, false, 0},
+
+		// 想很久却只吐几个字：思考 token 计入 output_tokens，把它撑到 128 那道闸门之上，
+		// 于是这一形态在加思考判据之前全程免检——不是窗口不够，是压根没被判为可疑。
+		// 2026-08-24 实证（usage_logs id=9514 out=577 / id=9523 out=445，账号 10）：
+		// 首字之后还跑了 6 秒多，客户端只收到 "d." 两个字符。
+		{"想很久只吐 2 字算可疑", "end_turn", 2, 577, false, true, 900},
+		{"同批样本 out=445 同形态", "end_turn", 2, 445, false, true, 900},
+		{"正文刚好卡在思考后上限仍算可疑", "end_turn", anthropicPostThinkingProseRuneCeiling, 577, false, true, 900},
+		{"思考刚好够长仍算可疑", "end_turn", 2, 577, false, true, anthropicShortTurnThinkingRuneFloor},
+		// 两侧边界各自都要能独立否掉，否则这条判据会开始吃正常回合。
+		{"思考不够长时仍由 token 闸门说话", "end_turn", 2, 577, false, false, anthropicShortTurnThinkingRuneFloor - 1},
+		{"思考很长但正文过了上限是真答案", "end_turn", anthropicPostThinkingProseRuneCeiling + 1, 577, false, false, 900},
+		// 思考判据不该松掉别的闸门：tool_use 和非 end_turn 收尾一律照旧放行。
+		{"想很久+tool_use 块仍不算", "end_turn", 2, 577, true, false, 900},
+		{"想很久但 max_tokens 收尾不算", "max_tokens", 2, 577, false, false, 900},
 	}
 
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			require.Equal(t, tc.suspicious, anthropicTurnLooksSuspiciouslyShort(
-				tc.stopReason, tc.proseRunes, tc.outputTokens, tc.sawToolUse))
+				tc.stopReason, tc.proseRunes, tc.outputTokens, tc.sawToolUse, tc.thinking))
 		})
 	}
 }
@@ -221,7 +244,7 @@ func TestAnthropicTurnIsEmptyAnswer(t *testing.T) {
 			require.Equal(t, tc.want, got)
 			if got {
 				require.True(t, anthropicTurnLooksSuspiciouslyShort(
-					tc.stopReason, tc.proseRunes, tc.outputTokens, tc.toolUse),
+					tc.stopReason, tc.proseRunes, tc.outputTokens, tc.toolUse, 0),
 					"空回合必须同时是可疑短回合，否则会出现罚了号却不解绑的组合")
 			}
 		})
@@ -236,7 +259,7 @@ func TestEmptyAnswerImpliesSuspiciouslyShort(t *testing.T) {
 			for _, tokens := range []int{-1, 0, 1, 70, anthropicShortTurnOutputTokenLimit, anthropicShortTurnOutputTokenLimit + 1, 4096} {
 				for _, toolUse := range []bool{false, true} {
 					if anthropicTurnIsEmptyAnswer(sr, runes, tokens, toolUse) {
-						require.True(t, anthropicTurnLooksSuspiciouslyShort(sr, runes, tokens, toolUse),
+						require.True(t, anthropicTurnLooksSuspiciouslyShort(sr, runes, tokens, toolUse, 0),
 							"stop_reason=%q prose=%d tokens=%d toolUse=%v 是空回合却不可疑", sr, runes, tokens, toolUse)
 					}
 				}
@@ -623,7 +646,7 @@ func TestShortTurnPredicatesAreMutuallyExclusive(t *testing.T) {
 		for _, runes := range runeCounts {
 			for _, tokens := range tokenCounts {
 				for _, toolUse := range []bool{false, true} {
-					short := anthropicTurnLooksSuspiciouslyShort(sr, runes, tokens, toolUse)
+					short := anthropicTurnLooksSuspiciouslyShort(sr, runes, tokens, toolUse, 0)
 					healthy := anthropicTurnProvesUpstreamHealthy(sr, runes, tokens, toolUse)
 					require.False(t, short && healthy,
 						"stop_reason=%q prose=%d tokens=%d toolUse=%v 同时命中两个判定", sr, runes, tokens, toolUse)

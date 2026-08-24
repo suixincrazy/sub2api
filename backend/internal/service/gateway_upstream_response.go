@@ -841,6 +841,8 @@ func (s *GatewayService) handleStreamingResponse(ctx context.Context, resp *http
 	visibleChars := 0
 	// proseRunes 与 visibleChars 分开累计，理由同透传链路：见 anthropicVisibleProseRunes。
 	proseRunes := 0
+	// thinkingRunes 单独累计，理由同透传链路：见 anthropicPostThinkingProseRuneCeiling。
+	thinkingRunes := 0
 	sawContentBlockStart := false
 	sawToolUseBlock := false
 	useNoopDeltaKeepalive := c != nil && c.Request != nil && shouldUseClaudeCodeNoopDeltaKeepalive(c.GetHeader("User-Agent"))
@@ -1008,6 +1010,7 @@ func (s *GatewayService) handleStreamingResponse(ctx context.Context, resp *http
 			}
 			visibleChars += anthropicVisibleDeltaChars(parsedFrame)
 			proseRunes += anthropicVisibleProseRunes(parsedFrame)
+			thinkingRunes += anthropicThinkingRunes(parsedFrame)
 		}
 		if !eventChanged {
 			block := ""
@@ -1053,7 +1056,7 @@ func (s *GatewayService) handleStreamingResponse(ctx context.Context, resp *http
 			// 这条路径只累计连击 / 到阈值解绑，绝不罚号，见 noteAnthropicShortTurnStreak。
 			// 三态：可疑 -> 累计连击；有正面证据 -> 清零；其余（典型是 tool_use 中间回合）
 			// -> 不表态，保留连击。见 anthropicTurnProvesUpstreamHealthy。
-			if anthropicTurnLooksSuspiciouslyShort(sawStopReason, proseRunes, usage.OutputTokens, sawToolUseBlock) {
+			if anthropicTurnLooksSuspiciouslyShort(sawStopReason, proseRunes, usage.OutputTokens, sawToolUseBlock, thinkingRunes) {
 				s.noteAnthropicShortTurnStreak(ctx, account, originalModel, proseRunes, usage.OutputTokens)
 				// 空回合这一档要额外冷却账号，与透传分支同口径：解绑只管下一发落在哪，
 				// 账号本身还在池子里。这条链路没有持流窗口，所以只有 delivered 一种结局。
