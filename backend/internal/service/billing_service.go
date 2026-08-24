@@ -1151,6 +1151,49 @@ func applyChannelTokenPriceOverrides(pricing *ModelPricing, channelPricing *Chan
 		pricing.CacheReadPricePerToken = *channelPricing.CacheReadPrice
 		pricing.CacheReadPricePerTokenPriority = priority
 	}
+	applyDerivedTokenPrices(pricing, channelPricing)
+}
+
+// applyDerivedTokenPrices 用「提示价 × 倍率」补齐没有显式配置绝对价的档位。
+//
+// 必须在 applyChannelTokenPriceOverrides 应用完绝对价之后调用：倍率乘的是**有效提示价**
+// （渠道覆盖优先，否则模型目录价），而不是各档自己的基础价。
+//
+// 三条不变式：
+//   - 绝对价优先。某档配了绝对价，该档的倍率一律忽略（前端也不该同时收两个值）。
+//   - 提示价为 0 时不派生。此时目录里没有可乘的基数，派生只会把该档静默打成 0 白送算力；
+//     宁可保留目录价。
+//   - Priority/Fast 档沿用 channelTierOverridePrice 的口径，与绝对价覆盖路径逐字一致。
+func applyDerivedTokenPrices(pricing *ModelPricing, channelPricing *ChannelModelPricing) {
+	if pricing == nil || channelPricing == nil || !channelPricing.HasDerivedTokenPrices() {
+		return
+	}
+	base := pricing.InputPricePerToken
+	if base <= 0 {
+		return
+	}
+	if channelPricing.OutputPrice == nil && channelPricing.CompletionMultiplier != nil {
+		derived := base * *channelPricing.CompletionMultiplier
+		priority := channelTierOverridePrice(pricing.OutputPricePerToken, pricing.OutputPricePerTokenPriority, derived)
+		pricing.OutputPricePerToken = derived
+		pricing.OutputPricePerTokenPriority = priority
+	}
+	if channelPricing.CacheWritePrice == nil && channelPricing.CacheCreationMultiplier != nil {
+		derived := base * *channelPricing.CacheCreationMultiplier
+		priority := channelTierOverridePrice(pricing.CacheCreationPricePerToken, pricing.CacheCreationPricePerTokenPriority, derived)
+		pricing.CacheCreationPricePerToken = derived
+		pricing.CacheCreationPricePerTokenPriority = priority
+		// 与绝对价覆盖路径同口径：显式设定后即使为 0 也不回退，5m/1h 两档一起跟上。
+		pricing.CacheCreationPriceExplicit = true
+		pricing.CacheCreation5mPrice = derived
+		pricing.CacheCreation1hPrice = derived
+	}
+	if channelPricing.CacheReadPrice == nil && channelPricing.CacheReadMultiplier != nil {
+		derived := base * *channelPricing.CacheReadMultiplier
+		priority := channelTierOverridePrice(pricing.CacheReadPricePerToken, pricing.CacheReadPricePerTokenPriority, derived)
+		pricing.CacheReadPricePerToken = derived
+		pricing.CacheReadPricePerTokenPriority = priority
+	}
 }
 
 // --- 统一计费入口 ---

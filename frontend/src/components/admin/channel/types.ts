@@ -25,6 +25,10 @@ export interface PricingFormEntry {
   output_price: number | string | null
   cache_write_price: number | string | null
   cache_read_price: number | string | null
+  // 派生倍率：只维护提示价，其余三档 = 提示价 × 倍率（对应档位填了绝对价时倍率失效）。
+  completion_multiplier?: number | string | null
+  cache_creation_multiplier?: number | string | null
+  cache_read_multiplier?: number | string | null
   fast_multiplier?: number | string | null
   flex_multiplier?: number | string | null
   image_input_price: number | string | null
@@ -174,6 +178,29 @@ export function isValidPositiveMultiplier(val: number | string | null | undefine
   if (val === null || val === undefined || val === '') return true
   const multiplier = Number(val)
   return Number.isFinite(multiplier) && multiplier > 0
+}
+
+/** 派生倍率允许 0（把某档白送），只拦负数与非数字；与 fast/flex 要求 > 0 不同。 */
+export function isValidNonNegativeMultiplier(val: number | string | null | undefined): boolean {
+  if (val === null || val === undefined || val === '') return true
+  const multiplier = Number(val)
+  return Number.isFinite(multiplier) && multiplier >= 0
+}
+
+/**
+ * 按派生倍率算出展示用的档位价（$/MTok），与后端 applyDerivedTokenPrices 同口径：
+ * 该档填了绝对价、或没填倍率、或提示价 <= 0 时返回 null（不派生）。
+ */
+export function derivedMTokPrice(
+  promptPrice: number | string | null | undefined,
+  configuredPrice: number | string | null | undefined,
+  multiplier: number | string | null | undefined,
+): number | null {
+  if (configuredPrice !== null && configuredPrice !== undefined && configuredPrice !== '') return null
+  const ratio = toNullableNumber(multiplier)
+  const base = toNullableNumber(promptPrice)
+  if (ratio === null || base === null || base <= 0) return null
+  return parseFloat((base * ratio).toPrecision(10))
 }
 
 /** 前端显示值($/MTok) → 后端存储值(per-token) */

@@ -139,6 +139,34 @@
             </div>
           </div>
 
+          <div v-if="enableTierMultipliers" class="mt-3">
+            <label class="block text-xs font-medium text-gray-500 dark:text-gray-400">
+              {{ t('admin.channels.form.derivedMultipliers') }}
+              <span class="ml-1 font-normal text-gray-400">{{ t('admin.channels.form.derivedMultipliersHint') }}</span>
+            </label>
+            <div class="mt-1 grid grid-cols-2 gap-2 sm:grid-cols-3">
+              <div>
+                <label class="text-xs text-gray-400">{{ t('admin.channels.form.derivedCompletionMultiplier') }}</label>
+                <input :value="entry.completion_multiplier" @input="emitField('completion_multiplier', ($event.target as HTMLInputElement).value)"
+                  type="number" step="any" min="0" class="input mt-0.5 text-sm" :placeholder="t('admin.channels.form.multiplierPlaceholder')" />
+              </div>
+              <div>
+                <label class="text-xs text-gray-400">{{ t('admin.channels.form.derivedCacheCreationMultiplier') }}</label>
+                <input :value="entry.cache_creation_multiplier" @input="emitField('cache_creation_multiplier', ($event.target as HTMLInputElement).value)"
+                  type="number" step="any" min="0" class="input mt-0.5 text-sm" :placeholder="t('admin.channels.form.multiplierPlaceholder')" />
+              </div>
+              <div>
+                <label class="text-xs text-gray-400">{{ t('admin.channels.form.derivedCacheReadMultiplier') }}</label>
+                <input :value="entry.cache_read_multiplier" @input="emitField('cache_read_multiplier', ($event.target as HTMLInputElement).value)"
+                  type="number" step="any" min="0" class="input mt-0.5 text-sm" :placeholder="t('admin.channels.form.multiplierPlaceholder')" />
+              </div>
+            </div>
+            <p v-if="derivedPricePreview.length > 0" class="mt-1 text-xs text-gray-400">
+              {{ derivedPricePreview.join(' · ') }}
+              <span class="ml-1">$/MTok</span>
+            </p>
+          </div>
+
           <div v-if="enableTierMultipliers" class="mt-3 grid max-w-md grid-cols-2 gap-2">
             <div>
               <label class="text-xs text-gray-400">{{ t('admin.channels.form.fastMultiplier') }}</label>
@@ -265,7 +293,7 @@ import IntervalRow from './IntervalRow.vue'
 import ModelTagInput from './ModelTagInput.vue'
 import TimePricingSection from './TimePricingSection.vue'
 import type { PricingFormEntry, IntervalFormEntry } from './types'
-import { perTokenToMTok, getPlatformTagClass } from './types'
+import { perTokenToMTok, getPlatformTagClass, derivedMTokPrice } from './types'
 import type { BillingMode } from '@/api/admin/channels'
 import channelsAPI from '@/api/admin/channels'
 
@@ -301,6 +329,21 @@ const billingModeOptions = computed(() => [
 const billingModeLabel = computed(() => {
   const opt = billingModeOptions.value.find(o => o.value === props.entry.billing_mode)
   return opt ? opt.label : props.entry.billing_mode
+})
+
+// 派生价预览：与后端 applyDerivedTokenPrices 同口径，只显示真正会派生的档位。
+// 提示价留空时整段不显示 —— 后端此时用模型目录价做基数，前端拿不到那个值，
+// 显示一个算错的数比不显示更坏。
+const derivedPricePreview = computed(() => {
+  const e = props.entry
+  const rows: Array<[string, number | null]> = [
+    [t('admin.channels.form.outputPrice'), derivedMTokPrice(e.input_price, e.output_price, e.completion_multiplier)],
+    [t('admin.channels.form.cacheWritePrice'), derivedMTokPrice(e.input_price, e.cache_write_price, e.cache_creation_multiplier)],
+    [t('admin.channels.form.cacheReadPrice'), derivedMTokPrice(e.input_price, e.cache_read_price, e.cache_read_multiplier)],
+  ]
+  return rows
+    .filter((row): row is [string, number] => row[1] !== null)
+    .map(([label, price]) => `${label} $${price}`)
 })
 
 function emitField(field: keyof PricingFormEntry, value: string) {

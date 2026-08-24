@@ -45,6 +45,11 @@ export interface ChannelModelPricing {
   output_price: number | null
   cache_write_price: number | null
   cache_read_price: number | null
+  // 派生倍率：只填提示价 + 倍率，其余三档 = 提示价 × 倍率。
+  // 对应档位填了绝对价时倍率被忽略；三个都为 null 即完全走绝对价（老行为）。
+  completion_multiplier?: number | null
+  cache_creation_multiplier?: number | null
+  cache_read_multiplier?: number | null
   fast_multiplier?: number | null
   flex_multiplier?: number | null
   image_input_price: number | null

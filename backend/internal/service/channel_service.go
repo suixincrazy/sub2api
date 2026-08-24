@@ -746,6 +746,19 @@ func checkPricesNotNegative(p ChannelModelPricing) error {
 			return infraerrors.BadRequest("INVALID_MULTIPLIER", fmt.Sprintf("%s must be > 0", c.field))
 		}
 	}
+	// 派生倍率允许为 0（例如把缓存读取白送），但不能为负 —— 负倍率会算出负费用倒找钱。
+	for _, c := range []struct {
+		field string
+		val   *float64
+	}{
+		{"completion_multiplier", p.CompletionMultiplier},
+		{"cache_creation_multiplier", p.CacheCreationMultiplier},
+		{"cache_read_multiplier", p.CacheReadMultiplier},
+	} {
+		if c.val != nil && *c.val < 0 {
+			return infraerrors.BadRequest("INVALID_MULTIPLIER", fmt.Sprintf("%s must be >= 0", c.field))
+		}
+	}
 	return nil
 }
 

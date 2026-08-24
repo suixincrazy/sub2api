@@ -14,9 +14,13 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
+// 必须与 channel_repo_pricing.go 里 SELECT 的列序逐字一致：sqlmock 按列数/列序喂 Scan，
+// 少一列就是 "expected N destination arguments" 而不是断言失败，看不出是列表过期。
 var channelModelPricingTimePricingColumns = []string{
 	"id", "channel_id", "platform", "models", "billing_mode", "input_price", "output_price",
-	"cache_write_price", "cache_read_price", "fast_multiplier", "flex_multiplier", "image_input_price", "image_output_price",
+	"cache_write_price", "cache_read_price",
+	"completion_multiplier", "cache_creation_multiplier", "cache_read_multiplier",
+	"fast_multiplier", "flex_multiplier", "image_input_price", "image_output_price",
 	"per_request_price", "time_pricing", "created_at", "updated_at",
 }
 
@@ -33,7 +37,9 @@ func newChannelModelPricingTimePricingRepo(t *testing.T) (*channelRepository, sq
 func modelPricingTimePricingRow(timePricing any) *sqlmock.Rows {
 	return sqlmock.NewRows(channelModelPricingTimePricingColumns).AddRow(
 		int64(11), int64(7), "openai", `["gpt-5"]`, service.BillingModeToken,
-		nil, nil, nil, nil, nil, nil, nil, nil, nil, timePricing,
+		nil, nil, nil, nil, // 四档绝对价
+		nil, nil, nil, // 三个派生倍率
+		nil, nil, nil, nil, nil, timePricing,
 		time.Date(2026, 8, 17, 0, 0, 0, 0, time.UTC), time.Date(2026, 8, 17, 1, 0, 0, 0, time.UTC),
 	)
 }
@@ -105,10 +111,10 @@ func TestChannelModelPricingTimePricingCreateAndUpdateRoundTrip(t *testing.T) {
 
 	t.Run("create writes JSON", func(t *testing.T) {
 		repo, mock := newChannelModelPricingTimePricingRepo(t)
-		mock.ExpectQuery(regexp.QuoteMeta("INSERT INTO channel_model_pricing (channel_id, platform, models, billing_mode, input_price, output_price, cache_write_price, cache_read_price, fast_multiplier, flex_multiplier, image_input_price, image_output_price, per_request_price, time_pricing)")).
+		mock.ExpectQuery(regexp.QuoteMeta("INSERT INTO channel_model_pricing (channel_id, platform, models, billing_mode, input_price, output_price, cache_write_price, cache_read_price, completion_multiplier, cache_creation_multiplier, cache_read_multiplier, fast_multiplier, flex_multiplier, image_input_price, image_output_price, per_request_price, time_pricing)")).
 			WithArgs(
 				int64(7), "openai", []byte(`["gpt-5"]`), service.BillingModeToken,
-				nil, nil, nil, nil, nil, nil, nil, nil, nil, channelModelPricingTimePricingJSON,
+				nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, channelModelPricingTimePricingJSON,
 			).
 			WillReturnRows(sqlmock.NewRows([]string{"id", "created_at", "updated_at"}).AddRow(int64(11), time.Time{}, time.Time{}))
 
@@ -118,10 +124,13 @@ func TestChannelModelPricingTimePricingCreateAndUpdateRoundTrip(t *testing.T) {
 
 	t.Run("update writes JSON and entry ID", func(t *testing.T) {
 		repo, mock := newChannelModelPricingTimePricingRepo(t)
-		mock.ExpectExec(`(?s)UPDATE channel_model_pricing.*per_request_price = \$11, time_pricing = \$12, platform = \$13.*WHERE id = \$14`).
+		// $14 是 WHERE 里的 id，派生倍率从 $15 起 —— 这个"中间跳一位"的排布是故意的，
+		// 保留原有 $1..$13 编号才不用重排所有实参。
+		mock.ExpectExec(`(?s)UPDATE channel_model_pricing.*per_request_price = \$11, time_pricing = \$12, platform = \$13, completion_multiplier = \$15, cache_creation_multiplier = \$16, cache_read_multiplier = \$17.*WHERE id = \$14`).
 			WithArgs(
 				[]byte(`["gpt-5"]`), service.BillingModeToken,
 				nil, nil, nil, nil, nil, nil, nil, nil, nil, channelModelPricingTimePricingJSON, "openai", int64(11),
+				nil, nil, nil,
 			).
 			WillReturnResult(sqlmock.NewResult(0, 1))
 
@@ -153,10 +162,10 @@ func TestChannelModelPricingTimePricingCreateAndUpdateWriteNullWhenDisabled(t *t
 
 			t.Run("create writes SQL NULL", func(t *testing.T) {
 				repo, mock := newChannelModelPricingTimePricingRepo(t)
-				mock.ExpectQuery(regexp.QuoteMeta("INSERT INTO channel_model_pricing (channel_id, platform, models, billing_mode, input_price, output_price, cache_write_price, cache_read_price, fast_multiplier, flex_multiplier, image_input_price, image_output_price, per_request_price, time_pricing)")).
+				mock.ExpectQuery(regexp.QuoteMeta("INSERT INTO channel_model_pricing (channel_id, platform, models, billing_mode, input_price, output_price, cache_write_price, cache_read_price, completion_multiplier, cache_creation_multiplier, cache_read_multiplier, fast_multiplier, flex_multiplier, image_input_price, image_output_price, per_request_price, time_pricing)")).
 					WithArgs(
 						int64(7), "openai", []byte(`["gpt-5"]`), service.BillingModeToken,
-						nil, nil, nil, nil, nil, nil, nil, nil, nil, nil,
+						nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil,
 					).
 					WillReturnRows(sqlmock.NewRows([]string{"id", "created_at", "updated_at"}).AddRow(int64(11), time.Time{}, time.Time{}))
 
@@ -166,10 +175,11 @@ func TestChannelModelPricingTimePricingCreateAndUpdateWriteNullWhenDisabled(t *t
 
 			t.Run("update writes SQL NULL", func(t *testing.T) {
 				repo, mock := newChannelModelPricingTimePricingRepo(t)
-				mock.ExpectExec(`(?s)UPDATE channel_model_pricing.*per_request_price = \$11, time_pricing = \$12, platform = \$13.*WHERE id = \$14`).
+				mock.ExpectExec(`(?s)UPDATE channel_model_pricing.*per_request_price = \$11, time_pricing = \$12, platform = \$13, completion_multiplier = \$15, cache_creation_multiplier = \$16, cache_read_multiplier = \$17.*WHERE id = \$14`).
 					WithArgs(
 						[]byte(`["gpt-5"]`), service.BillingModeToken,
 						nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, "openai", int64(11),
+						nil, nil, nil,
 					).
 					WillReturnResult(sqlmock.NewResult(0, 1))
 

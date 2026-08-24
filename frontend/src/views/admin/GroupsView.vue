@@ -4547,6 +4547,11 @@ const groupPricingFromAPI = (
     output_price: perTokenToMTok(entry.output_price),
     cache_write_price: perTokenToMTok(entry.cache_write_price),
     cache_read_price: perTokenToMTok(entry.cache_read_price),
+    // 分组表单不展示派生倍率（与 fast/flex 一致），但要原样带回去：
+    // 否则通过 API 配过倍率的分组，一进编辑框保存就被静默清空。
+    completion_multiplier: entry.completion_multiplier ?? null,
+    cache_creation_multiplier: entry.cache_creation_multiplier ?? null,
+    cache_read_multiplier: entry.cache_read_multiplier ?? null,
     image_input_price: perTokenToMTok(entry.image_input_price),
     image_output_price: perTokenToMTok(entry.image_output_price),
     per_request_price: entry.per_request_price,
@@ -4568,6 +4573,9 @@ const groupPricingToAPI = (
       output_price: mTokToPerToken(entry.output_price),
       cache_write_price: mTokToPerToken(entry.cache_write_price),
       cache_read_price: mTokToPerToken(entry.cache_read_price),
+      completion_multiplier: toNullableNumber(entry.completion_multiplier),
+      cache_creation_multiplier: toNullableNumber(entry.cache_creation_multiplier),
+      cache_read_multiplier: toNullableNumber(entry.cache_read_multiplier),
       image_input_price: mTokToPerToken(entry.image_input_price),
       image_output_price: mTokToPerToken(entry.image_output_price),
       per_request_price: toNullableNumber(entry.per_request_price),

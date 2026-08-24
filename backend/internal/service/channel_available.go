@@ -123,15 +123,82 @@ func (s *ChannelService) fillGlobalPricingFallback(models []SupportedModel) {
 		return
 	}
 	for i := range models {
-		if !pricingNeedsFallback(models[i].Pricing) {
-			continue
+		// 派生倍率必须**先**按「运营是否显式配过该档」定案，再让全局回落去补 nil 字段。
+		// 顺序反了的话回落补上的 LiteLLM 补全价会挡住本该派生出来的价，
+		// 于是广场展示 LiteLLM 价、实际扣费按派生价，两个口径打架。
+		derived := s.computeDerivedDisplayPrices(models[i].Name, models[i].Pricing)
+		if pricingNeedsFallback(models[i].Pricing) {
+			if lp := s.pricingService.GetModelPricing(models[i].Name); lp != nil {
+				models[i].Pricing = synthesizePricingFromLiteLLM(lp, models[i].Pricing)
+			}
 		}
-		lp := s.pricingService.GetModelPricing(models[i].Name)
-		if lp == nil {
-			continue
-		}
-		models[i].Pricing = synthesizePricingFromLiteLLM(lp, models[i].Pricing)
+		models[i].Pricing = derived.applyTo(models[i].Pricing)
 	}
+}
+
+// derivedTokenDisplayPrices 是按派生倍率算出的展示价，字段为 nil 表示该档不派生。
+type derivedTokenDisplayPrices struct {
+	output     *float64
+	cacheWrite *float64
+	cacheRead  *float64
+}
+
+func (d derivedTokenDisplayPrices) empty() bool {
+	return d.output == nil && d.cacheWrite == nil && d.cacheRead == nil
+}
+
+// applyTo 把派生价盖到展示定价上（返回克隆，不改入参——渠道定价指针指向缓存共享数据）。
+//
+// 这里是**覆盖**而不是填空：某档要不要派生，在 computeDerivedDisplayPrices 里已经按
+// 运营配置定过案了，此刻 p 上的值可能是全局回落刚补进来的 LiteLLM 价，不是运营配置。
+func (d derivedTokenDisplayPrices) applyTo(p *ChannelModelPricing) *ChannelModelPricing {
+	if p == nil || d.empty() {
+		return p
+	}
+	clone := *p
+	if d.output != nil {
+		clone.OutputPrice = d.output
+	}
+	if d.cacheWrite != nil {
+		clone.CacheWritePrice = d.cacheWrite
+	}
+	if d.cacheRead != nil {
+		clone.CacheReadPrice = d.cacheRead
+	}
+	return &clone
+}
+
+// computeDerivedDisplayPrices 复刻计费侧 applyDerivedTokenPrices 的口径，算出展示用派生价。
+// 有效提示价 = 渠道价优先，否则模型目录官方价；为 0 时不派生（与计费侧一致）。
+func (s *ChannelService) computeDerivedDisplayPrices(model string, p *ChannelModelPricing) derivedTokenDisplayPrices {
+	var out derivedTokenDisplayPrices
+	if p == nil || !p.HasDerivedTokenPrices() {
+		return out
+	}
+	switch p.BillingMode {
+	case BillingModeImage, BillingModePerRequest, BillingModeVideo:
+		return out
+	}
+	base := p.InputPrice
+	if base == nil && s.pricingService != nil {
+		if lp := s.pricingService.GetModelPricing(model); lp != nil {
+			base = nonZeroPtr(lp.InputCostPerToken)
+		}
+	}
+	if base == nil || *base <= 0 {
+		return out
+	}
+	derive := func(configured, multiplier *float64) *float64 {
+		if configured != nil || multiplier == nil {
+			return nil
+		}
+		v := *base * *multiplier
+		return &v
+	}
+	out.output = derive(p.OutputPrice, p.CompletionMultiplier)
+	out.cacheWrite = derive(p.CacheWritePrice, p.CacheCreationMultiplier)
+	out.cacheRead = derive(p.CacheReadPrice, p.CacheReadMultiplier)
+	return out
 }
 
 // pricingNeedsFallback 判定一个 ChannelModelPricing 是否需要走全局回落。

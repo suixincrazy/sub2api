@@ -447,10 +447,13 @@ func TestPricingRequestToService_TimePricingNil(t *testing.T) {
 // 避免渠道倍率意外污染账号成本口径。
 func TestPricingRequestToService_MultipliersGatedByFlag(t *testing.T) {
 	req := channelModelPricingRequest{
-		Models:         []string{"gpt-5"},
-		BillingMode:    "token",
-		FastMultiplier: float64Ptr(2.5),
-		FlexMultiplier: float64Ptr(0.5),
+		Models:                  []string{"gpt-5"},
+		BillingMode:             "token",
+		FastMultiplier:          float64Ptr(2.5),
+		FlexMultiplier:          float64Ptr(0.5),
+		CompletionMultiplier:    float64Ptr(5),
+		CacheCreationMultiplier: float64Ptr(1.25),
+		CacheReadMultiplier:     float64Ptr(0.2),
 		Intervals: []pricingIntervalRequest{{
 			MinTokens:            272000,
 			InputMultiplier:      float64Ptr(2),
@@ -463,6 +466,9 @@ func TestPricingRequestToService_MultipliersGatedByFlag(t *testing.T) {
 	allowed := pricingRequestToService([]channelModelPricingRequest{req}, true)
 	require.Equal(t, float64Ptr(2.5), allowed[0].FastMultiplier)
 	require.Equal(t, float64Ptr(0.5), allowed[0].FlexMultiplier)
+	require.Equal(t, float64Ptr(5), allowed[0].CompletionMultiplier)
+	require.Equal(t, float64Ptr(1.25), allowed[0].CacheCreationMultiplier)
+	require.Equal(t, float64Ptr(0.2), allowed[0].CacheReadMultiplier)
 	require.Equal(t, float64Ptr(2), allowed[0].Intervals[0].InputMultiplier)
 	require.Equal(t, float64Ptr(1.5), allowed[0].Intervals[0].OutputMultiplier)
 	require.Equal(t, float64Ptr(2), allowed[0].Intervals[0].CacheWriteMultiplier)
@@ -471,12 +477,33 @@ func TestPricingRequestToService_MultipliersGatedByFlag(t *testing.T) {
 	dropped := pricingRequestToService([]channelModelPricingRequest{req}, false)
 	require.Nil(t, dropped[0].FastMultiplier)
 	require.Nil(t, dropped[0].FlexMultiplier)
+	// 派生倍率同理：account_stats_pricing.go 直接用 *float64 价格算钱、不查模型目录，
+	// 倍率在那条路径没有生效点，存下来只会造成"配了却不生效"。
+	require.Nil(t, dropped[0].CompletionMultiplier)
+	require.Nil(t, dropped[0].CacheCreationMultiplier)
+	require.Nil(t, dropped[0].CacheReadMultiplier)
 	require.Nil(t, dropped[0].Intervals[0].InputMultiplier)
 	require.Nil(t, dropped[0].Intervals[0].OutputMultiplier)
 	require.Nil(t, dropped[0].Intervals[0].CacheWriteMultiplier)
 	require.Nil(t, dropped[0].Intervals[0].CacheReadMultiplier)
 	// 非倍率字段不受开关影响
 	require.Equal(t, 272000, dropped[0].Intervals[0].MinTokens)
+}
+
+// 派生倍率必须能通过响应 DTO 回到前端，否则编辑框每次打开都是空的，
+// 一保存就把倍率清掉。
+func TestPricingToResponse_DerivedMultipliers(t *testing.T) {
+	got := pricingToResponse(&service.ChannelModelPricing{
+		BillingMode:             service.BillingModeToken,
+		InputPrice:              float64Ptr(4e-6),
+		CompletionMultiplier:    float64Ptr(5),
+		CacheCreationMultiplier: float64Ptr(1.25),
+		CacheReadMultiplier:     float64Ptr(0.2),
+	})
+
+	require.Equal(t, float64Ptr(5), got.CompletionMultiplier)
+	require.Equal(t, float64Ptr(1.25), got.CacheCreationMultiplier)
+	require.Equal(t, float64Ptr(0.2), got.CacheReadMultiplier)
 }
 
 func TestPricingToResponse_TimePricing(t *testing.T) {
