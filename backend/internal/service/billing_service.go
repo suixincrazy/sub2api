@@ -120,6 +120,15 @@ const (
 	openAIGPT54LongContextOutputMultiplier = 1.5
 )
 
+// Anthropic 1M-context 溢价：输入超过 200K 时整次会话 input ×2 / output ×1.5，
+// 缓存创建与缓存读取跟随输入倍率（computeTokenBreakdown 已按此口径处理）。
+// LiteLLM 目录没有给 Opus 5 系列长上下文字段，这里按官方价目补齐。
+const (
+	claudeOpusLongContextInputThreshold   = 200000
+	claudeOpusLongContextInputMultiplier  = 2.0
+	claudeOpusLongContextOutputMultiplier = 1.5
+)
+
 func normalizeBillingServiceTier(serviceTier string) string {
 	return strings.ToLower(strings.TrimSpace(serviceTier))
 }
@@ -1508,6 +1517,9 @@ func (s *BillingService) applyModelSpecificPricingPolicy(model string, pricing *
 	if pricing == nil {
 		return nil
 	}
+	if usesClaudeOpusLongContextPricing(model) {
+		return applyClaudeOpusLongContextPolicy(pricing)
+	}
 	normalized := normalizeKnownOpenAICodexModel(model)
 	isGPT56 := isOpenAIGPT56Model(normalized)
 	usesLegacyLongContextPricing := usesOpenAILegacyLongContextPricing(normalized)
@@ -1540,6 +1552,41 @@ func (s *BillingService) applyModelSpecificPricingPolicy(model string, pricing *
 		if cloned.LongContextOutputMultiplier <= 0 {
 			cloned.LongContextOutputMultiplier = openAIGPT54LongContextOutputMultiplier
 		}
+	}
+	return &cloned
+}
+
+// usesClaudeOpusLongContextPricing 匹配走 Anthropic 1M-context 溢价的 Opus 型号：
+// Opus 5 及映射到它的 Opus 4.8（两者共用同一张定价卡，阶梯口径必须一致）。
+// 匹配风格与 getFallbackPricing 一致：先判 opus-5，避免裸数字误命中 opus-4-5。
+func usesClaudeOpusLongContextPricing(model string) bool {
+	modelLower := strings.ToLower(strings.TrimSpace(model))
+	if !strings.Contains(modelLower, "opus") {
+		return false
+	}
+	if strings.Contains(modelLower, "opus-5") || strings.Contains(modelLower, "opus5") {
+		return true
+	}
+	return strings.Contains(modelLower, "4.8") || strings.Contains(modelLower, "4-8")
+}
+
+// applyClaudeOpusLongContextPolicy 按官方价目补齐缺失的长上下文阶梯字段。
+// 目录 / 渠道 / 分组已显式配置的字段不覆盖，逐字段判定。
+func applyClaudeOpusLongContextPolicy(pricing *ModelPricing) *ModelPricing {
+	if pricing.LongContextInputThreshold > 0 &&
+		pricing.LongContextInputMultiplier > 0 &&
+		pricing.LongContextOutputMultiplier > 0 {
+		return pricing
+	}
+	cloned := *pricing
+	if cloned.LongContextInputThreshold <= 0 {
+		cloned.LongContextInputThreshold = claudeOpusLongContextInputThreshold
+	}
+	if cloned.LongContextInputMultiplier <= 0 {
+		cloned.LongContextInputMultiplier = claudeOpusLongContextInputMultiplier
+	}
+	if cloned.LongContextOutputMultiplier <= 0 {
+		cloned.LongContextOutputMultiplier = claudeOpusLongContextOutputMultiplier
 	}
 	return &cloned
 }

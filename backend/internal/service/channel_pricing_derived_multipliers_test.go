@@ -1,6 +1,7 @@
 package service
 
 import (
+	"context"
 	"testing"
 
 	"github.com/stretchr/testify/require"
@@ -233,4 +234,79 @@ func TestDerivedMultipliersRejectNegativeValues(t *testing.T) {
 
 	// 0 是合法配置（例如缓存读取白送），与 fast/flex 要求严格 > 0 不同。
 	require.NoError(t, checkPricesNotNegative(ChannelModelPricing{CacheReadMultiplier: &zero}))
+}
+
+// 生产形态：分组卡只填提示价 + 三个倍率，Opus 5 的长上下文阶梯由模型策略补齐，
+// 两者必须叠加 —— 阶梯乘的是派生后的价格，不是目录价。
+//
+// 目录价（$5/$25/$6.25/$0.50）与派生价（$4/$20/$5/$0.80）刻意全不相同，
+// 断言才能区分阶梯到底乘在哪个基数上。
+func TestClaudeOpus5LongContextStacksOnDerivedPrices(t *testing.T) {
+	newResolver := func() (*BillingService, *ModelPricingResolver) {
+		bs := &BillingService{fallbackPrices: map[string]*ModelPricing{
+			"claude-opus-5": {
+				InputPricePerToken:         5e-6,
+				OutputPricePerToken:        25e-6,
+				CacheCreationPricePerToken: 6.25e-6,
+				CacheReadPricePerToken:     0.5e-6,
+			},
+		}}
+		return bs, NewModelPricingResolver(nil, bs)
+	}
+	groupWithCard := func(longContextEnabled bool) *Group {
+		card := *derivedRatioPricing()
+		card.Models = []string{"claude-opus-5"}
+		return &Group{
+			ID:                        100,
+			ModelPricing:              []ChannelModelPricing{card},
+			LongContextPricingEnabled: longContextEnabled,
+		}
+	}
+	// input + cache_creation + cache_read = 220000 > 200000 阈值。
+	overThreshold := UsageTokens{
+		InputTokens:         150000,
+		CacheCreationTokens: 40000,
+		CacheReadTokens:     30000,
+		OutputTokens:        2000,
+	}
+	cost := func(group *Group, tokens UsageTokens) *CostBreakdown {
+		bs, r := newResolver()
+		bd, err := bs.CalculateCostUnified(CostInput{
+			Ctx: context.Background(), Model: "claude-opus-5", Group: group,
+			Tokens: tokens, RateMultiplier: 1, Resolver: r,
+		})
+		require.NoError(t, err)
+		require.NotNil(t, bd)
+		return bd
+	}
+
+	t.Run("超阈值：阶梯乘派生价", func(t *testing.T) {
+		bd := cost(groupWithCard(true), overThreshold)
+
+		// input / 缓存两档 ×2，补全 ×1.5。
+		require.InDelta(t, 150000*derivedPromptPerToken*2, bd.InputCost, 1e-9)
+		require.InDelta(t, 40000*derivedCacheWritePerToken*2, bd.CacheCreationCost, 1e-9)
+		require.InDelta(t, 30000*derivedCacheReadPerToken*2, bd.CacheReadCost, 1e-9)
+		require.InDelta(t, 2000*derivedCompletionPerToken*1.5, bd.OutputCost, 1e-9)
+		require.InDelta(t, 1.708, bd.TotalCost, 1e-9)
+		require.True(t, bd.LongContextBillingApplied)
+	})
+
+	t.Run("未超阈值：仍是派生价", func(t *testing.T) {
+		bd := cost(groupWithCard(true), UsageTokens{InputTokens: 100000, OutputTokens: 2000})
+
+		require.InDelta(t, 100000*derivedPromptPerToken, bd.InputCost, 1e-9)
+		require.InDelta(t, 2000*derivedCompletionPerToken, bd.OutputCost, 1e-9)
+		require.False(t, bd.LongContextBillingApplied)
+	})
+
+	t.Run("分组关掉长上下文开关时阶梯不生效", func(t *testing.T) {
+		bd := cost(groupWithCard(false), overThreshold)
+
+		require.InDelta(t, 150000*derivedPromptPerToken, bd.InputCost, 1e-9)
+		require.InDelta(t, 40000*derivedCacheWritePerToken, bd.CacheCreationCost, 1e-9)
+		require.InDelta(t, 30000*derivedCacheReadPerToken, bd.CacheReadCost, 1e-9)
+		require.InDelta(t, 2000*derivedCompletionPerToken, bd.OutputCost, 1e-9)
+		require.False(t, bd.LongContextBillingApplied)
+	})
 }

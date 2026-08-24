@@ -459,6 +459,102 @@ func TestCalculateCost_LongContextAppliesMultiplierToCacheCreation5mAnd1h(t *tes
 		"both 5m and 1h cache_creation prices should be scaled by LongContextInputMultiplier")
 }
 
+// LiteLLM 目录不给 Opus 5 系列长上下文字段，阶梯只能由 applyModelSpecificPricingPolicy 补齐。
+func TestUsesClaudeOpusLongContextPricing(t *testing.T) {
+	tests := []struct {
+		model string
+		want  bool
+	}{
+		{model: "claude-opus-5", want: true},
+		{model: "claude-opus-5-20260501", want: true},
+		{model: "Claude-Opus-5", want: true},
+		{model: "  claude-opus-5  ", want: true},
+		{model: "opus5", want: true},
+		{model: "claude-opus-4-8", want: true},
+		{model: "claude-opus-4.8", want: true},
+		// 阶梯只覆盖 Opus 5 与映射到它的 4.8；其余 Opus 型号保持平价。
+		{model: "claude-opus-4-5", want: false},
+		{model: "claude-opus-4-6", want: false},
+		{model: "claude-opus-4-7", want: false},
+		{model: "claude-3-opus", want: false},
+		// 非 Opus 一律不命中，避免 sonnet-5 之类被裸 "5" 误判。
+		{model: "claude-sonnet-5", want: false},
+		{model: "gpt-5.6-sol", want: false},
+		{model: "", want: false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.model, func(t *testing.T) {
+			require.Equal(t, tt.want, usesClaudeOpusLongContextPricing(tt.model))
+		})
+	}
+}
+
+func TestGetModelPricing_ClaudeOpus5FillsLongContextLadder(t *testing.T) {
+	svc := newTestBillingService()
+
+	pricing, err := svc.GetModelPricing("claude-opus-5")
+	require.NoError(t, err)
+	require.NotNil(t, pricing)
+	// 四档基础价不受阶梯策略影响。
+	require.InDelta(t, 5e-6, pricing.InputPricePerToken, 1e-12)
+	require.InDelta(t, 25e-6, pricing.OutputPricePerToken, 1e-12)
+	require.Equal(t, 200000, pricing.LongContextInputThreshold)
+	require.InDelta(t, 2.0, pricing.LongContextInputMultiplier, 1e-12)
+	require.InDelta(t, 1.5, pricing.LongContextOutputMultiplier, 1e-12)
+	require.False(t, pricing.LongContextThresholdInclusive, "Anthropic 口径是严格大于 200K")
+}
+
+func TestGetModelPricing_ClaudeOpus46KeepsNoLongContextLadder(t *testing.T) {
+	svc := newTestBillingService()
+
+	pricing, err := svc.GetModelPricing("claude-opus-4-6")
+	require.NoError(t, err)
+	require.NotNil(t, pricing)
+	require.Zero(t, pricing.LongContextInputThreshold)
+}
+
+// 阈值是严格大于：正好 200000 不涨价，200001 才涨。
+func TestCalculateCost_ClaudeOpus5LongContextThresholdIsExclusive(t *testing.T) {
+	svc := newTestBillingService()
+
+	atThreshold, err := svc.CalculateCost("claude-opus-5", UsageTokens{InputTokens: 200000}, 1.0)
+	require.NoError(t, err)
+	require.InDelta(t, 200000*5e-6, atThreshold.InputCost, 1e-10)
+	require.False(t, atThreshold.LongContextBillingApplied)
+
+	overThreshold, err := svc.CalculateCost("claude-opus-5", UsageTokens{InputTokens: 200001}, 1.0)
+	require.NoError(t, err)
+	require.InDelta(t, 200001*5e-6*2.0, overThreshold.InputCost, 1e-10)
+	require.True(t, overThreshold.LongContextBillingApplied)
+}
+
+// 阈值按 input + cache_creation + cache_read 之和判定，四档价都跟着涨：
+// input / cache 两档 ×2，output ×1.5。
+func TestCalculateCost_ClaudeOpus5LongContextAppliesWholeSessionMultipliers(t *testing.T) {
+	svc := newTestBillingService()
+
+	tokens := UsageTokens{
+		InputTokens:         100000,
+		CacheCreationTokens: 60000,
+		CacheReadTokens:     50000, // 合计 210000 > 200000
+		OutputTokens:        4000,
+	}
+
+	cost, err := svc.CalculateCost("claude-opus-5", tokens, 1.0)
+	require.NoError(t, err)
+
+	expectedInput := float64(tokens.InputTokens) * 5e-6 * 2.0
+	expectedCacheWrite := float64(tokens.CacheCreationTokens) * 6.25e-6 * 2.0
+	expectedCacheRead := float64(tokens.CacheReadTokens) * 0.5e-6 * 2.0
+	expectedOutput := float64(tokens.OutputTokens) * 25e-6 * 1.5
+	require.InDelta(t, expectedInput, cost.InputCost, 1e-10)
+	require.InDelta(t, expectedCacheWrite, cost.CacheCreationCost, 1e-10)
+	require.InDelta(t, expectedCacheRead, cost.CacheReadCost, 1e-10)
+	require.InDelta(t, expectedOutput, cost.OutputCost, 1e-10)
+	require.True(t, cost.LongContextBillingApplied)
+}
+
 func TestGetFallbackPricing_FamilyMatching(t *testing.T) {
 	svc := newTestBillingService()
 
