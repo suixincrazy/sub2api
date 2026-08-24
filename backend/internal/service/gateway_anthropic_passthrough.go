@@ -710,14 +710,28 @@ func (o *anthropicHoldbackObserver) windowElapsed(now time.Time, window time.Dur
 // 只用来累计连击、到阈值后解绑，绝不罚号。两者必须分开，否则可疑形态会被当成确定故障
 // 把健康账号罚下线——那正是当初否掉「输出长度突降基线」的理由。
 //
-// 五个条件同时成立才算可疑：
+// 前三个条件是门槛，之后分「空」与「短」两类：
 //  1. stop_reason 恰好是 end_turn。tool_use/max_tokens/stop_sequence 都说明模型
 //     确实干了活或是被限制截断，pause_turn 是协议级续传，都不算。
 //  2. 没有开过 tool_use 块。开了工具块的回合无论正文多短都是正常的 agent 行为。
 //  3. 上游确实报了正的 output_tokens。为 0 的情形归 anthropicStreamLooksIncomplete-
 //     DespiteTerminal 管，这里放行避免同一次故障被两套逻辑各记一次。
-//  4. output_tokens 不超过上限。这是主判据，见 anthropicShortTurnOutputTokenLimit。
-//  5. 正文长度不超过上限。兜住 token 计费口径异常（压缩/复用 token 的兼容层）的情形。
+//
+// 空回合（proseRunes == 0）：end_turn 收尾却一个字的正文都没有。这**不受 output_tokens
+// 上限约束** —— 上限的作用是区分「短答案」与「真答案」，而没有正文时压根不存在答案。
+// 思考 token 也计入 output_tokens，所以「想了很久、一句话都没说」会是大 output_tokens +
+// 零正文，用上限去卡它只会漏掉。
+//
+// 短回合（0 < proseRunes <= 上限）：仍要求 output_tokens 不超过上限，这是主判据，
+// 见 anthropicShortTurnOutputTokenLimit；正文上限兜住 token 计费口径异常的情形。
+//
+// 为什么必须把空回合收进来（2026-08-24 实证）：账号 12 sotamodel 的主力故障形态是
+// message_start 之后一路到 message_stop 全程无正文、message_delta 报 output_tokens=1，
+// 协议完整、stop_reason=end_turn。旧实现两侧都判不住 —— anthropicStreamLooksIncomplete-
+// DespiteTerminal 要求 output_tokens <= 0（拿到的是 1），这里又要求 proseRunes > 0
+// （拿到的是 0），48 小时里 51/142 发（35.9%）从缝里漏过去，客户端看到空响应后自己重试，
+// 粘性把每一次重试都送回同一个坏号。对照组同期 output_tokens=1 占比：账号 5 是 0.1%、
+// 9 是 0.1%、10/11 是 0% —— 空回合是明确的上游故障信号，不是合法回答形态。
 func anthropicTurnLooksSuspiciouslyShort(
 	stopReason string,
 	proseRunes int,
@@ -730,10 +744,32 @@ func anthropicTurnLooksSuspiciouslyShort(
 	if sawToolUseBlock {
 		return false
 	}
-	if outputTokens <= 0 || outputTokens > anthropicShortTurnOutputTokenLimit {
+	if outputTokens <= 0 {
 		return false
 	}
-	return proseRunes > 0 && proseRunes <= anthropicShortTurnProseRuneLimit
+	if proseRunes == 0 {
+		return true
+	}
+	if outputTokens > anthropicShortTurnOutputTokenLimit {
+		return false
+	}
+	return proseRunes <= anthropicShortTurnProseRuneLimit
+}
+
+// anthropicTurnIsEmptyAnswer 从可疑形态里再切出「空回合」这一档。
+//
+// 与短回合分开的理由是代价不同：短回合可能真的只是个一句话答案，误判要留退路（持流只丢弃
+// 一次、绝不罚号）；空回合不存在「本来就该是空的答案」这种可能，所以可以按上游故障处理，
+// 走 HandleStreamTruncated 让账号进冷却，下一发自然落到别的号。判据与
+// anthropicTurnLooksSuspiciouslyShort 的空回合分支必须一致，所以直接复用它做前置。
+func anthropicTurnIsEmptyAnswer(
+	stopReason string,
+	proseRunes int,
+	outputTokens int,
+	sawToolUseBlock bool,
+) bool {
+	return proseRunes == 0 &&
+		anthropicTurnLooksSuspiciouslyShort(stopReason, proseRunes, outputTokens, sawToolUseBlock)
 }
 
 // anthropicTurnProvesUpstreamHealthy 判定这一回合能否作为「上游把话说完了」的正面证据，
@@ -834,6 +870,8 @@ const anthropicIncompleteStreamUpstreamMessage = "Anthropic upstream delivered a
 
 const anthropicTruncatedStreamUpstreamMessage = "Anthropic upstream truncated the SSE stream after it was committed to the client"
 
+const anthropicEmptyAnswerTurnUpstreamMessage = "Anthropic upstream ended the turn with no visible answer"
+
 const anthropicUnfailedOverRefusalUpstreamMessage = "Anthropic upstream returned a safeguards refusal that could no longer be failed over"
 
 func anthropicEmptyStreamErrorBody() []byte {
@@ -883,6 +921,51 @@ func (s *GatewayService) reportStreamTruncatedAfterCommit(ctx context.Context, c
 	})
 	logger.LegacyPrintf("service.gateway", "[Anthropic Passthrough] stream truncated after commit, no failover possible: account=%d(%s) model=%s request_id=%s reason=%s",
 		account.ID, account.Name, model, upstreamRequestID, reason)
+	if s.rateLimitService != nil {
+		s.rateLimitService.HandleStreamTruncated(ctx, account, model)
+	}
+}
+
+// reportAnthropicEmptyAnswerTurn 归因并冷却「协议完整但零正文」的回合。
+//
+// 与 reportStreamTruncatedAfterCommit 共用 stream_timeout_settings 那一套开关/阈值/
+// 计数窗口（运维只需一个旋钮），只在 Kind 与文案上区分 —— 对上游来说这两件事是同一类
+// 故障：这一发没有产出可用输出。线上该设置是 threshold_count=1 / temp_unsched 1 分钟，
+// 所以第一次空回合就把账号冷却一分钟，下一发自然落到别的号。
+//
+// 为什么这一档可以罚号，而短回合不行：短回合有「用户问的问题本来就只有一句话答案」这种
+// 合法解释，误判会把健康账号摘下线；空回合没有对应的合法解释。实测对照也支持这个判断，
+// 见 anthropicTurnLooksSuspiciouslyShort 的注释。
+//
+// 调用点两处，覆盖「拦下来了」和「没拦住」两种结局：持流丢弃分支（客户端零暴露）与
+// reportIfTerminalButIncomplete（持流关闭/窗口耗尽/重试额度已用，响应已交付）。
+func (s *GatewayService) reportAnthropicEmptyAnswerTurn(
+	ctx context.Context, c *gin.Context, resp *http.Response, account *Account, model string,
+	outputTokens int, stopReason, disposition string,
+) {
+	if account == nil {
+		return
+	}
+	upstreamRequestID := ""
+	if resp != nil {
+		upstreamRequestID = resp.Header.Get("x-request-id")
+	}
+	detail := fmt.Sprintf("stop_reason=%s output_tokens=%d prose_runes=0 disposition=%s",
+		stopReason, outputTokens, disposition)
+	appendOpsUpstreamError(c, OpsUpstreamErrorEvent{
+		Platform:           account.Platform,
+		AccountID:          account.ID,
+		AccountName:        account.Name,
+		UpstreamStatusCode: http.StatusBadGateway,
+		UpstreamRequestID:  upstreamRequestID,
+		Kind:               "empty_answer_turn",
+		Message:            anthropicEmptyAnswerTurnUpstreamMessage,
+		Detail:             detail,
+	})
+	slog.Warn("anthropic_empty_answer_turn",
+		"account_id", account.ID, "account_name", account.Name, "model", model,
+		"stop_reason", stopReason, "output_tokens", outputTokens,
+		"disposition", disposition, "upstream_request_id", upstreamRequestID)
 	if s.rateLimitService != nil {
 		s.rateLimitService.HandleStreamTruncated(ctx, account, model)
 	}
@@ -1420,6 +1503,13 @@ func (s *GatewayService) handleStreamingResponseAnthropicAPIKeyPassthrough(
 			// -> 不表态，保留连击。见 anthropicTurnProvesUpstreamHealthy。
 			if anthropicTurnLooksSuspiciouslyShort(sawStopReason, proseRunes, usage.OutputTokens, sawToolUseBlock) {
 				s.noteAnthropicShortTurnStreak(ctx, account, model, proseRunes, usage.OutputTokens)
+				// 走到这里说明空回合没被持流拦住（窗口配 0、窗口耗尽、或本请求的重试额度
+				// 已经用掉），客户端已经吃到一个没有答案的 200。解绑只管下一发落在哪，
+				// 账号本身还在池子里，所以这一档要额外冷却账号。
+				if anthropicTurnIsEmptyAnswer(sawStopReason, proseRunes, usage.OutputTokens, sawToolUseBlock) {
+					s.reportAnthropicEmptyAnswerTurn(ctx, c, resp, account, model,
+						usage.OutputTokens, sawStopReason, "delivered")
+				}
 			} else if anthropicTurnProvesUpstreamHealthy(sawStopReason, proseRunes, usage.OutputTokens, sawToolUseBlock) {
 				s.clearAnthropicShortTurnStreak(ctx)
 			}
@@ -1561,6 +1651,18 @@ func (s *GatewayService) handleStreamingResponseAnthropicAPIKeyPassthrough(
 						commitPrelude = true
 					case anthropicHoldbackDiscard:
 						pendingPreludeLines = pendingPreludeLines[:0]
+						// 丢弃只治这一发。粘性绑定还指着这个坏号，而重试那一发不会改写它
+						// （非破坏性绑定：已有绑定指向别的账号时不覆盖），所以下一发客户端
+						// 请求照旧从这个号起手，每发白烧一次上游调用。这里主动解绑，阈值 1
+						// 下这一次 note 就直接删绑定，重试那一发随即绑到新号上。
+						// 代价只是丢一次 prompt cache —— 见 noteAnthropicShortTurnStreak。
+						s.noteAnthropicShortTurnStreak(ctx, account, model,
+							holdback.proseRunes, holdback.outputTokens)
+						if anthropicTurnIsEmptyAnswer(holdback.stopReason, holdback.proseRunes,
+							holdback.outputTokens, holdback.sawToolUseBlock) {
+							s.reportAnthropicEmptyAnswerTurn(ctx, c, resp, account, model,
+								holdback.outputTokens, holdback.stopReason, "discarded")
+						}
 						return nil, s.newAnthropicShortTurnFailoverError(
 							c, resp, account, model,
 							holdback.proseRunes, holdback.outputTokens, holdback.stopReason)

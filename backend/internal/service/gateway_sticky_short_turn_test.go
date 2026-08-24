@@ -147,11 +147,29 @@ func TestAnthropicTurnLooksSuspiciouslyShort(t *testing.T) {
 		// 开了工具块的短回合是标准 agent 行为，绝不能解绑——否则每次工具调用都在打断粘性。
 		{"开了 tool_use 块不算", "end_turn", 20, 10, true, false},
 
-		// output_tokens<=0 与零正文归 anthropicStreamLooksIncompleteDespiteTerminal，
-		// 在这里放行，避免同一次故障被两套逻辑各记一次。
+		// output_tokens<=0 归 anthropicStreamLooksIncompleteDespiteTerminal，在这里放行，
+		// 避免同一次故障被两套逻辑各记一次。
 		{"output_tokens 为零不算", "end_turn", 20, 0, false, false},
 		{"output_tokens 为负不算", "end_turn", 20, -1, false, false},
-		{"零正文不算", "end_turn", 0, 30, false, false},
+
+		// 零正文 + output_tokens>0：账号 12（sotamodel）的实测形态，也是两套判定之间那条缝。
+		// anthropicStreamLooksIncompleteDespiteTerminal 要求 output_tokens<=0（实际拿到 1），
+		// 这里原先要求 proseRunes>0（实际拿到 0），于是三个检测器全部放行、持流判成 Release，
+		// 一个没有答案的 200 被原样交付，客户端表现为断流后自己重发，而账号既没被排除也没被
+		// 冷却，粘性把下一发原样送回去——正是「断流且不会自动切号」。
+		//
+		// 48h 统计（output_tokens=1 占该账号流式请求的比例）：账号 12 = 35.9%（51/142），
+		// 账号 5/9 = 0.1%，账号 10/11 = 0%。健康账号几乎不产生这个形态，所以它是确定性的
+		// 上游故障，判可疑不会误伤。
+		{"零正文 out=1 是空回合", "end_turn", 0, 1, false, true},
+		{"零正文 out=30 是空回合", "end_turn", 0, 30, false, true},
+		// 空回合刻意**不**受 output_tokens 上限约束：思考 token 也计入 output_tokens，
+		// 「想了很久一句没说」正是最典型的截断形态，卡上限反而会把它漏掉。
+		{"零正文即使 token 上量仍算空回合", "end_turn", 0, anthropicShortTurnOutputTokenLimit + 1, false, true},
+		{"零正文即使 token 很多仍算空回合", "end_turn", 0, 4096, false, true},
+		// 其余闸门对空回合一视同仁：工具回合与非 end_turn 收尾都不算。
+		{"零正文 + tool_use 块不算", "end_turn", 0, 1, true, false},
+		{"零正文但 max_tokens 收尾不算", "max_tokens", 0, 1, false, false},
 	}
 
 	for _, tc := range cases {
@@ -159,6 +177,95 @@ func TestAnthropicTurnLooksSuspiciouslyShort(t *testing.T) {
 			require.Equal(t, tc.suspicious, anthropicTurnLooksSuspiciouslyShort(
 				tc.stopReason, tc.proseRunes, tc.outputTokens, tc.sawToolUse))
 		})
+	}
+}
+
+// anthropicTurnIsEmptyAnswer 把「一个字都没说」从「说得少」里切出来。这条分界决定要不要
+// 罚号，所以边界必须单独钉住：
+//   - 说得少可能是真的只有一句话的答案，罚号会把一个好账号从所有会话的调度池里摘掉；
+//   - 一个字都没说不存在合法解释——end_turn 声明「我说完了」，却没有任何 text_delta。
+//
+// 它必须是 anthropicTurnLooksSuspiciouslyShort 的**子集**：否则调用点会出现「罚了号但没
+// 解绑」的组合，粘性还钉在坏号上。
+func TestAnthropicTurnIsEmptyAnswer(t *testing.T) {
+	for _, tc := range []struct {
+		name         string
+		stopReason   string
+		proseRunes   int
+		outputTokens int
+		toolUse      bool
+		want         bool
+	}{
+		// 账号 12 的实测形态。
+		{"零正文 out=1", "end_turn", 0, 1, false, true},
+		{"零正文 out=30", "end_turn", 0, 30, false, true},
+		// 不受 token 上限约束：长思考 + 零正文照样是空回合。
+		{"零正文 token 上量", "end_turn", 0, anthropicShortTurnOutputTokenLimit + 1, false, true},
+
+		// 有正文就不是空回合，哪怕短到会被解绑。这条守的就是「短≠空」，
+		// 少了它罚号会扩散到所有短回答上。
+		{"一个字也算有正文", "end_turn", 1, 30, false, false},
+		{"实测短截断有正文，不算空", "end_turn", 131, 70, false, false},
+
+		// 闸门与短回合判定共用，逐条确认没有旁路。
+		{"tool_use 块不算", "end_turn", 0, 1, true, false},
+		{"max_tokens 不算", "max_tokens", 0, 1, false, false},
+		{"tool_use 收尾不算", "tool_use", 0, 1, false, false},
+		{"空 stop_reason 不算", "", 0, 1, false, false},
+		// output_tokens<=0 归确定性残缺判定，不在这里重复记一次。
+		{"output_tokens 为零不算", "end_turn", 0, 0, false, false},
+		{"output_tokens 为负不算", "end_turn", 0, -1, false, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			got := anthropicTurnIsEmptyAnswer(tc.stopReason, tc.proseRunes, tc.outputTokens, tc.toolUse)
+			require.Equal(t, tc.want, got)
+			if got {
+				require.True(t, anthropicTurnLooksSuspiciouslyShort(
+					tc.stopReason, tc.proseRunes, tc.outputTokens, tc.toolUse),
+					"空回合必须同时是可疑短回合，否则会出现罚了号却不解绑的组合")
+			}
+		})
+	}
+}
+
+// 穷举确认子集关系：空回合永远蕴含可疑短回合。调用点靠这个不变式把「解绑」和「罚号」
+// 叠在同一个分支里，一旦被破坏就会静默出现罚号但不解绑。
+func TestEmptyAnswerImpliesSuspiciouslyShort(t *testing.T) {
+	for _, sr := range []string{"end_turn", "max_tokens", "stop_sequence", "tool_use", "pause_turn", "refusal", ""} {
+		for _, runes := range []int{0, 1, 50, anthropicShortTurnProseRuneLimit, anthropicShortTurnProseRuneLimit + 1} {
+			for _, tokens := range []int{-1, 0, 1, 70, anthropicShortTurnOutputTokenLimit, anthropicShortTurnOutputTokenLimit + 1, 4096} {
+				for _, toolUse := range []bool{false, true} {
+					if anthropicTurnIsEmptyAnswer(sr, runes, tokens, toolUse) {
+						require.True(t, anthropicTurnLooksSuspiciouslyShort(sr, runes, tokens, toolUse),
+							"stop_reason=%q prose=%d tokens=%d toolUse=%v 是空回合却不可疑", sr, runes, tokens, toolUse)
+					}
+				}
+			}
+		}
+	}
+}
+
+// emptyAnswerSSE 复刻账号 12 的实测响应：协议层完整（message_delta + message_stop、
+// stop_reason=end_turn），开了正文块，却一个 text_delta 都没有，output_tokens 只有 1。
+//
+// 与 shortTurnSSE 的唯一区别就是没有 text_delta —— 这一个差别决定了三个检测器全部放行。
+func emptyAnswerSSE(outputTokens int) *http.Response {
+	return &http.Response{
+		StatusCode: http.StatusOK,
+		Header:     http.Header{"Content-Type": []string{"text/event-stream"}},
+		Body: sseBody(
+			`data: {"type":"message_start","message":{"usage":{"input_tokens":129000}}}`,
+			"",
+			`data: {"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}`,
+			"",
+			`data: {"type":"content_block_stop","index":0}`,
+			"",
+			fmt.Sprintf(`data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":%d}}`, outputTokens),
+			"",
+			`data: {"type":"message_stop"}`,
+			"",
+			"",
+		),
 	}
 }
 
@@ -196,7 +303,6 @@ func TestAnthropicVisibleProseRunes(t *testing.T) {
 		`{"type":"content_block_delta","delta":{"type":"thinking_delta","thinking":"想"}}`)),
 		"旧函数仍应把思考链计入，判零口径不变")
 }
-
 
 // 端到端：两条信号都放行的「协议合法但疑似没把话说完」，连续两发后必须解除粘性绑定，
 // 让客户端的下一发重新选号落到同优先级的另一个账号上。
@@ -259,7 +365,6 @@ func TestAnthropicPassthrough_NormalTurnResetsShortTurnStreak(t *testing.T) {
 	require.Zero(t, cache.deletedSessions[sessionKey], "连续正常回合不得解绑")
 	require.Empty(t, cache.streaks, "正常回合之后不得留下连击数")
 }
-
 
 // 开了 tool_use 块的短回合是标准 agent 行为，不得累计——否则每一次工具调用都在打断粘性。
 func TestAnthropicPassthrough_ToolUseShortTurnNotCounted(t *testing.T) {
@@ -690,4 +795,85 @@ func TestAnthropicPassthrough_LongThinkingShortProseStillUnbinds(t *testing.T) {
 	runShortTurnPassthrough(t, svc, groupID, sessionKey, 9, resp())
 	requireUnboundOnce(t, cache, groupID, sessionKey)
 	require.Zero(t, repo.tempCalls)
+}
+
+// 账号 12 的端到端复现（透传链路，持流关闭 → 空响应已经交付给客户端）。
+//
+// 这一发同时要三件事：解绑（下一发换号）、罚号（把账号从调度池里暂时摘掉）、并且**不**
+// 因为解绑而漏掉罚号。只解绑治不了这个账号：解绑之后重新选号仍可能落回它（它还在池子里、
+// 健康度满分），而它 35.9% 的请求都是空响应；只罚号也不够：粘性绑定还钉在它上面，罚号
+// 期间那条会话会被判成「绑定的账号临时不可用」而不是换号。
+func TestAnthropicPassthrough_EmptyAnswerTurnUnbindsAndPenalizes(t *testing.T) {
+	const sessionKey = "sticky-empty-answer"
+	const groupID = int64(1)
+	cache := newShortTurnStreakCache(sessionKey, 12)
+	svc, repo := newShortTurnTestGatewayService(t, cache)
+
+	runShortTurnPassthrough(t, svc, groupID, sessionKey, 12, emptyAnswerSSE(1))
+
+	requireUnboundOnce(t, cache, groupID, sessionKey)
+	require.Positive(t, repo.tempCalls,
+		"end_turn 却一个字都没说是确定性上游故障，必须冷却账号，否则重新选号会落回同一个号")
+}
+
+// 同一条链路上「说得少」与「一个字没说」的对照。这一对必须一起看：罚号的边界就在这里，
+// 放宽到短回合上会把只有一句话答案的正常回合也罚掉。
+func TestAnthropicPassthrough_ShortButNonEmptyTurnIsNotPenalized(t *testing.T) {
+	const sessionKey = "sticky-short-not-penalized"
+	const groupID = int64(1)
+	cache := newShortTurnStreakCache(sessionKey, 12)
+	svc, repo := newShortTurnTestGatewayService(t, cache)
+
+	// 只有一个字的正文：短到必然解绑，但仍然不得罚号。
+	runShortTurnPassthrough(t, svc, groupID, sessionKey, 12, shortTurnSSE("好", 30, false))
+	requireUnboundOnce(t, cache, groupID, sessionKey)
+	require.Zero(t, repo.tempCalls, "有正文就可能是合法的短回答，只解绑不罚号")
+}
+
+// 常规链路上的账号 12 复现。第三方中转号不走透传，两条链路必须同口径。
+func TestRegularPath_EmptyAnswerTurnUnbindsAndPenalizes(t *testing.T) {
+	const sessionKey = "regular-empty-answer"
+	const groupID = int64(1)
+	cache := newShortTurnStreakCache(sessionKey, 12)
+	svc, repo := newShortTurnTestGatewayService(t, cache)
+
+	runShortTurnRegularPath(t, svc, groupID, sessionKey, 12, emptyAnswerSSE(1))
+
+	requireUnboundOnce(t, cache, groupID, sessionKey)
+	require.Positive(t, repo.tempCalls, "常规链路必须与透传同口径")
+}
+
+// 空回合不受 output_tokens 上限约束的端到端形态：长思考 + 零正文 + token 上量。
+// 按上限卡就会漏掉它，而这正是「想很久却什么都没说」的实际样子。
+func TestAnthropicPassthrough_LongThinkingZeroProseIsPenalized(t *testing.T) {
+	const sessionKey = "sticky-thinking-empty"
+	const groupID = int64(1)
+	cache := newShortTurnStreakCache(sessionKey, 12)
+	svc, repo := newShortTurnTestGatewayService(t, cache)
+
+	resp := &http.Response{
+		StatusCode: http.StatusOK,
+		Header:     http.Header{"Content-Type": []string{"text/event-stream"}},
+		Body: sseBody(
+			`data: {"type":"message_start","message":{"usage":{"input_tokens":129000}}}`,
+			"",
+			`data: {"type":"content_block_start","index":0,"content_block":{"type":"thinking","thinking":""}}`,
+			"",
+			fmt.Sprintf(`data: {"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":%q}}`,
+				strings.Repeat("我得先想清楚这里的因果链条。", 60)),
+			"",
+			`data: {"type":"content_block_stop","index":0}`,
+			"",
+			// 思考 token 全部计入 output_tokens，远超短回合上限，但正文是零。
+			`data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":900}}`,
+			"",
+			`data: {"type":"message_stop"}`,
+			"",
+			"",
+		),
+	}
+	runShortTurnPassthrough(t, svc, groupID, sessionKey, 12, resp)
+
+	requireUnboundOnce(t, cache, groupID, sessionKey)
+	require.Positive(t, repo.tempCalls, "思考 token 上量不得让零正文逃过判定")
 }
