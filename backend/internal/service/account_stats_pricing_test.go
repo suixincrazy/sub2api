@@ -768,7 +768,41 @@ func TestResolveAccountStatsCost_FallsBackToLiteLLM(t *testing.T) {
 	require.InDelta(t, 0.2, *result, 1e-12)
 }
 
+// fast/priority 档在 fallback 价上按 serviceTierCostMultiplier 整体 ×2。
+//
+// 刻意用 100K 输入而不是 1M：`tryModelFilePricing` 的分支条件是「档位是 fast/priority/flex
+// **或** 命中长上下文阶梯」，1M 输入会同时踩中阶梯，一条用例就有了两个失败理由。
+// 阶梯与档位的叠加口径由下面那条单独钉。
 func TestResolveAccountStatsCost_FallbackHonorsAnthropicFast(t *testing.T) {
+	channel := &Channel{ID: 1, Status: StatusActive}
+	cs := newTestChannelServiceForStats(t, channel, 10, "anthropic")
+	bs := newTestBillingServiceWithPrices(map[string]*ModelPricing{
+		"claude-opus-5": {
+			InputPricePerToken:  5e-6,
+			OutputPricePerToken: 25e-6,
+		},
+	})
+
+	result := resolveAccountStatsCost(
+		context.Background(), cs, bs,
+		1, 10, "claude-opus-5",
+		UsageTokens{InputTokens: 100_000, OutputTokens: 100_000},
+		1, 0, "fast",
+	)
+	require.NotNil(t, result)
+	// (100_000×5e-6 + 100_000×25e-6) × 2 = (0.5 + 2.5) × 2 = 6
+	require.InDelta(t, 6, *result, 1e-12)
+	require.LessOrEqual(t, 100_000, 200_000, "前提：输入量必须低于长上下文阈值，否则这条用例混进了阶梯")
+}
+
+// 账号成本统计这条路径同样要吃长上下文阶梯，而且阶梯在档位倍率**之前**生效。
+//
+// 2026-08-24 Opus 5 补上阶梯（commit 70ba9184d）之前，claude-opus-5 的阶梯字段全是 0，
+// shouldApplySessionLongContextPricing 永远 false，这里走的是平价分支，1M/1M 的 fast
+// 请求算出 60。补上阶梯之后 1M 输入越过 200K 阈值，input ×2 / output ×1.5 先生效，
+// 再乘 fast 的 ×2 —— 这正是上游对 1M 上下文的真实计价，账号成本统计必须跟着走，
+// 否则会把长上下文请求的成本系统性低估一半。
+func TestResolveAccountStatsCost_FallbackHonorsAnthropicLongContextLadder(t *testing.T) {
 	channel := &Channel{ID: 1, Status: StatusActive}
 	cs := newTestChannelServiceForStats(t, channel, 10, "anthropic")
 	bs := newTestBillingServiceWithPrices(map[string]*ModelPricing{
@@ -785,7 +819,32 @@ func TestResolveAccountStatsCost_FallbackHonorsAnthropicFast(t *testing.T) {
 		1, 0, "fast",
 	)
 	require.NotNil(t, result)
-	require.InDelta(t, 60, *result, 1e-12)
+	// 阶梯：input 5e-6→10e-6、output 25e-6→37.5e-6；
+	// 小计 1M×10e-6 + 1M×37.5e-6 = 47.5；再乘 fast 的 ×2 = 95。
+	require.InDelta(t, 95, *result, 1e-12)
+}
+
+// 同一条链路上不带档位的长上下文请求：只有阶梯生效，没有 ×2。
+// 与上面那条一起把「阶梯」和「档位」两个乘数分开钉住。
+func TestResolveAccountStatsCost_FallbackLongContextWithoutTier(t *testing.T) {
+	channel := &Channel{ID: 1, Status: StatusActive}
+	cs := newTestChannelServiceForStats(t, channel, 10, "anthropic")
+	bs := newTestBillingServiceWithPrices(map[string]*ModelPricing{
+		"claude-opus-5": {
+			InputPricePerToken:  5e-6,
+			OutputPricePerToken: 25e-6,
+		},
+	})
+
+	result := resolveAccountStatsCost(
+		context.Background(), cs, bs,
+		1, 10, "claude-opus-5",
+		UsageTokens{InputTokens: 1_000_000, OutputTokens: 1_000_000},
+		1, 0, "",
+	)
+	require.NotNil(t, result)
+	// 1M×10e-6 + 1M×37.5e-6 = 47.5，无档位倍率。
+	require.InDelta(t, 47.5, *result, 1e-12)
 }
 
 func TestResolveAccountStatsCost_Gemini36FlashTierUsesFallbackPricing(t *testing.T) {
