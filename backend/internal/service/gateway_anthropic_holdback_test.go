@@ -182,10 +182,13 @@ func TestAnthropicHoldbackVerdict(t *testing.T) {
 			discards: anthropicEmptyAnswerDiscardBudget,
 			want:     anthropicHoldbackRelease,
 		},
+		// 用常量表达而不是写死数字：这一条曾因为闸门从 128 抬到 320 而变成陈旧断言
+		// （outputTokens: 200 在 320 之下，早就不再"上量"了），红了一次没人发现。
 		{
 			name:       "token 上量的短正文是正常回答，放行",
-			stopReason: "end_turn", proseRunes: 131, outputTokens: 200,
-			want: anthropicHoldbackRelease,
+			stopReason: "end_turn", proseRunes: 131,
+			outputTokens: anthropicShortTurnOutputTokenLimit + 1,
+			want:         anthropicHoldbackRelease,
 		},
 		{
 			name:       "max_tokens 不是截断形态，放行",
@@ -212,11 +215,22 @@ func TestAnthropicHoldbackVerdict(t *testing.T) {
 			thinking: anthropicShortTurnThinkingRuneFloor - 1,
 			want:     anthropicHoldbackRelease,
 		},
+		// 越过 anthropicPostThinkingProseRuneCeiling 只是**关掉思考旁路**，不等于放行：
+		// 之后仍要过折算后的 token 闸门。思考 900 + 正文 600 时折算系数是 600/1500=0.4，
+		// out 必须大于 430/0.4≈1075 才算「说出来的部分够多」。
+		//
+		// 旧用例在这里写的是 prose=41 / out=577，折算只有 25，判定必然是可疑，却期望放行，
+		// 是一条从折算判据上线那天起就红着的陈旧断言。
 		{
-			name:       "思考很长但正文过了上限：是真答案，放行",
+			name:       "思考很长而正文与产出成比例：是真答案，放行",
+			stopReason: "end_turn", proseRunes: 600, outputTokens: 1200, thinking: 900,
+			want: anthropicHoldbackRelease,
+		},
+		{
+			name:       "思考很长而正文只是刚过旁路上限：折算后仍然可疑",
 			stopReason: "end_turn", proseRunes: anthropicPostThinkingProseRuneCeiling + 1,
 			outputTokens: 577, thinking: 900,
-			want: anthropicHoldbackRelease,
+			want: anthropicHoldbackDiscard,
 		},
 		// 账号 10 的另一形态（usage_logs id=9544）：上游把 usage 报成 0，而字节**确实**出去了。
 		// 旧代码在 output_tokens<=0 处无条件让位给残缺判定，可那边要求 visibleChars==0，于是
@@ -244,11 +258,11 @@ func TestAnthropicHoldbackVerdict(t *testing.T) {
 	}
 }
 
-// 观测器把「思考不算正文」和「窗口从原提交点起算」这两件事分开管。
+// 观测器把「思考不算正文」和「窗口量的是上游静默」这两件事分开管。
 //
 // 长思考 + 一句正文恰恰是要抓的形态，所以 thinking_delta 不得计入 proseRunes；但它**确实**
-// 是旧行为下的提交点，所以必须由它起算窗口——否则整段思考期都被攥着，客户端会长时间全黑
-// （keepalive 在 !streamCommitted 下不写字节）。
+// 是旧行为下的提交点，所以窗口从它之后才有资格起算——那之前的持流不是本机制新增的延迟。
+// 起算之后，计时起点是最后一帧有内容的 data，不是提交点：见 windowElapsed 的注释。
 func TestAnthropicHoldbackObserverSeparatesThinkingFromProse(t *testing.T) {
 	base := time.Date(2026, 8, 24, 1, 0, 0, 0, time.UTC)
 	o := &anthropicHoldbackObserver{}
@@ -263,7 +277,7 @@ func TestAnthropicHoldbackObserverSeparatesThinkingFromProse(t *testing.T) {
 	thinking := base.Add(10 * time.Millisecond)
 	o.observe(gjson.Parse(`{"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"我先想清楚因果链条"}}`), true, thinking)
 	require.Zero(t, o.proseRunes, "思考链不是正文")
-	require.Equal(t, thinking, o.firstCommitPointAt, "thinking_delta 是旧行为下的提交点，窗口从它起算")
+	require.Equal(t, thinking, o.firstCommitPointAt, "thinking_delta 是旧行为下的提交点，窗口从它之后才有资格起算")
 
 	o.observe(gjson.Parse(`{"type":"content_block_delta","index":1,"delta":{"type":"text_delta","text":"我看一下。"}}`), true, thinking.Add(time.Millisecond))
 	require.Equal(t, 5, o.proseRunes, "正文按 rune 数")
@@ -273,9 +287,64 @@ func TestAnthropicHoldbackObserverSeparatesThinkingFromProse(t *testing.T) {
 	require.Equal(t, "end_turn", o.stopReason)
 	require.Equal(t, 70, o.outputTokens, "message_delta 的终值必须盖掉 message_start 的初始值")
 
-	require.False(t, o.windowElapsed(thinking.Add(2999*time.Millisecond), 3*time.Second))
-	require.True(t, o.windowElapsed(thinking.Add(3*time.Second), 3*time.Second))
-	require.False(t, o.windowElapsed(thinking.Add(time.Hour), 0), "窗口配 0 时永不耗尽")
+	// 窗口从最后一帧有内容的 data 起算，不是从提交点起算。这里最后一帧是上面那条
+	// message_delta（thinking+2ms），比提交点晚 2ms。
+	last := thinking.Add(2 * time.Millisecond)
+	require.Equal(t, last, o.silenceSince(), "静默起点是最后一帧内容")
+	require.False(t, o.windowElapsed(last.Add(3*time.Second-time.Millisecond), 3*time.Second))
+	require.True(t, o.windowElapsed(last.Add(3*time.Second), 3*time.Second))
+	require.Equal(t, last.Add(3*time.Second), o.holdbackSilenceDeadline(3*time.Second))
+	require.False(t, o.windowElapsed(last.Add(time.Hour), 0), "窗口配 0 时永不耗尽")
+	require.True(t, o.holdbackSilenceDeadline(0).IsZero(), "窗口配 0 时没有截止时刻")
+
+	// 两套口径的分界就在这 2ms 上：旧实现从提交点起算总时长，会在 thinking+3s 判耗尽。
+	// 这条用例里差值只有 2ms，真实长思考回合里差的是整段思考时长，见
+	// TestAnthropicHoldbackObserverWindowMeasuresSilenceNotTotalHold。
+	require.False(t, o.windowElapsed(thinking.Add(3*time.Second), 3*time.Second),
+		"旧口径在这一刻判窗口耗尽，静默口径必须还没到")
+}
+
+// 2026-08-25 02:06:53 那一发的回归用例：帧还在持续到达时，窗口不得耗尽。
+//
+// 旧实现从 firstCommitPointAt 起算总时长，而 anthropicSSEPayloadCommitsResponse 把
+// thinking_delta 算作提交帧，于是长思考回合的窗口在思考期就走完、缓冲被无条件提交；等
+// stop_reason 到达、判定拿齐量的时候，字节已经出去了，再判「可疑」也只能给下一发解绑。
+func TestAnthropicHoldbackObserverWindowMeasuresSilenceNotTotalHold(t *testing.T) {
+	const window = 3 * time.Second
+	base := time.Date(2026, 8, 25, 2, 6, 0, 0, time.UTC)
+	o := &anthropicHoldbackObserver{}
+
+	// 每 500ms 一帧思考，连续 30 秒——十倍于窗口。
+	const frames, gap = 60, 500 * time.Millisecond
+	now := base
+	for i := 0; i < frames; i++ {
+		o.observe(gjson.Parse(`{"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"再想一层"}}`), true, now)
+		require.False(t, o.windowElapsed(now, window),
+			"第 %d 帧刚到就判窗口耗尽（已持流 %s）", i, now.Sub(base))
+		now = now.Add(gap)
+	}
+	require.Zero(t, o.proseRunes, "整段都是思考，没有正文")
+
+	// 上游真的静默满一个窗口，才认定等不起。
+	last := now.Add(-gap)
+	require.Greater(t, last.Sub(base), 9*window, "构造前提：持流总时长要远超一个窗口")
+	require.False(t, o.windowElapsed(last.Add(window-time.Millisecond), window))
+	require.True(t, o.windowElapsed(last.Add(window), window))
+}
+
+// ping 只证明连接活着，不证明上游还在产出，所以它不刷新静默起点——「上游吐了几句就长时间
+// 静默」正是要抓的形态，而中转在这种形态下往往还在按秒发 ping。
+func TestAnthropicHoldbackObserverPingDoesNotRefreshSilence(t *testing.T) {
+	const window = 3 * time.Second
+	base := time.Date(2026, 8, 25, 2, 6, 0, 0, time.UTC)
+	o := &anthropicHoldbackObserver{}
+
+	o.observe(gjson.Parse(`{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"我看一下。"}}`), true, base)
+	for i := 1; i <= 10; i++ {
+		o.observe(gjson.Parse(`{"type":"ping"}`), false, base.Add(time.Duration(i)*time.Second))
+	}
+	require.Equal(t, base, o.silenceSince(), "ping 不算内容，静默起点仍是那帧正文")
+	require.True(t, o.windowElapsed(base.Add(window), window), "只发 ping 等同静默，窗口照常耗尽")
 }
 
 // 还没到提交点就不该起算窗口，否则一条上游迟迟不吐内容的流会被判成「窗口已过」而丧失
@@ -597,6 +666,88 @@ func TestAnthropicPassthrough_HoldbackWindowTimeoutReleasesUndecidedTurn(t *test
 	var failoverErr *UpstreamFailoverError
 	require.False(t, errors.As(err, &failoverErr), "窗口到点是放行，不是丢弃重试")
 	require.Contains(t, rec.Body.String(), "先看一眼日志。", "窗口到点必须把攒下的帧放出去")
+}
+
+// pacedBody 按固定间隔逐个交出 SSE 事件，用来构造「帧一直在来、但总持流时长远超窗口」
+// 的流。stallThenEOF 构造的是相反的形态（先给完再长时间静默）。
+type pacedBody struct {
+	events []string
+	gap    time.Duration
+	buf    string
+	idx    int
+}
+
+func (p *pacedBody) Read(dst []byte) (int, error) {
+	if p.buf == "" {
+		if p.idx >= len(p.events) {
+			return 0, io.EOF
+		}
+		time.Sleep(p.gap)
+		// SSE 的事件终止符是空行，所以每个事件后面跟两个换行。
+		p.buf = p.events[p.idx] + "\n\n"
+		p.idx++
+	}
+	n := copy(dst, p.buf)
+	p.buf = p.buf[n:]
+	return n, nil
+}
+
+func (p *pacedBody) Close() error { return nil }
+
+// 2026-08-25 02:06:53 那一发的端到端回归：长思考回合里帧一直在来，总持流时长是窗口的
+// 一倍半，但任何相邻两帧之间都没有静默满一个窗口。
+//
+// 旧实现从首个提交帧起算**总时长**，而 anthropicSSEPayloadCommitsResponse 把
+// thinking_delta 算作提交帧，于是定时器在思考期间就开火、无条件 flushPendingPrelude()：
+// 字节出去、200 钉死，等 stop_reason 到达时判定虽然照旧判可疑，也只来得及给下一发解绑。
+// 改成静默口径之后定时器只是唤醒器，开火后复核发现帧还在来就续期，判定得以等到 stop_reason。
+func TestAnthropicPassthrough_HoldbackSurvivesLongThinkingWithoutExposure(t *testing.T) {
+	const sessionKey = "holdback-long-thinking"
+	const groupID = int64(1)
+	const windowMs = 500
+	const gap = 30 * time.Millisecond
+	cache := newShortTurnStreakCache(sessionKey, 10)
+	svc, repo := newHoldbackTestGatewayService(t, cache, windowMs)
+
+	events := []string{
+		`data: {"type":"message_start","message":{"usage":{"input_tokens":129000,"output_tokens":2}}}`,
+		`data: {"type":"content_block_start","index":0,"content_block":{"type":"thinking","thinking":""}}`,
+	}
+	// 20 帧思考，单帧间隔只有窗口的 6%，整段思考期却是窗口的 1.2 倍。
+	for i := 0; i < 20; i++ {
+		events = append(events, fmt.Sprintf(
+			`data: {"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":%q}}`,
+			"我得先想清楚这里的因果链条。"))
+	}
+	// 收尾是 16:42:55 那一发的形态：思考 280 rune，正文只有 "d." 两个字符。
+	events = append(events,
+		`data: {"type":"content_block_start","index":1,"content_block":{"type":"text","text":""}}`,
+		`data: {"type":"content_block_delta","index":1,"delta":{"type":"text_delta","text":"d."}}`,
+		`data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":577}}`,
+		`data: {"type":"message_stop"}`,
+	)
+	resp := &http.Response{
+		StatusCode: http.StatusOK,
+		Header:     http.Header{"Content-Type": []string{"text/event-stream"}},
+		Body:       &pacedBody{events: events, gap: gap},
+	}
+
+	started := time.Now()
+	rec, c, err := runHoldbackPassthrough(t, svc, groupID, sessionKey, 10, resp, nil)
+	require.Greater(t, time.Since(started), windowMs*time.Millisecond,
+		"构造前提：持流总时长必须超过一个窗口，否则这条用例退化成快流、验不出续期")
+
+	var failoverErr *UpstreamFailoverError
+	require.True(t, errors.As(err, &failoverErr), "帧还在来就不该放行，判定必须等到 stop_reason")
+	require.Equal(t, GatewayFailureReason("anthropic_short_turn_holdback"), failoverErr.Reason)
+	require.True(t, failoverErr.ShouldRetryNextAccount())
+
+	// 零暴露：这是整条用例的重点。旧口径下这里会拿到那段思考的字节。
+	require.Empty(t, rec.Body.String(), "判定成形之前一个字节都不能写给客户端")
+	require.False(t, c.Writer.Written())
+	require.Equal(t, 1, anthropicHoldbackDiscardsUsed(c))
+	require.Zero(t, repo.tempCalls, "持流丢弃不得罚号")
+	require.Equal(t, 1, cache.deletedSessions[sessionKey], "丢弃必须同时解绑")
 }
 
 // 2026-08-24 16:42:55 / 16:51:15 两发的端到端复现（usage_logs id=9514 out=577、

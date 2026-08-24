@@ -202,11 +202,15 @@ func TestAnthropicTurnLooksSuspiciouslyShort(t *testing.T) {
 		// 19:46:49 实证形态：思考 454 / 正文 114 / out 286，宣布下一步就收尾。
 		// 286 > 128 让原值闸门免检，折算后 57 才判得住。
 		{"想很久+正文上百 rune 仍算可疑", "end_turn", 114, 286, false, true, 454},
-		// 折算不能吃掉真正的成段回答。闸门 320 时，thinking 900/out 1000 要正文过
-		// ~424 rune 折算值才够 320，所以放行的门槛落在 500 rune 这一带（折算 357）。
+		// 折算不能吃掉真正的成段回答。闸门 430 时，thinking 900/out 1000 要正文过
+		// ~682 rune 折算值才够 430，所以放行的门槛落在 700 rune 这一带（折算 437）。
 		// 这才是「思考很长但正文成段是真答案」想守的性质；正文退到 300 rune（折算 250）
 		// 归可疑带，与 anthropicTurnProvesUpstreamHealthy 那侧同口径，两者互否。
-		{"思考很长且正文成段是真答案", "end_turn", 500, 1000, false, false, 900},
+		//
+		// 闸门 320 时这两行写的是 500（折算 357）/300，抬到 430 之后 500 落进可疑带，
+		// 是刻意的：这一带就是 22:20:13 那一类要收进来的形态。
+		{"思考很长且正文成段是真答案", "end_turn", 700, 1000, false, false, 900},
+		{"思考很长但正文只到 500 rune 仍可疑", "end_turn", 500, 1000, false, true, 900},
 		{"思考很长但正文只到 300 rune 仍可疑", "end_turn", 300, 1000, false, true, 900},
 		{"思考很长正文刚过健康下限仍可疑", "end_turn", 260, 800, false, true, 900},
 		// 思考判据不该松掉别的闸门：tool_use 和非 end_turn 收尾一律照旧放行。
@@ -645,10 +649,11 @@ func TestAnthropicTurnProvesUpstreamHealthy(t *testing.T) {
 		// anthropicShortTurnOutputTokenLimit 上那段网格结论（漏判 27→12，误报恒为 4）。
 		{"out=133/正文 210 字现在归可疑带，不再清零", "end_turn", 210, 133, false, 0, false},
 
-		// 折算对这一侧同样生效。thinking 900 时正文要过 ~424 rune 才够 320，
+		// 折算对这一侧同样生效。thinking 900 时正文要过 ~682 rune 才够 430，
 		// 这是「思考很长但确实写了成段正文」的正面证据形态。
-		{"思考很长但正文成段仍是正面证据", "end_turn", 500, 1000, false, 900, true},
-		// 同一组 out/thinking，正文退到 300 就落进可疑带（折算 250），不能清零。
+		{"思考很长但正文成段仍是正面证据", "end_turn", 700, 1000, false, 900, true},
+		// 同一组 out/thinking，正文退到 500/300 都落进可疑带（折算 357/250），不能清零。
+		{"思考很长而正文只到 500 rune 不清零", "end_turn", 500, 1000, false, 900, false},
 		{"思考很长而正文只到 300 rune 不清零", "end_turn", 300, 1000, false, 900, false},
 
 		{"tool_use 回合一律不表态，正文再长也不清零", "end_turn", longProse, manyTokens, true, 0, false},

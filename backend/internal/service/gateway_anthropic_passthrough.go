@@ -587,14 +587,35 @@ const (
 	//
 	// 2026-08-24 再从 400 放到 800：400 之上完全免检，而实测截断里正文 446~2325 rune
 	// 的有 9 发（12:20:23 prose 529、14:15:48 prose 592、14:20:13 prose 813 等），
-	// 全都是「宣布下一步就 end_turn、零 tool_use」的形态。放宽的代价用 150 发带标样本
-	// 量过：T×P 网格里误报数在 T=128..448 / P=400..4000 整片区间恒为 4，放宽不新增误报，
-	// 漏判则从 27 降到 12。
+	// 全都是「宣布下一步就 end_turn、零 tool_use」的形态。
 	//
-	// 没有取网格最优的 P=4000：负样本只有 15 发，其中 12 发正文集中在 838~2079 rune，
-	// 400~800 这一带的正常回答样本几乎是空的，那片「误报恒为 4」的平台更可能是样本没
-	// 覆盖到、而不是真的无风险。800 之下有实测截断支撑，之上不碰那 12 发长回答一簇。
-	anthropicShortTurnProseRuneLimit = 800
+	// 2026-08-25 再从 800 放到 1300，同时把 anthropicShortTurnOutputTokenLimit 抬到 430。
+	// 前一次标定的样本标签是坏的：它把「Stop hook 把任务推回来」也算成截断证据，而 Stop
+	// hook 在每一次 assistant 停下时都会触发，与截断无关，于是 168 发里有 140 发被标成正样本，
+	// 网格上误报数恒为 7、看不出任何结构。只保留**真人**下一条消息作判据重标之后是
+	// 92 正 / 17 负 / 62 无标，网格（漏判/误报）才出现平台：
+	//
+	//	        P=800  P=900  P=1000  P=1200  P=1300  P=1400  P=1600  P=2000
+	//	T=320    6/2    6/2    6/2     6/2     6/2     6/2     6/2     6/2
+	//	T=400    5/2    5/2    5/2     4/2     4/2     4/2     4/2     4/2
+	//	T=410    5/2    4/2    4/2     3/2     3/2     3/2     3/2     3/2
+	//	T=430    5/2    4/2    4/2     3/2     3/2     3/2     3/2     3/2
+	//	T=460    5/2    4/2    4/2     3/2     3/2     3/2     3/2     3/2
+	//	T=480    5/2    4/3    4/3     3/3     3/3     3/3     3/3     3/3
+	//
+	// 取 T=430 / P=1300 是平台中点：T 在 [410,460] 内误报不变，480 起才开始吃负样本；
+	// P 只要 ≥1200 就够，1300 留一点余量。两个 FP 不是这次放宽引入的——它们在今天的
+	// T=320 下**已经**被判可疑（out=42/prose=52，下一条是 `/goal`；out=112/prose=222，
+	// 下一条是「版本还是 0.1.179，不变就好」），两发都是真短回答被当成截断，放宽一发未增。
+	//
+	// 新抓到的三发正是要治的那一类：out=337/prose=675、out=380/prose=1170（17:02:33 断流）、
+	// out=402/prose=813（22:20:13 断流）。剩下 3 发漏判（prose 1757/1788/2325）不再追：
+	// 它们的下一条真人消息都是接着问实质问题，说明上一发其实答完了，标签本身可疑。
+	//
+	// 为什么不继续往 P=2000 推：17 发可靠负样本里 15 发的 out 落在 461 以上，正文却铺满
+	// 1000~2300 这一带，也就是说这一带的分辨力全部来自 token 闸门、正文上限在这里不提供
+	// 任何信息。把 P 推到负样本正文中位数之上只是让判定更依赖 T 单点，不增收益。
+	anthropicShortTurnProseRuneLimit = 1300
 	// anthropicShortTurnOutputTokenLimit 判定「短回合」的输出 token 上限。
 	//
 	// 单靠正文长度分不开两类回合，token 数才是干净的分界：同一批样本里所有截断的
@@ -609,14 +630,23 @@ const (
 	// 320 对 15 发正常样本仍有余量——它们的 out 是 461~1718 那一簇，最小的 3 发
 	// （out=123/42/16）在 128 时就已经判可疑，不是这次放宽新增的。
 	//
+	// 2026-08-25 再从 320 放到 430。依据是同一次重标之后的网格（完整网格与标签修正过程见
+	// anthropicShortTurnProseRuneLimit）：T 在 [410,460] 这一段漏判恒为 3、误报恒为 2，
+	// T=480 起误报才涨到 3。430 取这段的中点，两侧各留 20 token 余量。
+	//
+	// 边界仍然干净：17 发可靠负样本里 15 发的 out ≥461，也就是全部落在 460 之外；余下 2 发
+	// （out=42/prose=52、out=112/prose=222）在今天的 320 下**已经**被判可疑，是既有误报，
+	// 不是这次抬闸门新增的。新收进来的是 out=337/380/402 那三发实测截断，其中 out=402/
+	// prose=813 正是 22:20:13 那一发。
+	//
 	// 注意比的不是 output_tokens 原值，而是 anthropicVisibleOutputTokens 折算出的
 	// 「说出来的那部分」：原值含思考 token，思考一长就把闸门顶穿。标定这个阈值的样本
 	// 全是无思考回合，折算在那种回合上恒等于原值，所以标定仍然成立。
-	anthropicShortTurnOutputTokenLimit = 320
+	anthropicShortTurnOutputTokenLimit = 430
 	// anthropicHealthyTurnMinProseRunes 清零连击所需的最小正文长度，单位 rune。
 	//
-	// 刻意比 anthropicShortTurnProseRuneLimit 低（800 vs 200）：两者之间那一段
-	// （201~800 rune 且 token 数不小）既不算可疑、也不算「说完了」，一律不表态。
+	// 刻意比 anthropicShortTurnProseRuneLimit 低（1300 vs 200）：两者之间那一段
+	// （201~1300 rune 且 token 数不小）既不算可疑、也不算「说完了」，一律不表态。
 	// 留这条中间带是因为清零是**否掉已积累证据**的动作，宁可保守。
 	anthropicHealthyTurnMinProseRunes = 200
 	// anthropicShortTurnStreakThreshold 连续多少发才解绑。
@@ -765,12 +795,16 @@ type anthropicHoldbackObserver struct {
 	stopReason         string
 	sawToolUseBlock    bool
 	firstCommitPointAt time.Time
+	// lastContentFrameAt 是最后一帧**有内容**的 SSE data 的到达时刻，窗口靠它度量静默。
+	// ping 刻意不计入：它只证明连接活着，不证明上游还在产出，正是要判为「静默」的形态。
+	lastContentFrameAt time.Time
 }
 
 // observe 吃下一帧已解析的 SSE data。commits 是这一帧在旧行为下会不会提交响应，
 // now 由调用方传入，便于测试注入时钟。
 func (o *anthropicHoldbackObserver) observe(parsed gjson.Result, commits bool, now time.Time) {
-	switch strings.TrimSpace(parsed.Get("type").String()) {
+	frameType := strings.TrimSpace(parsed.Get("type").String())
+	switch frameType {
 	case "message_delta":
 		if r := strings.TrimSpace(parsed.Get("delta.stop_reason").String()); r != "" {
 			o.stopReason = r
@@ -791,21 +825,74 @@ func (o *anthropicHoldbackObserver) observe(parsed gjson.Result, commits bool, n
 			}
 		}
 	}
-	// 窗口从「旧行为下本会提交的那一帧」起算。这样窗口度量的正好是本次改动**新增**的
-	// 延迟，在它之前的持流（message_start / ping / 空思考块 / signature）本来就存在。
-	// 思考模式下这一帧是第一个 thinking_delta，所以长思考回合最多被推迟一个窗口就放行，
-	// 不会出现「整段思考期客户端全黑」——那期间 keepalive 在 !streamCommitted 下不写字节。
+	// firstCommitPointAt 只用来判断「窗口该不该开始计时」，不再是计时的起点：还没到旧行为
+	// 下的提交点时，持流没有新增任何延迟，窗口无从谈起。思考模式下这一帧是第一个
+	// thinking_delta。
 	if commits && o.firstCommitPointAt.IsZero() {
 		o.firstCommitPointAt = now
 	}
+	if frameType != "ping" {
+		o.lastContentFrameAt = now
+	}
 }
 
-// windowElapsed 判断持流窗口是否已耗尽。还没到原提交点时永不算耗尽。
+// silenceSince 给出「上游静默从什么时候开始算」。返回零值表示窗口还没起算。
+//
+// 两个下界取晚的那个：lastContentFrameAt 是真正的静默起点，而 firstCommitPointAt 保证
+// 在旧行为下本会提交的那一帧之前永不起算——那之前的持流（message_start / ping / 空思考块 /
+// signature）本来就存在，不是本机制新增的延迟。
+func (o *anthropicHoldbackObserver) silenceSince() time.Time {
+	if o.firstCommitPointAt.IsZero() {
+		return time.Time{}
+	}
+	if o.lastContentFrameAt.Before(o.firstCommitPointAt) {
+		return o.firstCommitPointAt
+	}
+	return o.lastContentFrameAt
+}
+
+// windowElapsed 判断持流窗口是否已耗尽。
+//
+// 度量的是**上游静默多久**，不是持流总共多久。这个区别就是 2026-08-25 02:06:53 那一发
+// 截断的根因：旧实现从 firstCommitPointAt 起算总时长，而
+// anthropicSSEPayloadCommitsResponse 把 thinking_delta 算作提交帧，于是长思考回合的窗口
+// 在**思考期间**就走完了。那一发 thinking 3934 rune / 正文 174 rune / output_tokens 1059，
+// 折算可见 44 token，判据齐了之后判定必然是「可疑」——但窗口早在 stop_reason 到达前耗尽，
+// case <-holdbackCh 已经无条件把缓冲提交给客户端，判定只赶得上给下一发解绑。阈值怎么调都
+// 治不了这一类，因为它压根没走到判定那一步。
+//
+// 改成静默口径之后：帧还在持续到达就说明上游没卡住、判定量还在路上，不放行；只有真的静默
+// 满一个窗口（也就是这个机制从一开始就说的「上游吐了几句就长时间静默」）才认定等不起。
+//
+// 代价是长思考回合在拿到 stop_reason 之前客户端一个字节都收不到（keepalive 在
+// !streamCommitted 下不写字节）。这是零暴露的必然价格：任何写给客户端的字节都会钉死
+// HTTP 200、断掉换号重试的可能。上界由 gateway.stream_data_interval_timeout 兜着，
+// 而正文一旦超过 anthropicShortTurnProseRuneLimit 就提前放行，长回答不会一直攥到最后。
 func (o *anthropicHoldbackObserver) windowElapsed(now time.Time, window time.Duration) bool {
-	if window <= 0 || o.firstCommitPointAt.IsZero() {
+	if window <= 0 {
 		return false
 	}
-	return now.Sub(o.firstCommitPointAt) >= window
+	since := o.silenceSince()
+	if since.IsZero() {
+		return false
+	}
+	return now.Sub(since) >= window
+}
+
+// holdbackSilenceDeadline 给出「再静默到什么时刻就该放行」。返回零值表示窗口还没起算。
+//
+// 给 select 里的定时器分支用：定时器 arm 之后按固定时长走，帧还在到达时也会开火，所以
+// 开火后拿这个时刻复核——没到就按差值续期，到了才放行。判据只有这一处口径，和
+// windowElapsed 共用 silenceSince，不会出现「定时器认为到点、判定认为没到」的分歧。
+func (o *anthropicHoldbackObserver) holdbackSilenceDeadline(window time.Duration) time.Time {
+	if window <= 0 {
+		return time.Time{}
+	}
+	since := o.silenceSince()
+	if since.IsZero() {
+		return time.Time{}
+	}
+	return since.Add(window)
 }
 
 // anthropicTurnLooksSuspiciouslyShort 判定这一回合是否为「协议合法但疑似没把话说完」。
@@ -1583,6 +1670,10 @@ func (s *GatewayService) handleStreamingResponseAnthropicAPIKeyPassthrough(
 	holdback := &anthropicHoldbackObserver{}
 	// 独立定时器，不复用 keepalive：窗口是毫秒级而 keepalive 默认 10 秒，靠它兜底会让
 	// 「上游吐了两句就长时间静默」的流白等十秒。定时器在首帧可见增量到达时才 arm。
+	//
+	// 定时器只是**唤醒器**，判据由 holdback.windowElapsed 单独持有：窗口量的是静默时长，
+	// 而定时器一旦 arm 就按固定时长走，帧还在到达时它照样会开火。所以开火之后必须复核，
+	// 复核不通过就按剩余静默时间续期，见 case <-holdbackCh。
 	var holdbackTimer *time.Timer
 	var holdbackCh <-chan time.Time
 	armHoldbackTimer := func() {
@@ -1864,10 +1955,23 @@ func (s *GatewayService) handleStreamingResponseAnthropicAPIKeyPassthrough(
 			processLine(line)
 
 		case <-holdbackCh:
-			// 持流窗口到点：判定要的 stop_reason 始终没来（上游吐了几句就长时间静默），
-			// 不能让客户端为一个启发式白等，原样放行。
+			// 定时器只是唤醒器，判据在 holdback.holdbackSilenceDeadline 手里：窗口量的是
+			// **静默**时长，而定时器 arm 之后按固定时长走，帧还在源源到达时它照样开火。
+			// 所以开火先复核，静默没满就按剩余时间续期、继续持流；只有真的静默满一个窗口
+			// （判定要的 stop_reason 始终没来）才认定等不起，原样放行。
 			holdbackCh = nil
-			if !streamCommitted {
+			now := time.Now()
+			deadline := holdback.holdbackSilenceDeadline(holdbackWindow)
+			switch {
+			case streamCommitted:
+				// 已经提交过，窗口没有可做的事。
+			case !deadline.IsZero() && now.Before(deadline):
+				if holdbackTimer != nil {
+					// 定时器已经开火、通道已被取空，Reset 前不需要再 Stop+drain。
+					holdbackTimer.Reset(deadline.Sub(now))
+					holdbackCh = holdbackTimer.C
+				}
+			default:
 				flushPendingPrelude()
 				if !clientDisconnected {
 					flusher.Flush()
