@@ -748,6 +748,18 @@ const (
 // 死气吃满时换号是纯亏——客户端已经等了整个预算，新尝试的三条线全部归零、又要从头等一遍，
 // 这正是 14:33:58 那一发跨 3 次尝试攥到 60 秒的成因。此时宁可把疑似截断的内容交出去：
 // 截断至少还有 noteAnthropicShortTurnStreak 给下一发解绑兜着，断流则是整发白丢。
+//
+// blockOrderViolation 是唯一一条**排在所有提前放行出口之前**的判据，而且刻意不受
+// deadAirExhausted 否决。理由是这一条与其余判据的性质不同：
+//   - 其余判据是启发式，量的是「这一回合看起来是不是没说完」，误判就会误伤健康账号，
+//     所以要让位给延迟；块序违规是协议层的确定性矛盾，为它换号不存在误伤成本。
+//   - 交付一条块序违规的响应不是「答案短了点」，而是把伪造的工具输出交给客户端。Claude Code
+//     这类客户端会当真去用它，用户只能人工发现并纠正（本次就是这么暴露的），代价远高于
+//     多等一次尝试。额度封在 anthropicBlockOrderDiscardBudget=2，最坏也只是多等两次。
+//
+// 它必须排在 sawToolUseBlock 与正文上限这两个提前放行出口之前：违规回合完全可以带工具块，
+// 也完全可以带超过 1300 rune 的长正文（21:25:40 那一发 872 rune，同类更长的也见得到），
+// 排在后面就会被提前放行短路掉，等于没加。
 func anthropicHoldbackVerdict(
 	releaseDeadlineElapsed bool,
 	deadAirExhausted bool,
@@ -757,7 +769,11 @@ func anthropicHoldbackVerdict(
 	sawToolUseBlock bool,
 	discardsUsed int,
 	thinkingRunes int,
+	blockOrderViolation bool,
 ) anthropicHoldbackDecision {
+	if blockOrderViolation && discardsUsed < anthropicBlockOrderDiscardBudget {
+		return anthropicHoldbackDiscard
+	}
 	if sawToolUseBlock {
 		return anthropicHoldbackRelease
 	}
@@ -794,6 +810,55 @@ func anthropicHoldbackDiscardBudget(
 	return anthropicShortTurnDiscardBudget
 }
 
+// anthropicBlockOrderDiscardBudget 是块序违规这一档在一次客户端请求里允许丢弃的次数。
+//
+// 与另外两档共用同一个计数器 holdbackDiscardsUsed，各自比自己的上限。给 2 而不是更多：
+// 违规是确定性判据、不存在「本来就该这样」的合法解释，理论上一次换号就够；留第二次是为了
+// 跨过连续两个坏号（短回合那一档实测最长连击就是 2）。额度耗尽后退化成放行 + 事后归因，
+// 不会把池子掏空成 502。
+const anthropicBlockOrderDiscardBudget = 2
+
+// anthropicContentBlockOrderTracker 按 content_block_start 的到达顺序判定块序违规。
+//
+// 判据只有一条：thinking / redacted_thinking 块出现在 text 块**之后**。Anthropic 的
+// 扩展思考协议里思考块永远排在正文之前（同一条 assistant 消息内 thinking 先于 text，
+// 客户端把 thinking 当作正文的前置推理来渲染），所以「text 之后又冒出 thinking」不是一种
+// 合法形态，只能是上游把多次生成的块拼错了序，或者把别的响应的碎片混了进来。
+//
+// 为什么要专门认这一条：2026-08-25 21:25:40 那一发（账号 9，msg_7d59435a-…，
+// stop_reason=end_turn、591 output_tokens、HTTP 200）的块序正是 text / thinking / text，
+// 第一个 text 块是伪造的工具输出（"Tool results:\n\n[Bash] SYNTAX OK…"），末块开头是
+// 乱码。这种响应在协议层完全合法：有 message_stop、有 stop_reason、正文 872 rune 远超
+// 短回合上限，既有的启发式判据（anthropicTurnLooksSuspiciouslyShort / 正文上限）全部放行，
+// 网关此前对它一无所知。
+//
+// 误报面实测：6 份对话共 1443 条 assistant 消息里块序违规只出现 5 次，其中 4 次是已确认的
+// 伪造回合，剩下 1 次是 msg_bdrk_* 前缀的合法响应。而 Bedrock 走的是
+// handleBedrockStreamingResponse 这条独立链路，两个跟踪点（透传链路的持流观测器 + 常规流式
+// 链路的事后归因）都碰不到它，所以那唯一一例合法形态在这两条链路上根本不会出现。判据在它
+// 实际生效的范围内是确定性的，不是概率启发式。
+type anthropicContentBlockOrderTracker struct {
+	sawTextBlock bool
+	violated     bool
+}
+
+// note 吃下一个 content_block_start 的块类型。大小写不敏感，空串忽略。
+func (t *anthropicContentBlockOrderTracker) note(blockType string) {
+	switch strings.ToLower(strings.TrimSpace(blockType)) {
+	case "text":
+		t.sawTextBlock = true
+	case "thinking", "redacted_thinking":
+		if t.sawTextBlock {
+			t.violated = true
+		}
+	}
+}
+
+// violation 报告本条消息是否已经出现块序违规。一旦置位就不再回落。
+func (t *anthropicContentBlockOrderTracker) violation() bool {
+	return t != nil && t.violated
+}
+
 // anthropicHoldbackObserver 在持流期间独立采集判定量。
 //
 // 必须与 handleStreamingResponseAnthropicAPIKeyPassthrough 里的累加器分开：那些量由
@@ -805,6 +870,7 @@ type anthropicHoldbackObserver struct {
 	outputTokens       int
 	stopReason         string
 	sawToolUseBlock    bool
+	blockOrder         anthropicContentBlockOrderTracker
 	firstCommitPointAt time.Time
 	// lastContentFrameAt 是最后一帧**有内容**的 SSE data 的到达时刻，窗口靠它度量静默。
 	// ping 刻意不计入：它只证明连接活着，不证明上游还在产出，正是要判为「静默」的形态。
@@ -824,7 +890,9 @@ func (o *anthropicHoldbackObserver) observe(parsed gjson.Result, commits bool, n
 			o.stopReason = r
 		}
 	case "content_block_start":
-		if strings.EqualFold(strings.TrimSpace(parsed.Get("content_block.type").String()), "tool_use") {
+		blockType := strings.TrimSpace(parsed.Get("content_block.type").String())
+		o.blockOrder.note(blockType)
+		if strings.EqualFold(blockType, "tool_use") {
 			o.sawToolUseBlock = true
 		}
 	}
@@ -1400,6 +1468,85 @@ func (s *GatewayService) reportAnthropicShortTurnUnbind(
 	}
 }
 
+const anthropicBlockOrderViolationUpstreamMessage = "Anthropic upstream emitted content blocks out of protocol order"
+
+// unbindStickySessionNow 立刻删掉会话到账号的亲和记录，不看短回合连击阈值。
+//
+// 与 noteAnthropicShortTurnStreak 的分工：那个是给启发式判据用的，单发可疑不足以定罪，
+// 所以要先攒连击到 anthropicShortTurnStreakThreshold 才解绑。确定性判据（块序违规）没有
+// 「攒证据」这一步，一次就该解绑，不能受那个阈值常量的取值影响——今天它是 1、两者行为恰好
+// 相同，但把确定性判据挂在一个随时可能被调大的启发式阈值上是错的耦合。
+//
+// 解绑后同样把连击计数清零：坏号已经被摘掉，下一发落到好号上答一句短话不该立刻又达标。
+func (s *GatewayService) unbindStickySessionNow(ctx context.Context, account *Account, model, reason string) bool {
+	if account == nil || s.cache == nil {
+		return false
+	}
+	groupID, sessionKey, ok := StickySessionScopeFromContext(ctx)
+	if !ok {
+		return false
+	}
+	if err := s.cache.DeleteSessionAccountID(ctx, groupID, sessionKey); err != nil {
+		slog.Warn("sticky_unbind_failed", "account_id", account.ID, "reason", reason, "error", err)
+		return false
+	}
+	if store, ok := s.cache.(stickyShortTurnStreakStore); ok {
+		if err := store.ResetStickyShortTurnStreak(ctx, groupID, sessionKey); err != nil {
+			slog.Warn("sticky_short_turn_reset_failed", "account_id", account.ID, "error", err)
+		}
+	}
+	slog.Warn("sticky_unbound",
+		"account_id", account.ID, "account_name", account.Name, "model", model, "reason", reason)
+	return true
+}
+
+// reportAnthropicBlockOrderViolation 归因并冷却「块序违规」的账号。
+//
+// 判据见 anthropicContentBlockOrderTracker：thinking 块出现在 text 块之后，协议上不可能。
+//
+// 为什么一次就罚，与空回合同档而不是走短回合的连击：块序违规是确定性矛盾，不存在「用户问的
+// 问题本来就该这样答」这类合法解释，攒连击只会让第二发也吃到伪造输出。实测误报面 1/5，
+// 且那 1 次是 msg_bdrk_* 前缀的另一个上游实现，不在本网关的坏号池里。
+//
+// 走同一个 HandleStreamTruncated / stream_timeout_settings：对客户端的后果与截断同类
+// （拿到一条不能用的响应），运维只需一个旋钮，ops 看板上用 Kind 区分归因。
+//
+// 调用点两处，覆盖「拦下来了」和「没拦住」两种结局：持流丢弃分支（disposition=discarded，
+// 客户端零暴露）与 reportIfTerminalButIncomplete（disposition=delivered，持流关闭/窗口
+// 耗尽/丢弃额度已用，响应已经交付）。两处都与另外两个报告器互斥：共用一个计数窗口，
+// 同一次故障不能记两次。
+func (s *GatewayService) reportAnthropicBlockOrderViolation(
+	ctx context.Context, c *gin.Context, resp *http.Response, account *Account, model string,
+	proseRunes, outputTokens int, stopReason, disposition string,
+) {
+	if account == nil {
+		return
+	}
+	upstreamRequestID := ""
+	if resp != nil {
+		upstreamRequestID = resp.Header.Get("x-request-id")
+	}
+	detail := fmt.Sprintf("stop_reason=%s prose_runes=%d output_tokens=%d disposition=%s violation=thinking_after_text",
+		stopReason, proseRunes, outputTokens, disposition)
+	appendOpsUpstreamError(c, OpsUpstreamErrorEvent{
+		Platform:           account.Platform,
+		AccountID:          account.ID,
+		AccountName:        account.Name,
+		UpstreamStatusCode: http.StatusBadGateway,
+		UpstreamRequestID:  upstreamRequestID,
+		Kind:               "block_order_violation",
+		Message:            anthropicBlockOrderViolationUpstreamMessage,
+		Detail:             detail,
+	})
+	slog.Warn("anthropic_block_order_violation",
+		"account_id", account.ID, "account_name", account.Name, "model", model,
+		"stop_reason", stopReason, "prose_runes", proseRunes, "output_tokens", outputTokens,
+		"disposition", disposition, "upstream_request_id", upstreamRequestID)
+	if s.rateLimitService != nil {
+		s.rateLimitService.HandleStreamTruncated(ctx, account, model)
+	}
+}
+
 // reportStreamIncompleteAfterCommit 记录「协议层收尾了但内容不完整」。
 //
 // 与 reportStreamTruncatedAfterCommit 并列，区别只在判定依据：那边是流断在半路
@@ -1634,6 +1781,62 @@ func (s *GatewayService) newAnthropicShortTurnFailoverError(
 	}
 }
 
+func anthropicBlockOrderHoldbackErrorBody() []byte {
+	body, err := json.Marshal(map[string]any{
+		"type": "error",
+		"error": map[string]any{
+			"type":    "upstream_error",
+			"code":    "anthropic_block_order_violation",
+			"message": anthropicBlockOrderViolationUpstreamMessage,
+		},
+	})
+	if err != nil {
+		return []byte(`{"type":"error","error":{"type":"upstream_error","code":"anthropic_block_order_violation","message":"Anthropic upstream emitted content blocks out of protocol order"}}`)
+	}
+	return body
+}
+
+// newAnthropicBlockOrderFailoverError 把「块序违规且提交窗口仍完好」标记为可 failover 的
+// 上游异常，让这条响应在写给客户端之前就被换号重试掉。
+//
+// 与 newAnthropicShortTurnFailoverError 同一套语义（请求域瞬时失败、带上游响应头、
+// 记一次 holdback discard），只在 Kind / code / 文案上区分，好让 ops 看板能把「伪造回合」
+// 这一类单独统计出来——它和短回合的根因不同，混在一起就看不出某个上游是不是在拼错块序。
+func (s *GatewayService) newAnthropicBlockOrderFailoverError(
+	c *gin.Context, resp *http.Response, account *Account, model string, proseRunes, outputTokens int, stopReason string,
+) *UpstreamFailoverError {
+	noteAnthropicHoldbackDiscard(c)
+	upstreamRequestID := ""
+	headers := http.Header{}
+	if resp != nil {
+		upstreamRequestID = resp.Header.Get("x-request-id")
+		headers = resp.Header.Clone()
+	}
+	appendOpsUpstreamError(c, OpsUpstreamErrorEvent{
+		Platform:           account.Platform,
+		AccountID:          account.ID,
+		AccountName:        account.Name,
+		UpstreamStatusCode: http.StatusBadGateway,
+		UpstreamRequestID:  upstreamRequestID,
+		Kind:               "block_order_holdback_failover",
+		Message:            anthropicBlockOrderViolationUpstreamMessage,
+		Detail: fmt.Sprintf("stop_reason=%s prose_runes=%d output_tokens=%d violation=thinking_after_text",
+			stopReason, proseRunes, outputTokens),
+	})
+	slog.Warn("anthropic_block_order_holdback_failover",
+		"account_id", account.ID, "account_name", account.Name, "model", model,
+		"stop_reason", stopReason, "prose_runes", proseRunes, "output_tokens", outputTokens,
+		"upstream_request_id", upstreamRequestID)
+	return &UpstreamFailoverError{
+		StatusCode:             http.StatusBadGateway,
+		ResponseBody:           anthropicBlockOrderHoldbackErrorBody(),
+		ResponseHeaders:        headers,
+		Scope:                  GatewayFailureScopeRequest,
+		RequestScopedTransient: true,
+		Reason:                 GatewayFailureReason("anthropic_block_order_violation"),
+	}
+}
+
 func (s *GatewayService) buildUpstreamRequestAnthropicAPIKeyPassthrough(
 	ctx context.Context,
 	c *gin.Context,
@@ -1762,6 +1965,11 @@ func (s *GatewayService) handleStreamingResponseAnthropicAPIKeyPassthrough(
 	thinkingRunes := 0
 	sawContentBlockStart := false
 	sawToolUseBlock := false
+	// blockOrder 与 holdback.blockOrder 是两份独立的跟踪器，理由同 anthropicHoldbackObserver
+	// 的注释：持流期的帧要等 flushPendingPrelude 重放才过 processLine，共用会重复观测。
+	// 这一份负责「没被持流拦住」的结局——持流关了、窗口耗尽、或丢弃额度已用完时，响应已经
+	// 交付，只能事后解绑 + 罚号，让下一发绕开这个号。
+	var blockOrder anthropicContentBlockOrderTracker
 
 	scanner := bufio.NewScanner(resp.Body)
 	maxLineSize := defaultMaxLineSize
@@ -1932,7 +2140,9 @@ func (s *GatewayService) handleStreamingResponseAnthropicAPIKeyPassthrough(
 					}
 				case "content_block_start":
 					sawContentBlockStart = true
-					if strings.EqualFold(strings.TrimSpace(parsedFrame.Get("content_block.type").String()), "tool_use") {
+					blockType := strings.TrimSpace(parsedFrame.Get("content_block.type").String())
+					blockOrder.note(blockType)
+					if strings.EqualFold(blockType, "tool_use") {
 						sawToolUseBlock = true
 					}
 				}
@@ -1991,6 +2201,15 @@ func (s *GatewayService) handleStreamingResponseAnthropicAPIKeyPassthrough(
 		reason, incomplete := anthropicStreamLooksIncompleteDespiteTerminal(
 			sawStopReason, visibleChars, usage.OutputTokens, sawContentBlockStart)
 		if !incomplete {
+			// 块序违规排在启发式判据之前：它是确定性矛盾，而下面的
+			// anthropicTurnProvesUpstreamHealthy 会把「正文很长、stop_reason 正常」判成健康
+			// 并清零连击——21:25:40 那一发正是这个形态，排在后面就会被判健康。
+			if blockOrder.violation() {
+				s.unbindStickySessionNow(ctx, account, model, "content block order violation")
+				s.reportAnthropicBlockOrderViolation(ctx, c, resp, account, model,
+					proseRunes, usage.OutputTokens, sawStopReason, "delivered")
+				return
+			}
 			// 确定性判定放行之后，再看这一回合是否属于「协议合法但疑似没把话说完」。
 			// 三态：可疑 -> 累计连击；有正面证据 -> 清零；其余（典型是 tool_use 中间回合）
 			// -> 不表态，保留连击。见 anthropicTurnProvesUpstreamHealthy。
@@ -2142,6 +2361,7 @@ func (s *GatewayService) handleStreamingResponseAnthropicAPIKeyPassthrough(
 						holdback.deadAirElapsed(now, holdbackDeadAir),
 						holdback.stopReason, holdback.proseRunes, holdback.outputTokens,
 						holdback.sawToolUseBlock, holdbackDiscardsUsed, holdback.thinkingRunes,
+						holdback.blockOrder.violation(),
 					) {
 					case anthropicHoldbackKeep:
 						commitPrelude = false
@@ -2149,6 +2369,18 @@ func (s *GatewayService) handleStreamingResponseAnthropicAPIKeyPassthrough(
 						commitPrelude = true
 					case anthropicHoldbackDiscard:
 						pendingPreludeLines = pendingPreludeLines[:0]
+						// 块序违规单独一条出口：判据是确定性的，所以解绑不走短回合的连击阈值，
+						// 归因也不能记成短回合/空回合——那两档的根因是「没把话说完」，这一档是
+						// 「块拼错了序，正文可能整段是伪造的」，混记就看不出某个上游在犯哪种错。
+						if holdback.blockOrder.violation() {
+							s.unbindStickySessionNow(ctx, account, model, "content block order violation")
+							s.reportAnthropicBlockOrderViolation(ctx, c, resp, account, model,
+								holdback.proseRunes, holdback.outputTokens,
+								holdback.stopReason, "discarded")
+							return nil, s.newAnthropicBlockOrderFailoverError(
+								c, resp, account, model,
+								holdback.proseRunes, holdback.outputTokens, holdback.stopReason)
+						}
 						// 丢弃只治这一发。粘性绑定还指着这个坏号，而重试那一发不会改写它
 						// （非破坏性绑定：已有绑定指向别的账号时不覆盖），所以下一发客户端
 						// 请求照旧从这个号起手，每发白烧一次上游调用。这里主动解绑，阈值 1

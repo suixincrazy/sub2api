@@ -83,6 +83,7 @@ func TestAnthropicHoldbackVerdict(t *testing.T) {
 		toolUse      bool
 		discards     int
 		thinking     int
+		blockOrder   bool
 		want         anthropicHoldbackDecision
 	}{
 		{
@@ -286,12 +287,63 @@ func TestAnthropicHoldbackVerdict(t *testing.T) {
 			deadAir: false, proseRunes: 12, outputTokens: 4,
 			want: anthropicHoldbackKeep,
 		},
+		// 块序违规这一档：2026-08-25 21:25:40 那一发（账号 9，text / thinking / text，
+		// stop_reason=end_turn、正文 872 rune、out=591）。它在协议层完全合法，既有判据全部
+		// 放行，所以这一条必须排在**所有**提前放行出口之前，否则等于没加。
+		{
+			name:       "块序违规：正文超上限也要丢弃",
+			blockOrder: true,
+			stopReason: "end_turn", proseRunes: anthropicShortTurnProseRuneLimit + 1, outputTokens: 591,
+			want: anthropicHoldbackDiscard,
+		},
+		{
+			name:       "块序违规：带 tool_use 块也要丢弃",
+			blockOrder: true, toolUse: true,
+			stopReason: "tool_use", proseRunes: 900, outputTokens: 400,
+			want: anthropicHoldbackDiscard,
+		},
+		// 判据还没齐（stop_reason 未到）时就能定案：违规在 content_block_start 那一刻就成立，
+		// 不必等 message_delta，越早换号越省客户端的等待。
+		{
+			name:       "块序违规：stop_reason 还没到也立刻丢弃",
+			blockOrder: true, proseRunes: 798,
+			want: anthropicHoldbackDiscard,
+		},
+		// 刻意不受死气否决：交付一条块序违规的响应等于把伪造的工具输出交给客户端，客户端会
+		// 当真去用，代价高于多等一次尝试。这一条与上面「死气吃满：可疑形态也不再丢弃」构成对照。
+		{
+			name:       "块序违规：死气吃满也照旧丢弃",
+			blockOrder: true, deadAir: true, windowGone: true,
+			stopReason: "end_turn", proseRunes: 872, outputTokens: 591,
+			want: anthropicHoldbackDiscard,
+		},
+		// 额度封顶后退化成放行 + 事后归因，不会把池子掏空成 502。
+		{
+			name:       "块序违规丢满额度后退回既有判定：放行",
+			blockOrder: true, discards: anthropicBlockOrderDiscardBudget,
+			stopReason: "end_turn", proseRunes: 872, outputTokens: 591,
+			want: anthropicHoldbackRelease,
+		},
+		// 额度耗尽时不得把「本来该攥着」的回合提前放行：退回既有判定即原样，不是无条件 Release。
+		{
+			name:       "块序违规额度耗尽且判据没齐：照旧攥着",
+			blockOrder: true, discards: anthropicBlockOrderDiscardBudget,
+			proseRunes: 12, outputTokens: 4,
+			want: anthropicHoldbackKeep,
+		},
+		// 反面：没有违规时这一档不得改变任何既有判定。
+		{
+			name:       "无违规的长正文回合照旧放行",
+			blockOrder: false,
+			stopReason: "end_turn", proseRunes: anthropicShortTurnProseRuneLimit + 1, outputTokens: 591,
+			want: anthropicHoldbackRelease,
+		},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			got := anthropicHoldbackVerdict(
 				tc.windowGone, tc.deadAir, tc.stopReason, tc.proseRunes, tc.outputTokens,
-				tc.toolUse, tc.discards, tc.thinking)
+				tc.toolUse, tc.discards, tc.thinking, tc.blockOrder)
 			require.Equal(t, tc.want, got)
 		})
 	}
@@ -341,6 +393,91 @@ func TestAnthropicHoldbackObserverSeparatesThinkingFromProse(t *testing.T) {
 	// TestAnthropicHoldbackObserverWindowMeasuresSilenceNotTotalHold。
 	require.False(t, o.windowElapsed(thinking.Add(3*time.Second), 3*time.Second),
 		"旧口径在这一刻判窗口耗尽，静默口径必须还没到")
+}
+
+// 块序违规判据：thinking / redacted_thinking 块出现在 text 块之后。
+//
+// 判据的全部价值在于它是确定性的，所以两侧边界都要钉死：合法序（thinking 先于 text，含同一
+// 回合里多个 thinking / 多个 text）永不置位；违规序一旦出现就不再回落。
+func TestAnthropicContentBlockOrderTracker(t *testing.T) {
+	t.Run("合法序：thinking 先于 text", func(t *testing.T) {
+		var tr anthropicContentBlockOrderTracker
+		tr.note("thinking")
+		tr.note("text")
+		require.False(t, tr.violation())
+	})
+	t.Run("合法序：多个 thinking 连着多个 text", func(t *testing.T) {
+		var tr anthropicContentBlockOrderTracker
+		for _, b := range []string{"thinking", "redacted_thinking", "text", "text"} {
+			tr.note(b)
+		}
+		require.False(t, tr.violation())
+	})
+	t.Run("合法序：纯 text 与纯工具回合", func(t *testing.T) {
+		var tr anthropicContentBlockOrderTracker
+		for _, b := range []string{"text", "tool_use", "text", "server_tool_use", "text"} {
+			tr.note(b)
+		}
+		require.False(t, tr.violation(), "工具块与 text 交替是常态，不是违规")
+	})
+	// 21:25:40 那一发的块序。
+	t.Run("违规序：text / thinking / text", func(t *testing.T) {
+		var tr anthropicContentBlockOrderTracker
+		tr.note("text")
+		require.False(t, tr.violation(), "只有 text 时还不构成违规")
+		tr.note("thinking")
+		require.True(t, tr.violation())
+		tr.note("text")
+		require.True(t, tr.violation(), "置位后不再回落")
+	})
+	t.Run("违规序：redacted_thinking 同样算", func(t *testing.T) {
+		var tr anthropicContentBlockOrderTracker
+		tr.note("text")
+		tr.note("redacted_thinking")
+		require.True(t, tr.violation())
+	})
+	t.Run("块类型大小写与空白不敏感", func(t *testing.T) {
+		var tr anthropicContentBlockOrderTracker
+		tr.note(" TEXT ")
+		tr.note("Thinking")
+		require.True(t, tr.violation())
+	})
+	t.Run("未知块类型与空串不表态", func(t *testing.T) {
+		var tr anthropicContentBlockOrderTracker
+		for _, b := range []string{"", "  ", "image", "unknown_future_block"} {
+			tr.note(b)
+		}
+		require.False(t, tr.violation())
+		require.False(t, tr.sawTextBlock, "未知块不得被当成 text，否则后续合法 thinking 会误判")
+	})
+	t.Run("nil 接收者不 panic", func(t *testing.T) {
+		var tr *anthropicContentBlockOrderTracker
+		require.False(t, tr.violation())
+	})
+}
+
+// 观测器要从真实 SSE 帧里认出块序违规，而不是只在裸类型串上工作。
+func TestAnthropicHoldbackObserverDetectsBlockOrderViolation(t *testing.T) {
+	base := time.Date(2026, 8, 25, 21, 25, 40, 0, time.UTC)
+
+	legal := &anthropicHoldbackObserver{}
+	legal.observe(gjson.Parse(`{"type":"content_block_start","index":0,"content_block":{"type":"thinking","thinking":""}}`), false, base)
+	legal.observe(gjson.Parse(`{"type":"content_block_start","index":1,"content_block":{"type":"text","text":""}}`), true, base)
+	require.False(t, legal.blockOrder.violation(), "thinking 先于 text 是合法序")
+
+	// 21:25:40 那一发：text / thinking / text，正文 872 rune、stop_reason=end_turn。
+	bad := &anthropicHoldbackObserver{}
+	bad.observe(gjson.Parse(`{"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}`), true, base)
+	bad.observe(gjson.Parse(`{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"Tool results:"}}`), true, base)
+	require.False(t, bad.blockOrder.violation())
+	bad.observe(gjson.Parse(`{"type":"content_block_start","index":1,"content_block":{"type":"thinking","thinking":""}}`), false, base)
+	require.True(t, bad.blockOrder.violation(), "text 之后的 thinking 块是协议违规")
+
+	// 工具块仍要被正常识别，块序跟踪不能把 sawToolUseBlock 挤掉。
+	tool := &anthropicHoldbackObserver{}
+	tool.observe(gjson.Parse(`{"type":"content_block_start","index":0,"content_block":{"type":"tool_use","name":"Bash"}}`), true, base)
+	require.True(t, tool.sawToolUseBlock)
+	require.False(t, tool.blockOrder.violation())
 }
 
 // 2026-08-25 02:06:53 那一发的回归用例：帧还在持续到达时，窗口不得耗尽。

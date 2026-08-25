@@ -846,6 +846,9 @@ func (s *GatewayService) handleStreamingResponse(ctx context.Context, resp *http
 	thinkingRunes := 0
 	sawContentBlockStart := false
 	sawToolUseBlock := false
+	// blockOrder 判块序违规，与透传链路同口径（见 anthropicContentBlockOrderTracker）。
+	// 这条链路没有持流窗口，所以只有 delivered 一种结局：响应已经交付，只能事后解绑 + 罚号。
+	var blockOrder anthropicContentBlockOrderTracker
 	useNoopDeltaKeepalive := c != nil && c.Request != nil && shouldUseClaudeCodeNoopDeltaKeepalive(c.GetHeader("User-Agent"))
 	noopDeltaKeepaliveBlockIndex := -1
 	noopDeltaKeepaliveDeltaType := ""
@@ -1005,7 +1008,9 @@ func (s *GatewayService) handleStreamingResponse(ctx context.Context, resp *http
 				}
 			case "content_block_start":
 				sawContentBlockStart = true
-				if strings.EqualFold(strings.TrimSpace(parsedFrame.Get("content_block.type").String()), "tool_use") {
+				blockType := strings.TrimSpace(parsedFrame.Get("content_block.type").String())
+				blockOrder.note(blockType)
+				if strings.EqualFold(blockType, "tool_use") {
 					sawToolUseBlock = true
 				}
 			}
@@ -1053,6 +1058,14 @@ func (s *GatewayService) handleStreamingResponse(ctx context.Context, resp *http
 		reason, incomplete := anthropicStreamLooksIncompleteDespiteTerminal(
 			sawStopReason, visibleChars, usage.OutputTokens, sawContentBlockStart)
 		if !incomplete {
+			// 块序违规排在启发式判据之前，理由同透传链路：它是确定性矛盾，而
+			// anthropicTurnProvesUpstreamHealthy 会把「长正文 + 正常 stop_reason」判成健康。
+			if blockOrder.violation() {
+				s.unbindStickySessionNow(ctx, account, originalModel, "content block order violation")
+				s.reportAnthropicBlockOrderViolation(ctx, c, resp, account, originalModel,
+					proseRunes, usage.OutputTokens, sawStopReason, "delivered")
+				return
+			}
 			// 确定性判定放行之后，再看这一回合是否「协议合法但疑似没把话说完」。
 			// 三态：可疑 -> 累计连击；有正面证据 -> 清零；其余（典型是 tool_use 中间回合）
 			// -> 不表态，保留连击。见 anthropicTurnProvesUpstreamHealthy。
