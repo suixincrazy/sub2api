@@ -28,6 +28,7 @@ const (
 )
 
 var explicitOpenAIHeaderSessionNames = []string{
+	"session-id",
 	"session_id",
 	"conversation_id",
 	openCodeSessionAffinityHeader,
@@ -145,7 +146,7 @@ func (s *OpenAIGatewayService) GenerateExplicitSessionHash(c *gin.Context, body 
 // GenerateSessionHash generates a sticky-session hash for OpenAI requests.
 //
 // Priority:
-//  1. Header: session_id
+//  1. Header: session-id / session_id
 //  2. Header: conversation_id
 //  3. Header: x-session-affinity / x-session-id / x-opencode-session (OpenCode)
 //  4. Header: x-conversation-id (CodeBuddy)
@@ -1180,6 +1181,11 @@ func (s *OpenAIGatewayService) selectAccountWithLoadAwareness(ctx context.Contex
 	}
 
 	// ============ Layer 1: Sticky session ============
+	// A healthy sticky account whose bounded wait queue is full may be used as a
+	// one-request capacity spillover in Layer 2. Keep that spillover temporary:
+	// rewriting the durable binding here would make a short burst migrate the
+	// whole conversation to a cache-cold account.
+	stickySpillover := false
 	if sessionHash != "" {
 		accountID := stickyAccountID
 		if accountID > 0 && !isExcluded(accountID) {
@@ -1226,6 +1232,7 @@ func (s *OpenAIGatewayService) selectAccountWithLoadAwareness(ctx context.Contex
 								MaxWaiting:     cfg.StickySessionMaxWaiting,
 							})
 						}
+						stickySpillover = true
 					}
 				}
 			}
@@ -1377,7 +1384,11 @@ func (s *OpenAIGatewayService) selectAccountWithLoadAwareness(ctx context.Contex
 				if selectErr != nil {
 					return nil, true, selectErr
 				}
-				if sessionHash != "" {
+				// stickySpillover 是上游的溢出保护，bindOpenAIStickySessionDuringSelection
+				// 是我方的非破坏性绑定。两者独立保留：后者的 existing != new 分支本就会拒绝
+				// 覆盖溢出场景下仍存在的原绑定，但前者更早短路、少一次缓存读，也把「这是一次性
+				// 容量溢出」的意图写在调用点上，不依赖被调函数恰好有那道检查。
+				if sessionHash != "" && !stickySpillover {
 					_ = s.bindOpenAIStickySessionDuringSelection(ctx, groupID, sessionHash, fresh.ID)
 				}
 				return selection, true, nil
@@ -1416,7 +1427,8 @@ func (s *OpenAIGatewayService) selectAccountWithLoadAwareness(ctx context.Contex
 				if selectErr != nil {
 					return nil, selectErr
 				}
-				if sessionHash != "" {
+				// 同上一处：溢出保护与非破坏性绑定各自独立。
+				if sessionHash != "" && !stickySpillover {
 					_ = s.bindOpenAIStickySessionDuringSelection(ctx, groupID, sessionHash, fresh.ID)
 				}
 				return selection, nil
