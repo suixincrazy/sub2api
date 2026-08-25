@@ -199,7 +199,7 @@ func TestDisplayPricingMaterializesDerivedPrices(t *testing.T) {
 
 	t.Run("提示价来自渠道配置", func(t *testing.T) {
 		models := []SupportedModel{{Name: "claude-opus-5", Platform: "anthropic", Pricing: derivedRatioPricing()}}
-		svc.fillGlobalPricingFallback(models)
+		fillGlobalPricingFallback(svc.pricingService, models)
 
 		got := models[0].Pricing
 		require.NotNil(t, got.OutputPrice)
@@ -214,7 +214,7 @@ func TestDisplayPricingMaterializesDerivedPrices(t *testing.T) {
 		config := derivedRatioPricing()
 		config.InputPrice = nil
 		models := []SupportedModel{{Name: "claude-opus-5", Platform: "anthropic", Pricing: config}}
-		svc.fillGlobalPricingFallback(models)
+		fillGlobalPricingFallback(svc.pricingService, models)
 
 		got := models[0].Pricing
 		require.InDelta(t, 5e-6, *got.InputPrice, 1e-18, "提示价由全局回落补上")

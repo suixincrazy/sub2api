@@ -309,6 +309,7 @@ func (s *GatewayService) forwardAnthropicAPIKeyPassthroughWithInput(
 		UpstreamModel:                 input.RequestModel,
 		UpstreamResponseModel:         observedUpstreamResponseModel(c),
 		UpstreamResponseModelConflict: observedUpstreamResponseModelConflict(c),
+		UpstreamResponseServiceTier:   observedUpstreamResponseServiceTier(c),
 		Stream:                        input.RequestStream,
 		Duration:                      time.Since(input.StartTime),
 		FirstTokenMs:                  firstTokenMs,
@@ -733,14 +734,15 @@ const (
 // 撑到 message_delta 的代价是首字延迟，所以给三条提前放行的出口，任何一条成立就立刻放行：
 //  1. 出现 tool_use 块——工具回合永远不是截断形态，没有再等的理由；
 //  2. 正文已超过短回合上限——已经不可能被判可疑，再等只是白等；
-//  3. 持流窗口耗尽——拿真实数据标定过，见 GatewayConfig.AnthropicHoldbackWindowMs。
+//  3. 放行截止线到点——静默窗口耗尽或持流总时长撞上限，两条都拿真实数据标定过，见
+//     GatewayConfig.AnthropicHoldbackWindowMs 与 GatewayConfig.AnthropicHoldbackMaxHoldMs。
 //
 // discardsUsed 是本次请求已经因为持流判定丢弃过几次上游响应。额度按形态分档，不是一刀切：
 // 「短但有正文」丢满 anthropicShortTurnDiscardBudget 次后就原样放行，因为真短答案确实存在；
 // 「零正文」可以多丢几次，因为不存在「本来就该是空的答案」这种合法解释。见
 // anthropicShortTurnDiscardBudget 与 anthropicEmptyAnswerDiscardBudget。
 func anthropicHoldbackVerdict(
-	windowElapsed bool,
+	releaseDeadlineElapsed bool,
 	stopReason string,
 	proseRunes int,
 	outputTokens int,
@@ -763,7 +765,7 @@ func anthropicHoldbackVerdict(
 		}
 		return anthropicHoldbackRelease
 	}
-	if windowElapsed {
+	if releaseDeadlineElapsed {
 		return anthropicHoldbackRelease
 	}
 	return anthropicHoldbackKeep
@@ -866,8 +868,10 @@ func (o *anthropicHoldbackObserver) silenceSince() time.Time {
 //
 // 代价是长思考回合在拿到 stop_reason 之前客户端一个字节都收不到（keepalive 在
 // !streamCommitted 下不写字节）。这是零暴露的必然价格：任何写给客户端的字节都会钉死
-// HTTP 200、断掉换号重试的可能。上界由 gateway.stream_data_interval_timeout 兜着，
-// 而正文一旦超过 anthropicShortTurnProseRuneLimit 就提前放行，长回答不会一直攥到最后。
+// HTTP 200、断掉换号重试的可能。正文一旦超过 anthropicShortTurnProseRuneLimit 就提前放行，
+// 长回答不会一直攥到最后；而这一条本身没有上界（上游一直出帧就一直续期），所以死气的上界
+// 由 maxHoldElapsed 那条总时长上限单独兜着——2026-08-25 加，之前只有
+// gateway.stream_data_interval_timeout（180s）那一级，实测出现过攥 83.4 秒的回合。
 func (o *anthropicHoldbackObserver) windowElapsed(now time.Time, window time.Duration) bool {
 	if window <= 0 {
 		return false
@@ -893,6 +897,63 @@ func (o *anthropicHoldbackObserver) holdbackSilenceDeadline(window time.Duration
 		return time.Time{}
 	}
 	return since.Add(window)
+}
+
+// maxHoldElapsed 判断持流**总时长**是否已到上限。
+//
+// 与 windowElapsed 的区别是起点：那一条从最后一帧有内容的 data 起算，上游持续出帧就无限
+// 续期；这一条从 firstCommitPointAt 起算，一旦开始持流就单调走到底、任何新帧都不能续期。
+// 两条各治一种形态——静默窗口治「吐两句就卡住」，这一条治「一直在吐但客户端一个字都看不到」。
+//
+// 为什么必须有这一条（2026-08-25 实证）：窗口改成静默口径之后，长思考／长回答的持流不再有
+// 任何上界，08:28:10 那一发 out=3677 攥了 83.4 秒、first_token_ms 83394 ≈ duration_ms
+// 83423，客户端全程零字节。分 band 量下来死气全压在 output_tokens>430 这一批上（p90 首字节
+// 42s→113s），而这一批在判据上结构性不可能被判可疑，攥着纯亏。完整标定见
+// GatewayConfig.AnthropicHoldbackMaxHoldMs。
+func (o *anthropicHoldbackObserver) maxHoldElapsed(now time.Time, maxHold time.Duration) bool {
+	if maxHold <= 0 {
+		return false
+	}
+	if o.firstCommitPointAt.IsZero() {
+		return false
+	}
+	return now.Sub(o.firstCommitPointAt) >= maxHold
+}
+
+// holdbackMaxHoldDeadline 给出持流总时长到顶的时刻。返回零值表示还没起算或没配上限。
+func (o *anthropicHoldbackObserver) holdbackMaxHoldDeadline(maxHold time.Duration) time.Time {
+	if maxHold <= 0 {
+		return time.Time{}
+	}
+	if o.firstCommitPointAt.IsZero() {
+		return time.Time{}
+	}
+	return o.firstCommitPointAt.Add(maxHold)
+}
+
+// holdbackReleaseDeadline 给出「无论上游再说什么都必须放行」的时刻：静默窗口与总时长上限
+// 两条截止线里先到的那个。返回零值表示两条都还没起算。
+//
+// 定时器分支只认这一个口径，保证不会出现「定时器认为到点、判定认为没到」的分歧——判定侧
+// 走 releaseDeadlineElapsed，两者由同样的两条截止线导出。
+func (o *anthropicHoldbackObserver) holdbackReleaseDeadline(window, maxHold time.Duration) time.Time {
+	silence := o.holdbackSilenceDeadline(window)
+	ceiling := o.holdbackMaxHoldDeadline(maxHold)
+	switch {
+	case silence.IsZero():
+		return ceiling
+	case ceiling.IsZero():
+		return silence
+	case ceiling.Before(silence):
+		return ceiling
+	default:
+		return silence
+	}
+}
+
+// releaseDeadlineElapsed 判断两条放行截止线有没有任意一条到点。
+func (o *anthropicHoldbackObserver) releaseDeadlineElapsed(now time.Time, window, maxHold time.Duration) bool {
+	return o.windowElapsed(now, window) || o.maxHoldElapsed(now, maxHold)
 }
 
 // anthropicTurnLooksSuspiciouslyShort 判定这一回合是否为「协议合法但疑似没把话说完」。
@@ -1666,21 +1727,34 @@ func (s *GatewayService) handleStreamingResponseAnthropicAPIKeyPassthrough(
 		holdbackWindow = time.Duration(s.cfg.Gateway.AnthropicHoldbackWindowMs) * time.Millisecond
 	}
 	holdbackActive := holdbackWindow > 0
+	// 持流总时长上限，与静默窗口取先到者。窗口配 0（整个机制关掉）时这一条也不参与，
+	// 免得上限把已经显式关掉的机制又拉起来。见 GatewayConfig.AnthropicHoldbackMaxHoldMs。
+	holdbackMaxHold := time.Duration(0)
+	if holdbackActive && s.cfg != nil && s.cfg.Gateway.AnthropicHoldbackMaxHoldMs > 0 {
+		holdbackMaxHold = time.Duration(s.cfg.Gateway.AnthropicHoldbackMaxHoldMs) * time.Millisecond
+	}
 	holdbackDiscardsUsed := anthropicHoldbackDiscardsUsed(c)
 	holdback := &anthropicHoldbackObserver{}
 	// 独立定时器，不复用 keepalive：窗口是毫秒级而 keepalive 默认 10 秒，靠它兜底会让
 	// 「上游吐了两句就长时间静默」的流白等十秒。定时器在首帧可见增量到达时才 arm。
 	//
-	// 定时器只是**唤醒器**，判据由 holdback.windowElapsed 单独持有：窗口量的是静默时长，
-	// 而定时器一旦 arm 就按固定时长走，帧还在到达时它照样会开火。所以开火之后必须复核，
-	// 复核不通过就按剩余静默时间续期，见 case <-holdbackCh。
+	// 定时器只是**唤醒器**，判据由 holdback.holdbackReleaseDeadline 单独持有：静默窗口量的
+	// 是静默时长、会随新帧不断续期，而定时器一旦 arm 就按固定时长走，帧还在到达时它照样会
+	// 开火。所以开火之后必须复核，复核不通过就按剩余时间续期，见 case <-holdbackCh。
+	//
+	// arm 的时长取两条截止线里近的那个：总时长上限比静默窗口小时（线上 10000 vs 15000），
+	// 按窗口 arm 会睡过上限、白攥那一段。
 	var holdbackTimer *time.Timer
 	var holdbackCh <-chan time.Time
 	armHoldbackTimer := func() {
 		if !holdbackActive || holdbackTimer != nil || holdback.firstCommitPointAt.IsZero() {
 			return
 		}
-		holdbackTimer = time.NewTimer(holdbackWindow)
+		wake := holdbackWindow
+		if holdbackMaxHold > 0 && holdbackMaxHold < wake {
+			wake = holdbackMaxHold
+		}
+		holdbackTimer = time.NewTimer(wake)
 		holdbackCh = holdbackTimer.C
 	}
 	defer func() {
@@ -1918,7 +1992,7 @@ func (s *GatewayService) handleStreamingResponseAnthropicAPIKeyPassthrough(
 					holdback.observe(holdFrame, commitPrelude, now)
 					armHoldbackTimer()
 					switch anthropicHoldbackVerdict(
-						holdback.windowElapsed(now, holdbackWindow),
+						holdback.releaseDeadlineElapsed(now, holdbackWindow, holdbackMaxHold),
 						holdback.stopReason, holdback.proseRunes, holdback.outputTokens,
 						holdback.sawToolUseBlock, holdbackDiscardsUsed, holdback.thinkingRunes,
 					) {
@@ -1955,13 +2029,14 @@ func (s *GatewayService) handleStreamingResponseAnthropicAPIKeyPassthrough(
 			processLine(line)
 
 		case <-holdbackCh:
-			// 定时器只是唤醒器，判据在 holdback.holdbackSilenceDeadline 手里：窗口量的是
-			// **静默**时长，而定时器 arm 之后按固定时长走，帧还在源源到达时它照样开火。
-			// 所以开火先复核，静默没满就按剩余时间续期、继续持流；只有真的静默满一个窗口
-			// （判定要的 stop_reason 始终没来）才认定等不起，原样放行。
+			// 定时器只是唤醒器，判据在 holdback.holdbackReleaseDeadline 手里：静默窗口量的
+			// 是**静默**时长、会随新帧续期，而定时器 arm 之后按固定时长走，帧还在源源到达时
+			// 它照样开火。所以开火先复核，两条截止线都没到就按剩余时间续期、继续持流；只有
+			// 静默真的满了一个窗口（判定要的 stop_reason 始终没来）、或者持流总时长撞到上限
+			// （上游一直在吐但客户端一个字节都还没拿到），才认定等不起，原样放行。
 			holdbackCh = nil
 			now := time.Now()
-			deadline := holdback.holdbackSilenceDeadline(holdbackWindow)
+			deadline := holdback.holdbackReleaseDeadline(holdbackWindow, holdbackMaxHold)
 			switch {
 			case streamCommitted:
 				// 已经提交过，窗口没有可做的事。
@@ -2106,6 +2181,72 @@ func parseSSEUsagePassthrough(data string, usage *ClaudeUsage) {
 			usage.CacheCreationInputTokens = int(total)
 		}
 	}
+
+	// Kimi's Anthropic-compatible stream uses input_tokens with two meanings:
+	// message_start reports total prompt input, while message_delta reports only
+	// uncached input. prompt_tokens remains the total in both events. Normalize
+	// to ClaudeUsage's mutually-exclusive buckets so downstream billing does not
+	// subtract cache tokens from an already-uncached value.
+	usageNode := parsed.Get("usage")
+	if parsed.Get("type").String() == "message_start" {
+		usageNode = parsed.Get("message.usage")
+	}
+	normalizeAnthropicCompatiblePromptUsage(usageNode, usage)
+}
+
+// normalizeAnthropicCompatiblePromptUsage converts provider-native OpenAI-style
+// prompt/cache fields into Claude's mutually-exclusive usage buckets. Native
+// Anthropic responses do not expose these aliases and are left alone.
+func normalizeAnthropicCompatiblePromptUsage(usageNode gjson.Result, usage *ClaudeUsage) bool {
+	if usage == nil || !usageNode.Exists() {
+		return false
+	}
+	promptTokens := usageNode.Get("prompt_tokens")
+	promptCacheHitTokens := usageNode.Get("prompt_cache_hit_tokens")
+	promptCacheMissTokens := usageNode.Get("prompt_cache_miss_tokens")
+	if (!promptTokens.Exists() || promptTokens.Int() <= 0) &&
+		!promptCacheHitTokens.Exists() && !promptCacheMissTokens.Exists() {
+		return false
+	}
+
+	cacheReadTokens := usage.CacheReadInputTokens
+	if v := usageNode.Get("cache_read_input_tokens"); v.Exists() {
+		cacheReadTokens = int(v.Int())
+	}
+	if cacheReadTokens == 0 {
+		if v := usageNode.Get("cached_tokens"); v.Exists() {
+			cacheReadTokens = int(v.Int())
+		}
+	}
+	if cacheReadTokens == 0 {
+		if v := usageNode.Get("prompt_tokens_details.cached_tokens"); v.Exists() {
+			cacheReadTokens = int(v.Int())
+		}
+	}
+	if cacheReadTokens == 0 && promptCacheHitTokens.Exists() {
+		cacheReadTokens = max(int(promptCacheHitTokens.Int()), 0)
+	}
+
+	cacheCreationTokens := usage.CacheCreationInputTokens
+	if v := usageNode.Get("cache_creation_input_tokens"); v.Exists() {
+		cacheCreationTokens = int(v.Int())
+	}
+	if cacheCreationTokens == 0 {
+		cc5m := usageNode.Get("cache_creation.ephemeral_5m_input_tokens").Int()
+		cc1h := usageNode.Get("cache_creation.ephemeral_1h_input_tokens").Int()
+		if cc5m > 0 || cc1h > 0 {
+			cacheCreationTokens = int(cc5m + cc1h)
+		}
+	}
+
+	if promptCacheMissTokens.Exists() {
+		usage.InputTokens = max(int(promptCacheMissTokens.Int()), 0)
+	} else {
+		usage.InputTokens = max(int(promptTokens.Int())-cacheReadTokens-cacheCreationTokens, 0)
+	}
+	usage.CacheReadInputTokens = cacheReadTokens
+	usage.CacheCreationInputTokens = cacheCreationTokens
+	return true
 }
 
 func parseClaudeUsageFromResponseBody(body []byte) *ClaudeUsage {
@@ -2139,6 +2280,7 @@ func parseClaudeUsageFromResponseBody(body []byte) *ClaudeUsage {
 			usage.CacheReadInputTokens = int(cached)
 		}
 	}
+	normalizeAnthropicCompatiblePromptUsage(usageNode, usage)
 	return usage
 }
 

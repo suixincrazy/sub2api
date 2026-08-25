@@ -32,7 +32,7 @@ const (
 
 // DefaultCSPPolicy is the default Content-Security-Policy with nonce support
 // __CSP_NONCE__ will be replaced with actual nonce at request time by the SecurityHeaders middleware
-const DefaultCSPPolicy = "default-src 'self'; worker-src 'self' blob:; script-src 'self' __CSP_NONCE__ https://challenges.cloudflare.com https://*.alicdn.com https://static.cloudflareinsights.com https://turing.captcha.qcloud.com https://turing.captcha.gtimg.com https://ca.turing.captcha.qcloud.com https://global.turing.captcha.gtimg.com https://www.tycaptcha.com https://cloudcache.tencentcs.com https://*.stripe.com https://static.airwallex.com https://checkout.airwallex.com https://static-demo.airwallex.com https://checkout-demo.airwallex.com; style-src 'self' 'unsafe-inline' https://*.captcha.gtimg.com https://fonts.googleapis.com https://*.alicdn.com https://static.airwallex.com https://checkout.airwallex.com https://static-demo.airwallex.com https://checkout-demo.airwallex.com; img-src 'self' data: blob: https:; font-src 'self' data: https://fonts.gstatic.com; connect-src 'self' https://turing.captcha.qcloud.com https://www.tycaptcha.com https://rce.tencentrio.com https:; frame-src https://challenges.cloudflare.com https://turing.captcha.qcloud.com https://ca.turing.captcha.qcloud.com https://www.tycaptcha.com https://*.stripe.com https://checkout.airwallex.com https://checkout-demo.airwallex.com; frame-ancestors 'none'; base-uri 'self'; form-action 'self'"
+const DefaultCSPPolicy = "default-src 'self'; worker-src 'self' blob:; script-src 'self' __CSP_NONCE__ https://challenges.cloudflare.com https://*.alicdn.com https://static.cloudflareinsights.com https://turing.captcha.qcloud.com https://turing.captcha.gtimg.com https://ca.turing.captcha.qcloud.com https://global.turing.captcha.gtimg.com https://www.tycaptcha.com https://cloudcache.tencentcs.com https://*.stripe.com https://static.airwallex.com https://checkout.airwallex.com https://static-demo.airwallex.com https://checkout-demo.airwallex.com; style-src 'self' 'unsafe-inline' https://*.captcha.gtimg.com https://fonts.googleapis.com https://*.alicdn.com https://static.airwallex.com https://checkout.airwallex.com https://static-demo.airwallex.com https://checkout-demo.airwallex.com; img-src 'self' data: blob: https:; font-src 'self' data: https://fonts.gstatic.com; connect-src 'self' https://turing.captcha.qcloud.com https://www.tycaptcha.com https://rce.tencentrio.com https:; frame-src 'self' https://challenges.cloudflare.com https://turing.captcha.qcloud.com https://ca.turing.captcha.qcloud.com https://www.tycaptcha.com https://*.stripe.com https://checkout.airwallex.com https://checkout-demo.airwallex.com; frame-ancestors 'none'; base-uri 'self'; form-action 'self'"
 
 // UMQ（用户消息队列）模式常量
 const (
@@ -60,6 +60,10 @@ const (
 // 128 MB 可容纳 2-3 张 4K PNG（base64 膨胀 33%，单张 4K PNG 最坏约 67MB base64）。
 // 可通过 gateway.upstream_response_read_max_bytes 配置项覆盖。
 const DefaultUpstreamResponseReadMaxBytes int64 = 128 * 1024 * 1024
+
+// DefaultModelsListReadMaxBytes 上游模型列表响应体的默认读取上限。
+// 可通过 gateway.models_list_read_max_bytes 配置项覆盖。
+const DefaultModelsListReadMaxBytes int64 = 8 * 1024 * 1024
 
 type Config struct {
 	Server                  ServerConfig                  `mapstructure:"server"`
@@ -99,6 +103,18 @@ type Config struct {
 	Idempotency             IdempotencyConfig             `mapstructure:"idempotency"`
 	BatchImage              BatchImageConfig              `mapstructure:"batch_image"`
 	ImageStorage            ImageStorageConfig            `mapstructure:"image_storage"`
+	Plugins                 PluginConfig                  `mapstructure:"plugins"`
+}
+
+// PluginConfig 控制管理员手动上传的本地进程插件。
+// 默认不包含插件，也不允许安装未签名插件；TrustedPublishers 用于追加第三方发布者。
+type PluginConfig struct {
+	DataDir              string            `mapstructure:"data_dir"`
+	AllowUnsigned        bool              `mapstructure:"allow_unsigned"`
+	TrustedPublishers    map[string]string `mapstructure:"trusted_publishers"`
+	MaxUploadBytes       int64             `mapstructure:"max_upload_bytes"`
+	MaxUncompressedBytes int64             `mapstructure:"max_uncompressed_bytes"`
+	StartTimeoutSeconds  int               `mapstructure:"start_timeout_seconds"`
 }
 
 type LogConfig struct {
@@ -948,6 +964,8 @@ type GatewayConfig struct {
 	TextMaxBodySize int64 `mapstructure:"text_max_body_size"`
 	// 非流式上游响应体读取上限（字节），用于防止无界读取导致内存放大
 	UpstreamResponseReadMaxBytes int64 `mapstructure:"upstream_response_read_max_bytes"`
+	// 上游模型列表响应体读取上限（字节）
+	ModelsListReadMaxBytes int64 `mapstructure:"models_list_read_max_bytes"`
 	// 代理探测响应体读取上限（字节）
 	ProxyProbeResponseReadMaxBytes int64 `mapstructure:"proxy_probe_response_read_max_bytes"`
 	// Gemini 上游响应头调试日志开关（默认关闭，避免高频日志开销）
@@ -1053,8 +1071,42 @@ type GatewayConfig struct {
 	// 3000ms 覆盖 97.0%；再加到 5000ms 只多覆盖 2.1 个百分点，却把延迟代价整体抬高。
 	// 改成静默口径之后这条标定只会更宽松：同一段耗时里凡有帧到达都不再计入。
 	// 正文超过短回合上限或出现 tool_use 块都会提前放行，所以多数长回答等不满这个窗口。
-	// 上界由 gateway.stream_data_interval_timeout 兜着——窗口只在上游真的不说话时耗尽。
+	// 上界由 gateway.anthropic_holdback_max_hold_ms 兜着——窗口只在上游真的不说话时耗尽。
 	AnthropicHoldbackWindowMs int `mapstructure:"anthropic_holdback_window_ms"`
+
+	// AnthropicHoldbackMaxHoldMs: 持流总时长上限（毫秒），0 表示不封顶。
+	//
+	// 为什么静默窗口一条不够：AnthropicHoldbackWindowMs 量的是上游**不说话**多久，所以上游
+	// 只要持续出帧就一直续期，长思考／长回答会被攥到 stream_data_interval_timeout（180s）
+	// 那一级。实测代价（2026-08-25，以 04:17 部署切分）：
+	//
+	//	era                band          n   avg(ftt/dur)  p50_ftt  p90_ftt  ftt>30s
+	//	改静默口径之前     out>430    1227      0.643      15306ms   42264ms   14.8%
+	//	改静默口径之后     out>430     243      0.791      21521ms  112844ms   38.7%
+	//	改静默口径之前     out<=430   1337      0.882       9488ms   23430ms    5.9%
+	//	改静默口径之后     out<=430    209      0.893      10729ms   17705ms    2.4%
+	//
+	// 也就是死气全压在长回合上（p90 首字节 42s→113s），而可疑区几乎没动。偏偏长回合这一整
+	// 批在判据上**结构性不可能**被判可疑：output_tokens>430 时
+	// anthropicVisibleOutputTokens 越过闸门，anthropicTurnLooksSuspiciouslyShort 必然
+	// return false。攥着它们一秒收益都没有，纯亏首字延迟。
+	//
+	// 10000ms 的标定：取 08-24 10:00 ~ 08-25 04:17（改静默口径之前，first_token_ms 还是
+	// 真实首字节时刻，未被持流污染）的 1957 发流式回合，用 duration_ms - first_token_ms
+	// 量「首帧到流结束」的跨度，也就是持流实际要覆盖的那一段：
+	//
+	//	band                  n     p50     p90     p95     p99     >8s    >15s
+	//	out<=430（可疑区）  1061   981ms  3641ms  5178ms  9301ms   1.0%    0.6%
+	//	out>430 （长回合）   896  7553ms 52158ms 94819ms 208026ms   49%     34%
+	//
+	// 两个分布几乎不重叠：可疑回合本来就短且快，p99 只有 9301ms，10000ms 完整盖到 p99，
+	// 只有约 0.9% 的可疑回合跨度超过它、退化成旧行为（放行 + 给下一发解绑，也就是这个机制
+	// 存在之前的行为，不会更差）。代价换来的是长回合那 49% 的死气从 52~95s 压回 10s 以内。
+	//
+	// 与静默窗口的分工：这一条从 firstCommitPointAt 起算**总时长**，那一条从最后一帧有内容
+	// 的 data 起算**静默时长**，两者取先到者放行。线上窗口配成 15000 时静默那条永不先到，
+	// 放行权由这一条独占；窗口配得比这个值小时仍由静默那条先兜住「吐两句就卡住」的形态。
+	AnthropicHoldbackMaxHoldMs int `mapstructure:"anthropic_holdback_max_hold_ms"`
 
 	// 是否记录上游错误响应体摘要（避免输出请求内容）
 	LogUpstreamErrorBody bool `mapstructure:"log_upstream_error_body"`
@@ -2307,6 +2359,14 @@ func setDefaults() {
 	viper.SetDefault("pricing.update_interval_hours", 24)
 	viper.SetDefault("pricing.hash_check_interval_minutes", 10)
 
+	// 本地进程插件。插件必须由管理员手动上传，项目默认不携带任何插件能力。
+	viper.SetDefault("plugins.data_dir", "")
+	viper.SetDefault("plugins.allow_unsigned", false)
+	viper.SetDefault("plugins.trusted_publishers", map[string]string{})
+	viper.SetDefault("plugins.max_upload_bytes", int64(128*1024*1024))
+	viper.SetDefault("plugins.max_uncompressed_bytes", int64(256*1024*1024))
+	viper.SetDefault("plugins.start_timeout_seconds", 15)
+
 	// Timezone (default to Asia/Shanghai for Chinese users)
 	viper.SetDefault("timezone", "Asia/Shanghai")
 
@@ -2474,6 +2534,7 @@ func setDefaults() {
 	viper.SetDefault("gateway.max_body_size", int64(256*1024*1024))
 	viper.SetDefault("gateway.text_max_body_size", int64(32*1024*1024))
 	viper.SetDefault("gateway.upstream_response_read_max_bytes", DefaultUpstreamResponseReadMaxBytes)
+	viper.SetDefault("gateway.models_list_read_max_bytes", DefaultModelsListReadMaxBytes)
 	viper.SetDefault("gateway.proxy_probe_response_read_max_bytes", int64(1024*1024))
 	viper.SetDefault("gateway.gemini_debug_response_headers", false)
 	viper.SetDefault("gateway.connection_pool_isolation", ConnectionPoolIsolationAccountProxy)
@@ -2494,6 +2555,8 @@ func setDefaults() {
 	// 必须显式 SetDefault，AutomaticEnv 只能覆盖已注册的键、不会新增键，
 	// 否则 GATEWAY_ANTHROPIC_HOLDBACK_WINDOW_MS 无法在不重新构建的前提下改这个值。
 	viper.SetDefault("gateway.anthropic_holdback_window_ms", 3000)
+	// 同上，必须显式注册才能靠 GATEWAY_ANTHROPIC_HOLDBACK_MAX_HOLD_MS 免重新构建地改。
+	viper.SetDefault("gateway.anthropic_holdback_max_hold_ms", 10000)
 	viper.SetDefault("gateway.scheduling.sticky_session_max_waiting", 3)
 	viper.SetDefault("gateway.scheduling.sticky_session_wait_timeout", 120*time.Second)
 	viper.SetDefault("gateway.scheduling.fallback_wait_timeout", 30*time.Second)
@@ -2669,6 +2732,15 @@ func (c *Config) Validate() error {
 		return fmt.Errorf("security.proxy_probe.urls: %w", err)
 	}
 	c.Security.ProxyProbe.URLs = proxyProbeURLs
+	if c.Plugins.MaxUploadBytes <= 0 || c.Plugins.MaxUploadBytes > 1024*1024*1024 {
+		return fmt.Errorf("plugins.max_upload_bytes must be between 1 and 1073741824")
+	}
+	if c.Plugins.MaxUncompressedBytes < c.Plugins.MaxUploadBytes || c.Plugins.MaxUncompressedBytes > 2*1024*1024*1024 {
+		return fmt.Errorf("plugins.max_uncompressed_bytes must be between max_upload_bytes and 2147483648")
+	}
+	if c.Plugins.StartTimeoutSeconds < 1 || c.Plugins.StartTimeoutSeconds > 120 {
+		return fmt.Errorf("plugins.start_timeout_seconds must be between 1 and 120")
+	}
 	if c.Server.ReadHeaderTimeout < 1 || c.Server.ReadHeaderTimeout > 60 {
 		return fmt.Errorf("server.read_header_timeout must be between 1 and 60 seconds")
 	}
@@ -3280,6 +3352,9 @@ func (c *Config) Validate() error {
 	if c.Gateway.UpstreamResponseReadMaxBytes <= 0 {
 		return fmt.Errorf("gateway.upstream_response_read_max_bytes must be positive")
 	}
+	if c.Gateway.ModelsListReadMaxBytes <= 0 {
+		return fmt.Errorf("gateway.models_list_read_max_bytes must be positive")
+	}
 	if c.Gateway.ProxyProbeResponseReadMaxBytes <= 0 {
 		return fmt.Errorf("gateway.proxy_probe_response_read_max_bytes must be positive")
 	}
@@ -3370,6 +3445,15 @@ func (c *Config) Validate() error {
 	if c.Gateway.AnthropicHoldbackWindowMs != 0 &&
 		(c.Gateway.AnthropicHoldbackWindowMs < 500 || c.Gateway.AnthropicHoldbackWindowMs > 15000) {
 		return fmt.Errorf("gateway.anthropic_holdback_window_ms must be 0 or between 500-15000 milliseconds")
+	}
+	if c.Gateway.AnthropicHoldbackMaxHoldMs < 0 {
+		return fmt.Errorf("gateway.anthropic_holdback_max_hold_ms must be non-negative")
+	}
+	// 下界 1000 而不是 500：这一条量总时长，比静默窗口天然要大一档，配得比可疑区 p50
+	// （981ms）还小就等于把持流整体关掉，那种意图应该显式配 0。
+	if c.Gateway.AnthropicHoldbackMaxHoldMs != 0 &&
+		(c.Gateway.AnthropicHoldbackMaxHoldMs < 1000 || c.Gateway.AnthropicHoldbackMaxHoldMs > 120000) {
+		return fmt.Errorf("gateway.anthropic_holdback_max_hold_ms must be 0 or between 1000-120000 milliseconds")
 	}
 	if c.Gateway.ImageStreamDataIntervalTimeout < 0 {
 		return fmt.Errorf("gateway.image_stream_data_interval_timeout must be non-negative")

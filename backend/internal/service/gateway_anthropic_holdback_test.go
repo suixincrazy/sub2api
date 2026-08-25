@@ -356,6 +356,84 @@ func TestAnthropicHoldbackObserverWindowNeedsCommitPoint(t *testing.T) {
 	require.False(t, o.windowElapsed(now.Add(time.Hour), time.Second))
 }
 
+// 2026-08-25 08:28:10 那一发的回归用例：上游一直在吐，持流总时长也必须封顶。
+//
+// 静默口径修掉了 02:06:53 那一类，代价是持流不再有任何上界——只要上游持续出帧，静默起点
+// 就不断刷新。那一发 out=3677 被攥了 83.4 秒（first_token_ms 83394 ≈ duration_ms 83423），
+// 客户端全程零字节。总时长上限从 firstCommitPointAt 起算、任何新帧都不能续期，专治这一类。
+func TestAnthropicHoldbackObserverMaxHoldCapsTotalHold(t *testing.T) {
+	const window = 15 * time.Second
+	const maxHold = 10 * time.Second
+	base := time.Date(2026, 8, 25, 8, 28, 10, 0, time.UTC)
+	o := &anthropicHoldbackObserver{}
+
+	// 每 200ms 一帧思考，连续 30 秒：静默那条永远不会到点。
+	const gap = 200 * time.Millisecond
+	now := base
+	for now.Sub(base) < 30*time.Second {
+		o.observe(gjson.Parse(`{"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"再想一层"}}`), true, now)
+		now = now.Add(gap)
+	}
+	require.False(t, o.windowElapsed(now, window),
+		"帧一直在到，静默窗口按定义永不耗尽——这正是需要第二条上限的理由")
+
+	require.Equal(t, base, o.firstCommitPointAt, "上限从第一个提交点起算")
+	require.False(t, o.maxHoldElapsed(base.Add(maxHold-time.Millisecond), maxHold))
+	require.True(t, o.maxHoldElapsed(base.Add(maxHold), maxHold))
+	require.True(t, o.releaseDeadlineElapsed(base.Add(maxHold), window, maxHold),
+		"两条截止线任意一条到点就该放行")
+	require.False(t, o.releaseDeadlineElapsed(base.Add(maxHold-time.Millisecond), window, maxHold))
+
+	// 上限配 0 表示不封顶，退化成只有静默一条。now 停在最后一帧之后 200ms，此刻静默那条
+	// 也没到点：两条都不放行，这正是改动前的行为——帧一直到，就一直攥着。
+	require.False(t, o.maxHoldElapsed(base.Add(time.Hour), 0), "上限配 0 时永不封顶")
+	require.True(t, o.holdbackMaxHoldDeadline(0).IsZero())
+	require.False(t, o.releaseDeadlineElapsed(now, window, 0),
+		"上限配 0 且帧刚到过，谁都不该放行——这就是改动前的行为")
+	// 而上限配 0 时放行权仍归静默那条：等它耗尽照样放行，不会因为上限缺席就永久攥着。
+	require.True(t, o.releaseDeadlineElapsed(now.Add(window), window, 0))
+}
+
+// 上限没起算之前不得放行：还没到提交点就说明持流一秒都还没开始。
+func TestAnthropicHoldbackObserverMaxHoldNeedsCommitPoint(t *testing.T) {
+	o := &anthropicHoldbackObserver{}
+	now := time.Date(2026, 8, 25, 8, 0, 0, 0, time.UTC)
+	o.observe(gjson.Parse(`{"type":"ping"}`), false, now)
+	require.False(t, o.maxHoldElapsed(now.Add(time.Hour), time.Second))
+	require.True(t, o.holdbackMaxHoldDeadline(time.Second).IsZero())
+	require.True(t, o.holdbackReleaseDeadline(time.Second, time.Second).IsZero())
+}
+
+// 定时器分支只认 holdbackReleaseDeadline 一个口径，所以它必须始终等于两条截止线里先到的
+// 那个。口径分歧的后果是定时器睡过上限、白攥一段——正是这一条要钉死的。
+func TestAnthropicHoldbackReleaseDeadlineTakesEarlierOfTwo(t *testing.T) {
+	base := time.Date(2026, 8, 25, 8, 28, 10, 0, time.UTC)
+	o := &anthropicHoldbackObserver{}
+	o.observe(gjson.Parse(`{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"我看一下。"}}`), true, base)
+
+	// 线上配置：窗口 15s、上限 10s。上游此刻静默，两条都已起算，上限先到。
+	require.Equal(t, base.Add(10*time.Second),
+		o.holdbackReleaseDeadline(15*time.Second, 10*time.Second),
+		"上限比窗口近时取上限")
+	// 反过来窗口更近时取窗口。
+	require.Equal(t, base.Add(3*time.Second),
+		o.holdbackReleaseDeadline(3*time.Second, 10*time.Second),
+		"窗口比上限近时取窗口")
+	// 各自配 0 时退化成另一条。
+	require.Equal(t, base.Add(10*time.Second), o.holdbackReleaseDeadline(0, 10*time.Second))
+	require.Equal(t, base.Add(3*time.Second), o.holdbackReleaseDeadline(3*time.Second, 0))
+	require.True(t, o.holdbackReleaseDeadline(0, 0).IsZero(), "两条都配 0 时没有截止时刻")
+
+	// 帧持续到达会把静默那条不断推后，上限那条不动——这正是两条并存的意义。
+	later := base.Add(20 * time.Second)
+	o.observe(gjson.Parse(`{"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"再想一层"}}`), true, later)
+	require.Equal(t, later.Add(15*time.Second), o.holdbackSilenceDeadline(15*time.Second),
+		"静默那条被新帧推后了")
+	require.Equal(t, base.Add(10*time.Second),
+		o.holdbackReleaseDeadline(15*time.Second, 10*time.Second),
+		"上限那条不受新帧影响，仍然是先到的那个")
+}
+
 // 端到端：疑似截断在客户端看到任何字节之前被丢掉并换号。这是整个改动的目的。
 func TestAnthropicPassthrough_HoldbackDiscardsShortTurnWithoutExposure(t *testing.T) {
 	const sessionKey = "holdback-discard"

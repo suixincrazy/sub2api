@@ -90,7 +90,7 @@ func (s *ChannelService) ListAvailable(ctx context.Context) ([]AvailableChannel,
 		ch.normalizeBillingModelSource()
 
 		supported := ch.SupportedModels()
-		s.fillGlobalPricingFallback(supported)
+		fillGlobalPricingFallback(s.pricingService, supported)
 
 		out = append(out, AvailableChannel{
 			ID:                 ch.ID,
@@ -117,18 +117,18 @@ func (s *ChannelService) ListAvailable(ctx context.Context) ([]AvailableChannel,
 //  1. Pricing == nil（渠道完全没声明该模型的定价条目）
 //  2. Pricing 非 nil 但所有价格字段为空（admin UI 建了条目但没填价格）
 //
-// 当 s.pricingService 为 nil（测试场景），跳过回落。
-func (s *ChannelService) fillGlobalPricingFallback(models []SupportedModel) {
-	if s.pricingService == nil {
+// 当 pricingService 为 nil（测试场景），跳过回落。可用渠道与模型广场共用。
+func fillGlobalPricingFallback(pricingService *PricingService, models []SupportedModel) {
+	if pricingService == nil {
 		return
 	}
 	for i := range models {
 		// 派生倍率必须**先**按「运营是否显式配过该档」定案，再让全局回落去补 nil 字段。
 		// 顺序反了的话回落补上的 LiteLLM 补全价会挡住本该派生出来的价，
 		// 于是广场展示 LiteLLM 价、实际扣费按派生价，两个口径打架。
-		derived := s.computeDerivedDisplayPrices(models[i].Name, models[i].Pricing)
+		derived := computeDerivedDisplayPrices(pricingService, models[i].Name, models[i].Pricing)
 		if pricingNeedsFallback(models[i].Pricing) {
-			if lp := s.pricingService.GetModelPricing(models[i].Name); lp != nil {
+			if lp := pricingService.GetModelPricing(models[i].Name); lp != nil {
 				models[i].Pricing = synthesizePricingFromLiteLLM(lp, models[i].Pricing)
 			}
 		}
@@ -170,7 +170,7 @@ func (d derivedTokenDisplayPrices) applyTo(p *ChannelModelPricing) *ChannelModel
 
 // computeDerivedDisplayPrices 复刻计费侧 applyDerivedTokenPrices 的口径，算出展示用派生价。
 // 有效提示价 = 渠道价优先，否则模型目录官方价；为 0 时不派生（与计费侧一致）。
-func (s *ChannelService) computeDerivedDisplayPrices(model string, p *ChannelModelPricing) derivedTokenDisplayPrices {
+func computeDerivedDisplayPrices(pricingService *PricingService, model string, p *ChannelModelPricing) derivedTokenDisplayPrices {
 	var out derivedTokenDisplayPrices
 	if p == nil || !p.HasDerivedTokenPrices() {
 		return out
@@ -180,8 +180,8 @@ func (s *ChannelService) computeDerivedDisplayPrices(model string, p *ChannelMod
 		return out
 	}
 	base := p.InputPrice
-	if base == nil && s.pricingService != nil {
-		if lp := s.pricingService.GetModelPricing(model); lp != nil {
+	if base == nil && pricingService != nil {
+		if lp := pricingService.GetModelPricing(model); lp != nil {
 			base = nonZeroPtr(lp.InputCostPerToken)
 		}
 	}
