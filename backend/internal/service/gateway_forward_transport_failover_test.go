@@ -33,7 +33,7 @@ func transportFailoverTestConfig() *config.Config {
 }
 
 // newAnthropicRegularAPIKeyAccount 是走**常规**转发链路的 Anthropic API Key 账号
-// （extra.anthropic_passthrough 未开启），即 upstream.example.invalid 这类第三方中转的形态。
+// （extra.anthropic_passthrough 未开启），即第三方中转的形态。
 func newAnthropicRegularAPIKeyAccount() *Account {
 	return &Account{
 		ID:          9301,

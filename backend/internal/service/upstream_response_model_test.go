@@ -133,7 +133,7 @@ func TestUpstreamModelMismatchDoesNotCollapseDifferentModels(t *testing.T) {
 func TestUpstreamModelMismatchUsesAccountResponseAliasMapping(t *testing.T) {
 	account := &Account{Credentials: map[string]any{
 		"upstream_response_model_mapping": map[string]any{
-			"upstream-deploy-alias-a":         "claude-opus-4-8",
+			"upstream-deploy-alias-a":      "claude-opus-4-8",
 			"upstream-deploy-alias-b": "claude-opus-4-8",
 		},
 	}}

@@ -214,7 +214,7 @@ func TestEvaluateStickyPreemption(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			got := evaluateStickyPreemption(tt.bound, tt.candidates, tt.higher, tt.rotate, tt.minIdle, now)
 			if got.preempt != tt.wantPreempt {
-				t.Fatalf("preempt = %v, want %v (reason=%q better=%d)", got.preempt, tt.wantPreempt, got.reason, got.betterA)
+				t.Fatalf("preempt = %v, want %v (reason=%q better=%d)", got.preempt, tt.wantPreempt, got.reason, got.betterAccountID)
 			}
 			if !tt.wantPreempt {
 				return
@@ -222,8 +222,8 @@ func TestEvaluateStickyPreemption(t *testing.T) {
 			if got.reason != tt.wantReason {
 				t.Errorf("reason = %q, want %q", got.reason, tt.wantReason)
 			}
-			if got.betterA != tt.wantBetter {
-				t.Errorf("betterA = %d, want %d", got.betterA, tt.wantBetter)
+			if got.betterAccountID != tt.wantBetter {
+				t.Errorf("betterAccountID = %d, want %d", got.betterAccountID, tt.wantBetter)
 			}
 		})
 	}
@@ -261,7 +261,7 @@ func TestStickyRotationAlternatesBetweenSamePriorityAccounts(t *testing.T) {
 			candidates, true, true, rotateIdle, now,
 		)
 		if decision.preempt {
-			bound = decision.betterA
+			bound = decision.betterAccountID
 		}
 		picks = append(picks, bound)
 		lastUsed[bound] = now
@@ -292,6 +292,7 @@ func TestStickyRotationAlternatesBetweenSamePriorityAccounts(t *testing.T) {
 // 关键在于两条判定的先后与门控差异：
 //   - 主号恢复（更高优先级）不受 MinIdle 约束，任何一轮都能立刻切回；
 //   - 同级副号轮换受 MinIdle 约束，只按轮换周期换。
+//
 // 若顺序颠倒或给切回也加上 MinIdle，主号恢复后仍要继续消耗副号额度。
 func TestStickyPreemptionSwitchesBackToPrimaryDuringSecondaryRotation(t *testing.T) {
 	const rotateIdle = 5 * time.Minute
@@ -340,7 +341,7 @@ func TestStickyPreemptionSwitchesBackToPrimaryDuringSecondaryRotation(t *testing
 			candidates, true, true, rotateIdle, now,
 		)
 		if decision.preempt {
-			bound = decision.betterA
+			bound = decision.betterAccountID
 		}
 		picks = append(picks, bound)
 		lastUsed[bound] = now
@@ -428,7 +429,7 @@ func TestStickyRotationAlternatesBetweenMultiplePrimaries(t *testing.T) {
 			if decision.reason != "same_priority_rotate" {
 				t.Fatalf("主号档轮换的原因应为 same_priority_rotate，实际 %q（picks=%v）", decision.reason, picks)
 			}
-			bound = decision.betterA
+			bound = decision.betterAccountID
 		}
 		picks = append(picks, bound)
 		lastUsed[bound] = now
@@ -482,7 +483,7 @@ func TestStickyRotationCoversEveryPrimaryInTopTier(t *testing.T) {
 			candidates, true, true, rotateIdle, now,
 		)
 		if decision.preempt {
-			bound = decision.betterA
+			bound = decision.betterAccountID
 		}
 		seen[bound]++
 		lastUsed[bound] = now

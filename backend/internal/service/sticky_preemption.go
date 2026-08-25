@@ -26,9 +26,9 @@ import (
 
 // stickyPreemptionDecision 描述一次抢占判定结果。
 type stickyPreemptionDecision struct {
-	preempt bool
-	reason  string
-	betterA int64 // 触发抢占的更优账号 ID，仅用于日志
+	preempt         bool
+	reason          string
+	betterAccountID int64 // 触发抢占的更优账号 ID，仅用于日志
 }
 
 // stickyPreemptionCandidate 是抢占判定所需的账号最小信息，
@@ -101,14 +101,14 @@ func evaluateStickyPreemption(
 
 	// 更高优先级恢复优先于同优先级轮询。
 	if bestHigher != nil {
-		return stickyPreemptionDecision{preempt: true, reason: "higher_priority_recovered", betterA: bestHigher.ID}
+		return stickyPreemptionDecision{preempt: true, reason: "higher_priority_recovered", betterAccountID: bestHigher.ID}
 	}
 	if bestRotate != nil {
-		// betterA 是「触发抢占的证据账号」（同级里最久未使用的那个），不是最终选号结果：
+		// betterAccountID 是「触发抢占的证据账号」（同级里最久未使用的那个），不是最终选号结果：
 		// 抢占只负责删掉绑定，最终选谁由 Layer 2 负载感知层重新决定，
 		// 而 Layer 2 会在「同优先级 + 同负载 + 最近使用时间相近」的组内随机打散
 		// （见 sameLastUsedAt / lastUsedGroupTolerance），所以多个同级账号之间是随机轮换。
-		return stickyPreemptionDecision{preempt: true, reason: "same_priority_rotate", betterA: bestRotate.ID}
+		return stickyPreemptionDecision{preempt: true, reason: "same_priority_rotate", betterAccountID: bestRotate.ID}
 	}
 	return stickyPreemptionDecision{}
 }
@@ -150,7 +150,7 @@ func logStickyPreemption(groupID int64, sessionHash string, bound int64, decisio
 		"group_id", groupID,
 		"session", shortSessionHash(sessionHash),
 		"bound_account_id", bound,
-		"better_account_id", decision.betterA,
+		"better_account_id", decision.betterAccountID,
 		"reason", decision.reason,
 	)
 }
