@@ -94,6 +94,10 @@ func shortTurnSSE(text string, outputTokens int, toolUse bool) *http.Response {
 }
 
 func blockOrderViolationSSE(stopReason string) *http.Response {
+	return blockOrderViolationSSEWithOutput(stopReason, 591)
+}
+
+func blockOrderViolationSSEWithOutput(stopReason string, outputTokens int) *http.Response {
 	return &http.Response{
 		StatusCode: http.StatusOK,
 		Header:     http.Header{"Content-Type": []string{"text/event-stream"}},
@@ -118,7 +122,7 @@ func blockOrderViolationSSE(stopReason string) *http.Response {
 			"",
 			`data: {"type":"content_block_stop","index":2}`,
 			"",
-			fmt.Sprintf(`data: {"type":"message_delta","delta":{"stop_reason":%q},"usage":{"output_tokens":591}}`, stopReason),
+			fmt.Sprintf(`data: {"type":"message_delta","delta":{"stop_reason":%q},"usage":{"output_tokens":%d}}`, stopReason, outputTokens),
 			"",
 			`data: {"type":"message_stop"}`,
 			"",
@@ -527,7 +531,7 @@ func TestStickySessionScopeRoundTrip(t *testing.T) {
 // runShortTurnRegularPath 跑一次常规（非透传）链路的流式转发，带粘性会话坐标。
 //
 // 这条链路是 handleStreamingResponse，第三方中转账号（不开 anthropic_passthrough 的
-// apikey 号，如 upstream.example.invalid）走的就是它。与透传分支用同一组判定函数，但原先
+// apikey 号，如第三方中转）走的就是它。与透传分支用同一组判定函数，但原先
 // 完全没有采集判定所需的输入，所以短回合解绑对这条路是死代码。
 func runShortTurnRegularPath(
 	t *testing.T, svc *GatewayService, groupID int64, sessionKey string,

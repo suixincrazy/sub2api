@@ -68,7 +68,7 @@ func runHoldbackPassthrough(
 //   - 丢弃额度必须能一票否决 Discard。用户问的问题本来就只有一句话答案时，每个账号都会
 //     给同样的短回合，不设上限会一路重试到调度耗尽，把一个完好的短回答变成 502。
 //   - 额度按形态分档。空回合不存在「本来就该是空的答案」这种合法解释，所以它的上限比短回合
-//     宽；两档共用同一个计数器，各自比自己的上限。
+//     宽；两种启发式形态共用一个计数器，各自比自己的上限，块序判据另有独立额度。
 //   - 客户端死气吃满时也一票否决 Discard，且这一条独立于 windowGone。换号会让新尝试的三条
 //     截止线全部归零、客户端在同一个 HTTP 请求上从头再等一轮，这正是 14:33:58 那一发跨
 //     3 次尝试攥到 60 秒的成因。
@@ -142,8 +142,8 @@ func TestAnthropicHoldbackVerdict(t *testing.T) {
 			want: anthropicHoldbackRelease,
 		},
 		// 4 条 disposition=delivered（2026-08-24 15:04:12 / 15:12:13 / 18:09:58 / 18:14:40）
-		// 的根因就在这里：两档共用一次性额度时，第一个坏号把额度吃光，第二个坏号的空响应必然
-		// 放行。下一条才是真正区分两档的那一行：discards 已经到了短回合的上限，空回合仍然丢。
+		// 的根因就在这里：启发式两档共用一次性额度时，第一个坏号把额度吃光，第二个坏号的空
+		// 响应必然放行。下一条才是真正区分两档的那一行：启发式额度已到短回合上限，空回合仍然丢。
 		{
 			name:       "零正文且已丢弃过一次：仍然丢弃，这是 4 条 delivered 的根因",
 			stopReason: "end_turn", proseRunes: 0, outputTokens: 1, heuristicDiscards: 1,
@@ -180,8 +180,8 @@ func TestAnthropicHoldbackVerdict(t *testing.T) {
 			heuristicDiscards: anthropicShortTurnDiscardBudget,
 			want:              anthropicHoldbackRelease,
 		},
-		// 两档共用一个计数器，所以顺序无关：为空回合丢满之后，短回合那一档立刻判定额度已尽，
-		// 短回合上限的保护不会因为空回合放宽而失效。
+		// 两种启发式形态共用一个计数器，所以顺序无关：为空回合丢满之后，短回合那一档立刻判定
+		// 启发式额度已尽，短回合上限的保护不会因为空回合放宽而失效。
 		{
 			name:       "空回合丢满之后短回合不再丢",
 			stopReason: "end_turn", proseRunes: 131, outputTokens: 70,
@@ -745,6 +745,25 @@ func TestAnthropicPassthrough_BlockOrderDiscardHasIndependentBudget(t *testing.T
 	require.Equal(t, 1, repo.tempCalls)
 }
 
+func TestAnthropicPassthrough_ExhaustedBlockOrderBudgetFallsBackToHeuristic(t *testing.T) {
+	const sessionKey = "holdback-block-order-exhausted"
+	const groupID = int64(1)
+	cache := newShortTurnStreakCache(sessionKey, 9)
+	svc, _ := newHoldbackTestGatewayService(t, cache, 3000)
+
+	rec, c, err := runHoldbackPassthrough(t, svc, groupID, sessionKey, 9,
+		blockOrderViolationSSEWithOutput("end_turn", 70), func(c *gin.Context) {
+			c.Set(anthropicBlockOrderDiscardsKey, anthropicBlockOrderDiscardBudget)
+		})
+
+	var failoverErr *UpstreamFailoverError
+	require.True(t, errors.As(err, &failoverErr))
+	require.Equal(t, GatewayFailureReason("anthropic_short_turn_holdback"), failoverErr.Reason)
+	require.Empty(t, rec.Body.String())
+	require.Equal(t, anthropicBlockOrderDiscardBudget, anthropicBlockOrderDiscardsUsed(c))
+	require.Equal(t, 1, anthropicHoldbackDiscardsUsed(c))
+}
+
 func TestAnthropicPassthrough_BlockOrderWinsOverIncompleteAfterCommit(t *testing.T) {
 	const sessionKey = "delivered-block-order"
 	const groupID = int64(1)
@@ -872,9 +891,9 @@ func TestAnthropicPassthrough_HoldbackShortTurnBudgetExhaustedDeliversAndUnbinds
 
 // 空回合的额度比短回合宽，这是 4 条 disposition=delivered 的直接修复。
 //
-// 实证形态：账号 9 被丢弃后 5~6 秒，账号 12 的空回合落地成一个 200。两档共用一次性额度时
-// 第一个坏号把额度吃光，第二个坏号必然放行。这里先记一次丢弃（模拟账号 9 那一发），再喂
-// 一条空回合，必须仍然丢弃。
+// 实证形态：账号 9 被丢弃后 5~6 秒，账号 12 的空回合落地成一个 200。启发式两档共用一次性
+// 额度时，第一个坏号把额度吃光，第二个坏号必然放行。这里先记一次丢弃（模拟账号 9 那一发），
+// 再喂一条空回合，必须仍然丢弃。
 func TestAnthropicPassthrough_HoldbackEmptyAnswerStillDiscardedAfterFirstDiscard(t *testing.T) {
 	const sessionKey = "holdback-empty-second-account"
 	const groupID = int64(1)

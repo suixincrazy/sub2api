@@ -700,7 +700,7 @@ const (
 	// 理由——放行的结果一定是客户端吃到一个没有答案的 200。
 	//
 	// 2026-08-24 实证：4 条 disposition=delivered（15:04:12 / 15:12:13 / 18:09:58 /
-	// 18:14:40）全是账号 12 在账号 9 被丢弃后 5~6 秒落地的空回合。两档共用一次性额度时，
+	// 18:14:40）全是账号 12 在账号 9 被丢弃后 5~6 秒落地的空回合。启发式两档共用一次性额度时，
 	// 第一个坏号把额度吃光，第二个坏号的空响应就必然放行，窗口调到多大都没用。
 	//
 	// 仍然留上限而不是无限重试：空回合这一档会走 HandleStreamTruncated 把账号冷却一分钟，
@@ -799,9 +799,9 @@ func anthropicHoldbackVerdict(
 
 // anthropicHoldbackDiscardBudget 给出这一形态在一次客户端请求里允许丢弃的次数。
 //
-// 两档共用同一个计数器、各自比自己的上限，顺序无关：先为短回合丢满 2 次之后，空回合仍能
-// 继续丢（2 < 3）；反过来为空回合丢满 3 次之后，短回合那一档立刻判定额度已尽（3 >= 2），
-// 短回合上限的保护不会因为空回合放宽而失效。
+// 两种启发式形态共用同一个计数器、各自比自己的上限，顺序无关：先为短回合丢满 2 次之后，
+// 空回合仍能继续丢（2 < 3）；反过来为空回合丢满 3 次之后，短回合那一档立刻判定额度已尽
+// （3 >= 2），短回合上限的保护不会因为空回合放宽而失效。块序判据使用独立计数器。
 func anthropicHoldbackDiscardBudget(
 	stopReason string, proseRunes, outputTokens int, sawToolUseBlock bool,
 ) int {
@@ -1386,7 +1386,7 @@ func (s *GatewayService) reportStreamTruncatedAfterCommit(ctx context.Context, c
 //
 // 调用点两处，覆盖「拦下来了」和「没拦住」两种结局：持流丢弃分支（客户端零暴露）与
 // reportIfTerminalButIncomplete（持流关闭/窗口耗尽/重试额度已用，响应已交付）。
-// 两处都与 reportAnthropicShortTurnUnbind 二选一：共用一个计数窗口，不能记两次。
+// 两处都与 reportAnthropicShortTurnUnbind 二选一，不能对同一故障重复归因。
 func (s *GatewayService) reportAnthropicEmptyAnswerTurn(
 	ctx context.Context, c *gin.Context, resp *http.Response, account *Account, model string,
 	outputTokens int, stopReason, disposition string,
@@ -1514,8 +1514,8 @@ func (s *GatewayService) unbindStickySessionNow(ctx context.Context, account *Ac
 //
 // 调用点两处，覆盖「拦下来了」和「没拦住」两种结局：持流丢弃分支（disposition=discarded，
 // 客户端零暴露）与 reportIfTerminalButIncomplete（disposition=delivered，持流关闭/窗口
-// 耗尽/丢弃额度已用，响应已经交付）。两处都与另外两个报告器互斥：共用一个计数窗口，
-// 同一次故障不能记两次。
+// 耗尽/丢弃额度已用，响应已经交付）。两处都与另外两个报告器互斥，同一次故障不能记两次；
+// 块序丢弃额度与启发式额度独立维护。
 func (s *GatewayService) reportAnthropicBlockOrderViolation(
 	ctx context.Context, c *gin.Context, resp *http.Response, account *Account, model string,
 	proseRunes, outputTokens int, stopReason, disposition string,
@@ -2236,7 +2236,7 @@ func (s *GatewayService) handleStreamingResponseAnthropicAPIKeyPassthrough(
 				unbound := s.noteAnthropicShortTurnStreak(ctx, account, model, proseRunes, usage.OutputTokens)
 				// 走到这里说明这一发没被持流拦住（窗口配 0、窗口耗尽、或本请求的重试额度
 				// 已经用掉），客户端已经吃到一个残缺的 200。解绑只管下一发落在哪，账号本身
-				// 还在池子里，所以要额外冷却账号。两个报告器共用同一个计数窗口，只能二选一。
+				// 还在池子里，所以要额外冷却账号。两个报告器只能二选一，避免同一次故障重复计数。
 				switch {
 				case anthropicTurnIsEmptyAnswer(sawStopReason, proseRunes, usage.OutputTokens, sawToolUseBlock):
 					s.reportAnthropicEmptyAnswerTurn(ctx, c, resp, account, model,
@@ -2391,7 +2391,7 @@ func (s *GatewayService) handleStreamingResponseAnthropicAPIKeyPassthrough(
 						// 块序违规单独一条出口：判据是确定性的，所以解绑不走短回合的连击阈值，
 						// 归因也不能记成短回合/空回合——那两档的根因是「没把话说完」，这一档是
 						// 「块拼错了序，正文可能整段是伪造的」，混记就看不出某个上游在犯哪种错。
-						if holdback.blockOrder.violation() {
+						if holdback.blockOrder.violation() && blockOrderDiscardsUsed < anthropicBlockOrderDiscardBudget {
 							s.unbindStickySessionNow(ctx, account, model, "content block order violation")
 							s.reportAnthropicBlockOrderViolation(ctx, c, resp, account, model,
 								holdback.proseRunes, holdback.outputTokens,
