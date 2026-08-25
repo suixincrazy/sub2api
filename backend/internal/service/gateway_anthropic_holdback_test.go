@@ -765,12 +765,9 @@ func TestAnthropicPassthrough_ExhaustedBlockOrderBudgetFallsBackToHeuristic(t *t
 	require.Equal(t, 1, cache.deletedSessions[sessionKey], "块序额度耗尽后的启发式回退仍必须解绑粘性会话")
 	require.Equal(t, 1, repo.tempCalls, "启发式回退解绑时必须冷却账号一次")
 	events := opsEvents(t, c)
-	var kinds []string
-	for _, event := range events {
-		kinds = append(kinds, event.Kind)
-	}
-	require.Contains(t, kinds, "short_turn_streak_unbind")
-	require.Contains(t, kinds, "short_turn_holdback_failover")
+	require.Len(t, events, 2)
+	require.Equal(t, "short_turn_streak_unbind", events[0].Kind)
+	require.Equal(t, "short_turn_holdback_failover", events[1].Kind)
 }
 
 func TestAnthropicPassthrough_BlockOrderWinsOverIncompleteAfterCommit(t *testing.T) {
