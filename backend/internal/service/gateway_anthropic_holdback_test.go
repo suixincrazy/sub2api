@@ -510,12 +510,13 @@ func TestAnthropicHoldbackObserverDeadAirSpansFailoverAttempts(t *testing.T) {
 	// 第二次尝试：换到账号 5，observer 全新，但 streamStartedAt 仍是同一个客户端请求起点。
 	second := &anthropicHoldbackObserver{streamStartedAt: requestStart}
 	secondFrame := discardAt.Add(500 * time.Millisecond)
-	second.observe(gjson.Parse(`{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"我再看一下。"}}`), true, secondFrame)
+	second.observe(gjson.Parse(`{"type":"message_start","message":{"usage":{"input_tokens":129000}}}`), false, secondFrame)
 
-	// 关键断言：以本次尝试为锚的两条线在这一刻都远没到点，唯独死气那条已经吃满。
+	// 第二次尝试只送出不提交响应的 message_start 后静默，前两条线都没起算；唯独锚在
+	// 客户端请求起点的死气预算会跨尝试继续走，并最终负责放行。
 	release := requestStart.Add(30*time.Second + 760*time.Millisecond) // 实测客户端 30.76 秒零字节
-	require.False(t, second.windowElapsed(release, 15*time.Second), "换号后静默那条重新起算，没到点")
-	require.False(t, second.maxHoldElapsed(release, 10*time.Second), "换号后上限那条重新起算，没到点")
+	require.False(t, second.windowElapsed(release, 15*time.Second), "没有提交点时静默线不参与")
+	require.False(t, second.maxHoldElapsed(release, 10*time.Second), "没有提交点时总时长线不参与")
 	require.True(t, second.deadAirElapsed(release, budget), "死气跨尝试累加，此刻必须已经吃满")
 	require.True(t, second.releaseDeadlineElapsed(release, 15*time.Second, 10*time.Second, budget),
 		"三条任意一条到点就该放行——这一刻只有死气那条在说话")
@@ -549,11 +550,11 @@ func TestAnthropicPassthrough_HoldbackDiscardsShortTurnWithoutExposure(t *testin
 	require.True(t, failoverErr.ShouldRetryNextAccount(), "必须继续换号")
 	require.False(t, failoverErr.RetryableOnSameAccount, "同一个坏中转上重试只会再截断一次")
 
-	// 不得罚号：判据是启发式的。Scope=Request + RequestScopedTransient 是这个仓库里
-	// 「故障与账号健康无关」的既有标记，TempUnscheduleRetryableError 会直接 return。
+	// 达到解绑阈值后必须冷却当前账号，避免删掉粘性绑定后调度仍选回同一个首选号。
+	// 只有未达到阈值的观测才不罚号；这条用例的阈值为 1，已经触发解绑。
 	require.Equal(t, GatewayFailureScopeRequest, failoverErr.Scope)
 	require.True(t, failoverErr.RequestScopedTransient)
-	require.Zero(t, repo.tempCalls, "持流丢弃不得罚号")
+	require.Equal(t, 1, repo.tempCalls, "持流丢弃在解绑时必须冷却账号")
 
 	// 零暴露：这是整条用例的重点，少了这两行就退化成事后归因。
 	require.Empty(t, rec.Body.String(), "截断内容一个字节都不能写给客户端")
@@ -604,14 +605,12 @@ func TestAnthropicPassthrough_HoldbackDiscardsEmptyAnswerWithoutExposure(t *test
 
 	// 罚号：与「说得少」分开。end_turn 声明说完了却一个字没说，不存在合法解释，
 	// 所以这一档要把账号从调度池里暂时摘掉——否则解绑后重新选号仍可能落回它。
-	require.Positive(t, repo.tempCalls, "空回合是确定性上游故障，必须冷却账号")
+	require.Equal(t, 1, repo.tempCalls, "空回合必须冷却账号且不得与短回合报告器重复计数")
 }
 
-// 对照组：同样走丢弃路径，但正文非空（只是短）。这一发不得罚号——用户的问题本来就可能
-// 只有一句话的答案，罚号会把一个好账号从所有会话的调度池里摘掉。
-//
-// 这一对（上面罚、这里不罚）是罚号边界的全部内容，必须成对存在。
-func TestAnthropicPassthrough_HoldbackDiscardShortButNonEmptyDoesNotPenalize(t *testing.T) {
+// 短但非空的回合达到解绑阈值后也必须冷却账号；报告器只应执行一次。
+// 空回合与这一档仍由调用点二选一，不能因为短回合非空而漏掉冷却。
+func TestAnthropicPassthrough_HoldbackDiscardShortButNonEmptyPenalizesOnce(t *testing.T) {
 	const sessionKey = "holdback-discard-nonempty"
 	const groupID = int64(1)
 	cache := newShortTurnStreakCache(sessionKey, 12)
@@ -624,7 +623,7 @@ func TestAnthropicPassthrough_HoldbackDiscardShortButNonEmptyDoesNotPenalize(t *
 	require.True(t, errors.As(err, &failoverErr))
 	require.Empty(t, rec.Body.String())
 	require.Equal(t, 1, cache.deletedSessions[sessionKey], "短回合同样解绑")
-	require.Zero(t, repo.tempCalls, "有正文就可能是合法短回答，只解绑不罚号")
+	require.Equal(t, 1, repo.tempCalls, "达到解绑阈值后必须冷却账号")
 }
 
 // 短回合（有正文）丢过一次之后仍要继续丢，这是 19:2x 那两发交付的直接修复。
@@ -650,7 +649,7 @@ func TestAnthropicPassthrough_HoldbackShortTurnStillDiscardedAfterFirstDiscard(t
 	require.True(t, failoverErr.ShouldRetryNextAccount())
 	require.Empty(t, rec.Body.String(), "一个字节都不能写给客户端")
 	require.Equal(t, 2, anthropicHoldbackDiscardsUsed(c), "计数要累加，不是布尔")
-	require.Zero(t, repo.tempCalls, "有正文就可能是合法短回答，只解绑不罚号")
+	require.Equal(t, 1, repo.tempCalls, "该回合只报告一次解绑冷却")
 }
 
 // 短回合的额度不是无限：丢满 anthropicShortTurnDiscardBudget 次之后必须原样交付并回落到解绑。
@@ -677,7 +676,7 @@ func TestAnthropicPassthrough_HoldbackShortTurnBudgetExhaustedDeliversAndUnbinds
 
 	// 交付了就回落到解绑，让下一发换号。
 	requireUnboundOnce(t, cache, groupID, sessionKey)
-	require.Zero(t, repo.tempCalls)
+	require.Equal(t, 1, repo.tempCalls, "交付路径达到解绑阈值后也必须冷却账号")
 }
 
 // 空回合的额度比短回合宽，这是 4 条 disposition=delivered 的直接修复。
@@ -703,7 +702,7 @@ func TestAnthropicPassthrough_HoldbackEmptyAnswerStillDiscardedAfterFirstDiscard
 	require.Empty(t, rec.Body.String(), "空响应一个字节都不能写给客户端")
 	require.False(t, c.Writer.Written())
 	require.Equal(t, 2, anthropicHoldbackDiscardsUsed(c), "计数要累加，不是布尔")
-	require.Positive(t, repo.tempCalls, "空回合照旧冷却账号")
+	require.Equal(t, 1, repo.tempCalls, "空回合必须只冷却一次")
 }
 
 // 空回合的额度也不是无限：丢满 anthropicEmptyAnswerDiscardBudget 次之后必须退化成放行。
@@ -728,7 +727,7 @@ func TestAnthropicPassthrough_HoldbackEmptyAnswerBudgetExhaustedDelivers(t *test
 
 	// 交付了就回落到解绑 + 冷却，与 delivered 那一档同口径。
 	requireUnboundOnce(t, cache, groupID, sessionKey)
-	require.Positive(t, repo.tempCalls, "交付出去的空回合仍要冷却账号")
+	require.Equal(t, 1, repo.tempCalls, "交付出去的空回合仍要冷却且不得重复计数")
 }
 
 // 成段回答必须照常交付，且不能因为持流丢帧或乱序。
@@ -922,7 +921,7 @@ func TestAnthropicPassthrough_HoldbackSurvivesLongThinkingWithoutExposure(t *tes
 	require.Empty(t, rec.Body.String(), "判定成形之前一个字节都不能写给客户端")
 	require.False(t, c.Writer.Written())
 	require.Equal(t, 1, anthropicHoldbackDiscardsUsed(c))
-	require.Zero(t, repo.tempCalls, "持流丢弃不得罚号")
+	require.Equal(t, 1, repo.tempCalls, "持流丢弃在解绑时必须冷却账号")
 	require.Equal(t, 1, cache.deletedSessions[sessionKey], "丢弃必须同时解绑")
 }
 
@@ -983,8 +982,8 @@ func TestAnthropicPassthrough_HoldbackDiscardsThinkingInflatedTurnWithoutExposur
 	require.Equal(t, 1, anthropicHoldbackDiscardsUsed(c))
 
 	require.Equal(t, 1, cache.deletedSessions[sessionKey], "丢弃必须同时解绑，否则下一发还是这个号")
-	// 有正文（哪怕只有两个字符）就不是空回合：只解绑，不罚号。
-	require.Zero(t, repo.tempCalls, "有正文就可能是合法短回答，不得罚号")
+	// 有正文（哪怕只有两个字符）就不是空回合，但达到解绑阈值仍要冷却当前账号。
+	require.Equal(t, 1, repo.tempCalls, "达到解绑阈值后必须冷却账号")
 }
 
 // 2026-08-24 17:02:33 那一发的端到端复现（usage_logs id=9544，账号 10）：上游把
@@ -1015,7 +1014,6 @@ func TestAnthropicPassthrough_HoldbackDiscardsZeroUsageWithProseWithoutExposure(
 	require.Equal(t, 1, anthropicHoldbackDiscardsUsed(c))
 
 	require.Equal(t, 1, cache.deletedSessions[sessionKey])
-	// 不罚号：这一档由正文长度说话，与「开了块却零输出」的确定性残缺分开，
-	// 避免同一次故障被两套逻辑各记一次。
-	require.Zero(t, repo.tempCalls, "有正文就只解绑不罚号")
+	// 这一档由正文长度归入短回合；达到解绑阈值后仍需冷却当前账号。
+	require.Equal(t, 1, repo.tempCalls, "达到解绑阈值后必须冷却账号")
 }

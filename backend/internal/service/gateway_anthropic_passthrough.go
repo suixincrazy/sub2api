@@ -1179,36 +1179,40 @@ func anthropicTurnProvesUpstreamHealthy(
 	return proseRunes > anthropicHealthyTurnMinProseRunes
 }
 
-// noteAnthropicShortTurnStreak 累计可疑短回合，达到阈值就解除本会话的粘性绑定。
+// noteAnthropicShortTurnStreak 累计可疑短回合，达到阈值就解除本会话的粘性绑定，
+// 并返回这一次是否真的解绑了。
 //
-// 为什么解绑而不是罚号：罚号会把账号从所有会话的调度池里摘掉，而这里的判据是启发式的，
-// 误判代价太大。解绑只影响这一条会话的账号亲和性，误判的代价仅是丢一次 prompt cache，
-// 而收益是客户端下一发能落到同优先级的另一个账号上——正是「自动切换到别的号继续」。
+// 为什么先解绑而不是直接罚号：罚号会把账号从所有会话的调度池里摘掉，而这里的判据是
+// 启发式的，每一次观测都罚的误判代价太大——单发短回答有「问题本来就只有一句话答案」
+// 这种合法解释。解绑只影响这一条会话的账号亲和性，误判代价仅是丢一次 prompt cache。
+//
+// 返回值给调用方用来补一次账号冷却：解绑本身治不了「坏号正好是首选号」的情况，见
+// reportAnthropicShortTurnUnbind。未达阈值的观测返回 false，仍然零惩罚。
 func (s *GatewayService) noteAnthropicShortTurnStreak(
 	ctx context.Context, account *Account, model string, proseRunes, outputTokens int,
-) {
+) bool {
 	groupID, sessionKey, ok := StickySessionScopeFromContext(ctx)
 	if !ok {
-		return
+		return false
 	}
 	store, ok := s.cache.(stickyShortTurnStreakStore)
 	if !ok {
-		return
+		return false
 	}
 	streak, err := store.IncrStickyShortTurnStreak(ctx, groupID, sessionKey, stickySessionTTL)
 	if err != nil {
 		slog.Warn("sticky_short_turn_incr_failed", "account_id", account.ID, "error", err)
-		return
+		return false
 	}
 	if streak < anthropicShortTurnStreakThreshold {
 		slog.Info("sticky_short_turn_observed",
 			"account_id", account.ID, "model", model, "streak", streak,
 			"prose_runes", proseRunes, "output_tokens", outputTokens)
-		return
+		return false
 	}
 	if err := s.cache.DeleteSessionAccountID(ctx, groupID, sessionKey); err != nil {
 		slog.Warn("sticky_short_turn_unbind_failed", "account_id", account.ID, "error", err)
-		return
+		return false
 	}
 	// 解绑后清零：否则下一发换到好账号上答了一句短话就又达标，会来回解绑。
 	if err := store.ResetStickyShortTurnStreak(ctx, groupID, sessionKey); err != nil {
@@ -1218,6 +1222,7 @@ func (s *GatewayService) noteAnthropicShortTurnStreak(
 		"account_id", account.ID, "model", model, "streak", streak,
 		"prose_runes", proseRunes, "output_tokens", outputTokens,
 		"reason", "consecutive protocol-legal but suspiciously short turns")
+	return true
 }
 
 // clearAnthropicShortTurnStreak 在一次正常回合后清零连击数。
@@ -1241,6 +1246,8 @@ const anthropicIncompleteStreamUpstreamMessage = "Anthropic upstream delivered a
 const anthropicTruncatedStreamUpstreamMessage = "Anthropic upstream truncated the SSE stream after it was committed to the client"
 
 const anthropicEmptyAnswerTurnUpstreamMessage = "Anthropic upstream ended the turn with no visible answer"
+
+const anthropicShortTurnUnbindUpstreamMessage = "Anthropic upstream repeatedly ended turns after unusually short replies"
 
 const anthropicUnfailedOverRefusalUpstreamMessage = "Anthropic upstream returned a safeguards refusal that could no longer be failed over"
 
@@ -1303,12 +1310,14 @@ func (s *GatewayService) reportStreamTruncatedAfterCommit(ctx context.Context, c
 // 故障：这一发没有产出可用输出。线上该设置是 threshold_count=1 / temp_unsched 1 分钟，
 // 所以第一次空回合就把账号冷却一分钟，下一发自然落到别的号。
 //
-// 为什么这一档可以罚号，而短回合不行：短回合有「用户问的问题本来就只有一句话答案」这种
-// 合法解释，误判会把健康账号摘下线；空回合没有对应的合法解释。实测对照也支持这个判断，
-// 见 anthropicTurnLooksSuspiciouslyShort 的注释。
+// 为什么这一档一次就罚，而短回合要等连击到阈值：短回合有「用户问的问题本来就只有一句话
+// 答案」这种合法解释，逐发罚会把健康账号摘下线；空回合没有对应的合法解释。实测对照也支持
+// 这个判断，见 anthropicTurnLooksSuspiciouslyShort 的注释。短回合那一档的口径见
+// reportAnthropicShortTurnUnbind。
 //
 // 调用点两处，覆盖「拦下来了」和「没拦住」两种结局：持流丢弃分支（客户端零暴露）与
 // reportIfTerminalButIncomplete（持流关闭/窗口耗尽/重试额度已用，响应已交付）。
+// 两处都与 reportAnthropicShortTurnUnbind 二选一：共用一个计数窗口，不能记两次。
 func (s *GatewayService) reportAnthropicEmptyAnswerTurn(
 	ctx context.Context, c *gin.Context, resp *http.Response, account *Account, model string,
 	outputTokens int, stopReason, disposition string,
@@ -1335,6 +1344,56 @@ func (s *GatewayService) reportAnthropicEmptyAnswerTurn(
 	slog.Warn("anthropic_empty_answer_turn",
 		"account_id", account.ID, "account_name", account.Name, "model", model,
 		"stop_reason", stopReason, "output_tokens", outputTokens,
+		"disposition", disposition, "upstream_request_id", upstreamRequestID)
+	if s.rateLimitService != nil {
+		s.rateLimitService.HandleStreamTruncated(ctx, account, model)
+	}
+}
+
+// reportAnthropicShortTurnUnbind 归因并冷却「连击到阈值、刚刚被解绑」的账号。
+//
+// 为什么解绑之后还要罚号：解绑只是删掉会话到账号的亲和记录，下一发要落到哪由调度决定，
+// 而调度是按 priority 升序取的（account_repo.go 的 ORDER BY ... priority ASC）。坏号
+// 如果正好是本组 priority 最小的那个，删掉绑定后下一发照旧选回它 —— 解绑成了空操作。
+// 线上实测到过这一幕：解绑后紧接着的那一发又回到同一个号上，继续断。
+//
+// 罚号的口径刻意收在「真的解绑了」这一刻，而不是每次可疑观测：单发短回合有「问题本来
+// 就只有一句话答案」这种合法解释，逐发罚会把健康账号摘下线；连击到阈值意味着这条会话
+// 上已经连续出现，合法解释站不住了。未达阈值的观测仍然零惩罚，见
+// noteAnthropicShortTurnStreak。
+//
+// 与空回合那一档共用 stream_timeout_settings（运维一个旋钮），只在 Kind 与文案上区分。
+// 线上配置 threshold_count=1 / temp_unsched 1 分钟，所以解绑那一刻账号冷却一分钟，
+// 足够让下一发绕开它，又不至于长时间少一个号。
+//
+// 调用方必须与 reportAnthropicEmptyAnswerTurn 二选一：空回合已经自带冷却，两个都调
+// 会让同一次故障在计数窗口里记两次。
+func (s *GatewayService) reportAnthropicShortTurnUnbind(
+	ctx context.Context, c *gin.Context, resp *http.Response, account *Account, model string,
+	proseRunes, outputTokens int, stopReason, disposition string,
+) {
+	if account == nil {
+		return
+	}
+	upstreamRequestID := ""
+	if resp != nil {
+		upstreamRequestID = resp.Header.Get("x-request-id")
+	}
+	detail := fmt.Sprintf("stop_reason=%s prose_runes=%d output_tokens=%d disposition=%s",
+		stopReason, proseRunes, outputTokens, disposition)
+	appendOpsUpstreamError(c, OpsUpstreamErrorEvent{
+		Platform:           account.Platform,
+		AccountID:          account.ID,
+		AccountName:        account.Name,
+		UpstreamStatusCode: http.StatusBadGateway,
+		UpstreamRequestID:  upstreamRequestID,
+		Kind:               "short_turn_streak_unbind",
+		Message:            anthropicShortTurnUnbindUpstreamMessage,
+		Detail:             detail,
+	})
+	slog.Warn("anthropic_short_turn_streak_unbind",
+		"account_id", account.ID, "account_name", account.Name, "model", model,
+		"stop_reason", stopReason, "prose_runes", proseRunes, "output_tokens", outputTokens,
 		"disposition", disposition, "upstream_request_id", upstreamRequestID)
 	if s.rateLimitService != nil {
 		s.rateLimitService.HandleStreamTruncated(ctx, account, model)
@@ -1933,17 +1992,20 @@ func (s *GatewayService) handleStreamingResponseAnthropicAPIKeyPassthrough(
 			sawStopReason, visibleChars, usage.OutputTokens, sawContentBlockStart)
 		if !incomplete {
 			// 确定性判定放行之后，再看这一回合是否属于「协议合法但疑似没把话说完」。
-			// 这条路径只累计连击 / 到阈值解绑，绝不罚号，见 noteAnthropicShortTurnStreak。
 			// 三态：可疑 -> 累计连击；有正面证据 -> 清零；其余（典型是 tool_use 中间回合）
 			// -> 不表态，保留连击。见 anthropicTurnProvesUpstreamHealthy。
 			if anthropicTurnLooksSuspiciouslyShort(sawStopReason, proseRunes, usage.OutputTokens, sawToolUseBlock, thinkingRunes) {
-				s.noteAnthropicShortTurnStreak(ctx, account, model, proseRunes, usage.OutputTokens)
-				// 走到这里说明空回合没被持流拦住（窗口配 0、窗口耗尽、或本请求的重试额度
-				// 已经用掉），客户端已经吃到一个没有答案的 200。解绑只管下一发落在哪，
-				// 账号本身还在池子里，所以这一档要额外冷却账号。
-				if anthropicTurnIsEmptyAnswer(sawStopReason, proseRunes, usage.OutputTokens, sawToolUseBlock) {
+				unbound := s.noteAnthropicShortTurnStreak(ctx, account, model, proseRunes, usage.OutputTokens)
+				// 走到这里说明这一发没被持流拦住（窗口配 0、窗口耗尽、或本请求的重试额度
+				// 已经用掉），客户端已经吃到一个残缺的 200。解绑只管下一发落在哪，账号本身
+				// 还在池子里，所以要额外冷却账号。两个报告器共用同一个计数窗口，只能二选一。
+				switch {
+				case anthropicTurnIsEmptyAnswer(sawStopReason, proseRunes, usage.OutputTokens, sawToolUseBlock):
 					s.reportAnthropicEmptyAnswerTurn(ctx, c, resp, account, model,
 						usage.OutputTokens, sawStopReason, "delivered")
+				case unbound:
+					s.reportAnthropicShortTurnUnbind(ctx, c, resp, account, model,
+						proseRunes, usage.OutputTokens, sawStopReason, "delivered")
 				}
 			} else if anthropicTurnProvesUpstreamHealthy(sawStopReason, proseRunes, usage.OutputTokens, sawToolUseBlock, thinkingRunes) {
 				s.clearAnthropicShortTurnStreak(ctx)
@@ -2092,12 +2154,19 @@ func (s *GatewayService) handleStreamingResponseAnthropicAPIKeyPassthrough(
 						// 请求照旧从这个号起手，每发白烧一次上游调用。这里主动解绑，阈值 1
 						// 下这一次 note 就直接删绑定，重试那一发随即绑到新号上。
 						// 代价只是丢一次 prompt cache —— 见 noteAnthropicShortTurnStreak。
-						s.noteAnthropicShortTurnStreak(ctx, account, model,
+						// 解绑成功还要补一次冷却：坏号若是本组 priority 最小的那个，
+						// 光删绑定下一发照旧选回它。见 reportAnthropicShortTurnUnbind。
+						unbound := s.noteAnthropicShortTurnStreak(ctx, account, model,
 							holdback.proseRunes, holdback.outputTokens)
-						if anthropicTurnIsEmptyAnswer(holdback.stopReason, holdback.proseRunes,
-							holdback.outputTokens, holdback.sawToolUseBlock) {
+						switch {
+						case anthropicTurnIsEmptyAnswer(holdback.stopReason, holdback.proseRunes,
+							holdback.outputTokens, holdback.sawToolUseBlock):
 							s.reportAnthropicEmptyAnswerTurn(ctx, c, resp, account, model,
 								holdback.outputTokens, holdback.stopReason, "discarded")
+						case unbound:
+							s.reportAnthropicShortTurnUnbind(ctx, c, resp, account, model,
+								holdback.proseRunes, holdback.outputTokens,
+								holdback.stopReason, "discarded")
 						}
 						return nil, s.newAnthropicShortTurnFailoverError(
 							c, resp, account, model,

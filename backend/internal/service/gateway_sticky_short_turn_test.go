@@ -380,8 +380,10 @@ func TestAnthropicPassthrough_ShortTurnStreakUnbindsStickySession(t *testing.T) 
 	runShortTurnPassthrough(t, svc, groupID, sessionKey, 9, shortTurnSSE("好的，我来看一下这个问题。", 30, false))
 	requireUnboundOnce(t, cache, groupID, sessionKey)
 
-	// 全程不得罚号：判据是启发式的，罚号会把账号从所有会话的调度池里摘掉，误判代价太大。
-	require.Zero(t, repo.tempCalls, "可疑短回合只解绑不罚号")
+	// 解绑那一刻必须补一次冷却：调度按 priority 升序取号，坏号若正好是本组最小的那个，
+	// 光删绑定下一发照旧选回它——线上实测到过解绑后紧接着又回同一个号。见
+	// reportAnthropicShortTurnUnbind。未达阈值的观测仍然零惩罚，由下面那条用例守。
+	require.Equal(t, 1, repo.tempCalls, "解绑那一刻必须冷却账号，否则解绑对首选号是空操作")
 
 	// TTL 必须跟粘性绑定同寿，绑定都过期了连击数没有意义。
 	for _, ttl := range cache.ttls {
@@ -522,8 +524,8 @@ func TestRegularPath_ShortTurnStreakUnbindsStickySession(t *testing.T) {
 	runShortTurnRegularPath(t, svc, groupID, sessionKey, 9, shortTurnSSE("好的，我来看一下这个问题。", 30, false))
 	requireUnboundOnce(t, cache, groupID, sessionKey)
 
-	// 全程不罚号：判据是启发式的，罚号会把账号从所有会话的调度池摘掉。
-	require.Zero(t, repo.tempCalls, "可疑短回合只解绑不罚号")
+	// 与透传分支同口径：解绑那一刻补一次冷却，见 reportAnthropicShortTurnUnbind。
+	require.Equal(t, 1, repo.tempCalls, "解绑那一刻必须冷却账号")
 }
 
 // 常规链路上的正常回合同样要清零连击数。
@@ -735,7 +737,7 @@ func TestAnthropicPassthrough_ToolUseTurnBetweenShortTurnsStillUnbinds(t *testin
 	// 第二发截断：再次解绑（解绑后连击已清零，所以又是从 1 开始达标）。
 	runShortTurnPassthrough(t, svc, groupID, sessionKey, 9, shortTurnSSE("日志键都在那个函数里。抓前后日志", 34, false))
 	require.Equal(t, 2, cache.deletedSessions[sessionKey], "第二发截断必须再解绑一次")
-	require.Zero(t, repo.tempCalls, "只解绑不罚号")
+	require.Equal(t, 2, repo.tempCalls, "两次解绑各配一次冷却，中间的 tool_use 回合不得罚号")
 }
 
 // 常规链路上的同一条复现。
@@ -758,7 +760,7 @@ func TestRegularPath_ToolUseTurnBetweenShortTurnsStillUnbinds(t *testing.T) {
 
 	runShortTurnRegularPath(t, svc, groupID, sessionKey, 9, shortTurnSSE("又一句短回答", 34, false))
 	require.Equal(t, 2, cache.deletedSessions[sessionKey], "第二发截断必须再解绑一次")
-	require.Zero(t, repo.tempCalls)
+	require.Equal(t, 2, repo.tempCalls, "两次解绑各配一次冷却")
 }
 
 // cjkTruncationText 复刻实测中文截断的正文形状，长度按 anthropicShortTurnProseRuneLimit
@@ -800,7 +802,7 @@ func TestAnthropicPassthrough_CJKTruncationUnbinds(t *testing.T) {
 	// 说完了」的正面证据去清零，那样一次解绑都不会有。
 	runShortTurnPassthrough(t, svc, groupID, sessionKey, 9, shortTurnSSE(text, 106, false))
 	requireUnboundOnce(t, cache, groupID, sessionKey)
-	require.Zero(t, repo.tempCalls, "只解绑不罚号")
+	require.Equal(t, 1, repo.tempCalls, "达到解绑阈值后必须冷却账号")
 }
 
 // 常规链路上的同一条中文截断复现。
@@ -813,7 +815,7 @@ func TestRegularPath_CJKTruncationUnbinds(t *testing.T) {
 
 	runShortTurnRegularPath(t, svc, groupID, sessionKey, 9, shortTurnSSE(text, 106, false))
 	requireUnboundOnce(t, cache, groupID, sessionKey)
-	require.Zero(t, repo.tempCalls)
+	require.Equal(t, 1, repo.tempCalls, "达到解绑阈值后必须冷却账号")
 }
 
 // 22:31:21 那一发（131 字 / out=70）的端到端复现。它比上面那条短，抓住它的是
@@ -832,7 +834,7 @@ func TestAnthropicPassthrough_ShortCJKTruncationUnbinds(t *testing.T) {
 
 	runShortTurnPassthrough(t, svc, groupID, sessionKey, 9, shortTurnSSE(text, 70, false))
 	requireUnboundOnce(t, cache, groupID, sessionKey)
-	require.Zero(t, repo.tempCalls)
+	require.Equal(t, 1, repo.tempCalls, "达到解绑阈值后必须冷却账号")
 }
 
 // 「想很久却只吐一句」是最典型的截断形态，不得因为思考链很长就被放过。
@@ -870,7 +872,7 @@ func TestAnthropicPassthrough_LongThinkingShortProseStillUnbinds(t *testing.T) {
 
 	runShortTurnPassthrough(t, svc, groupID, sessionKey, 9, resp())
 	requireUnboundOnce(t, cache, groupID, sessionKey)
-	require.Zero(t, repo.tempCalls)
+	require.Equal(t, 1, repo.tempCalls, "达到解绑阈值后必须冷却账号")
 }
 
 // 账号 12 的端到端复现（透传链路，持流关闭 → 空响应已经交付给客户端）。
@@ -888,22 +890,22 @@ func TestAnthropicPassthrough_EmptyAnswerTurnUnbindsAndPenalizes(t *testing.T) {
 	runShortTurnPassthrough(t, svc, groupID, sessionKey, 12, emptyAnswerSSE(1))
 
 	requireUnboundOnce(t, cache, groupID, sessionKey)
-	require.Positive(t, repo.tempCalls,
-		"end_turn 却一个字都没说是确定性上游故障，必须冷却账号，否则重新选号会落回同一个号")
+	require.Equal(t, 1, repo.tempCalls,
+		"end_turn 却一个字都没说必须冷却账号，且不得与短回合报告器重复计数")
 }
 
-// 同一条链路上「说得少」与「一个字没说」的对照。这一对必须一起看：罚号的边界就在这里，
-// 放宽到短回合上会把只有一句话答案的正常回合也罚掉。
-func TestAnthropicPassthrough_ShortButNonEmptyTurnIsNotPenalized(t *testing.T) {
+// 同一条链路上「说得少」与「一个字没说」的对照。短回合达到解绑阈值后也要冷却账号，
+// 但必须与空回合报告器互斥，避免同一发重复罚号。
+func TestAnthropicPassthrough_ShortButNonEmptyTurnPenalizesOnce(t *testing.T) {
 	const sessionKey = "sticky-short-not-penalized"
 	const groupID = int64(1)
 	cache := newShortTurnStreakCache(sessionKey, 12)
 	svc, repo := newShortTurnTestGatewayService(t, cache)
 
-	// 只有一个字的正文：短到必然解绑，但仍然不得罚号。
+	// 只有一个字的正文：短到必然解绑，并且只触发一次解绑冷却。
 	runShortTurnPassthrough(t, svc, groupID, sessionKey, 12, shortTurnSSE("好", 30, false))
 	requireUnboundOnce(t, cache, groupID, sessionKey)
-	require.Zero(t, repo.tempCalls, "有正文就可能是合法的短回答，只解绑不罚号")
+	require.Equal(t, 1, repo.tempCalls, "短回合报告器必须只执行一次")
 }
 
 // 常规链路上的账号 12 复现。第三方中转号不走透传，两条链路必须同口径。
@@ -916,7 +918,7 @@ func TestRegularPath_EmptyAnswerTurnUnbindsAndPenalizes(t *testing.T) {
 	runShortTurnRegularPath(t, svc, groupID, sessionKey, 12, emptyAnswerSSE(1))
 
 	requireUnboundOnce(t, cache, groupID, sessionKey)
-	require.Positive(t, repo.tempCalls, "常规链路必须与透传同口径")
+	require.Equal(t, 1, repo.tempCalls, "常规链路必须与透传同口径且只冷却一次")
 }
 
 // 空回合不受 output_tokens 上限约束的端到端形态：长思考 + 零正文 + token 上量。
@@ -951,5 +953,5 @@ func TestAnthropicPassthrough_LongThinkingZeroProseIsPenalized(t *testing.T) {
 	runShortTurnPassthrough(t, svc, groupID, sessionKey, 12, resp)
 
 	requireUnboundOnce(t, cache, groupID, sessionKey)
-	require.Positive(t, repo.tempCalls, "思考 token 上量不得让零正文逃过判定")
+	require.Equal(t, 1, repo.tempCalls, "思考 token 上量不得让零正文逃过判定或重复计数")
 }
