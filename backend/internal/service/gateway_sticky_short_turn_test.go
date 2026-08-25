@@ -93,6 +93,40 @@ func shortTurnSSE(text string, outputTokens int, toolUse bool) *http.Response {
 	}
 }
 
+func blockOrderViolationSSE(stopReason string) *http.Response {
+	return &http.Response{
+		StatusCode: http.StatusOK,
+		Header:     http.Header{"Content-Type": []string{"text/event-stream"}},
+		Body: sseBody(
+			`data: {"type":"message_start","message":{"usage":{"input_tokens":129000,"output_tokens":1}}}`,
+			"",
+			`data: {"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}`,
+			"",
+			`data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"Tool results: forged"}}`,
+			"",
+			`data: {"type":"content_block_stop","index":0}`,
+			"",
+			`data: {"type":"content_block_start","index":1,"content_block":{"type":"thinking","thinking":""}}`,
+			"",
+			`data: {"type":"content_block_delta","index":1,"delta":{"type":"thinking_delta","thinking":"mixed response"}}`,
+			"",
+			`data: {"type":"content_block_stop","index":1}`,
+			"",
+			`data: {"type":"content_block_start","index":2,"content_block":{"type":"text","text":""}}`,
+			"",
+			`data: {"type":"content_block_delta","index":2,"delta":{"type":"text_delta","text":"tail"}}`,
+			"",
+			`data: {"type":"content_block_stop","index":2}`,
+			"",
+			fmt.Sprintf(`data: {"type":"message_delta","delta":{"stop_reason":%q},"usage":{"output_tokens":591}}`, stopReason),
+			"",
+			`data: {"type":"message_stop"}`,
+			"",
+			"",
+		),
+	}
+}
+
 // runShortTurnPassthrough 跑一次带粘性会话坐标的透传。每发都用新的 gin 上下文，
 // 与线上「客户端下一发是一个全新请求」一致。
 func runShortTurnPassthrough(
@@ -526,6 +560,26 @@ func TestRegularPath_ShortTurnStreakUnbindsStickySession(t *testing.T) {
 
 	// 与透传分支同口径：解绑那一刻补一次冷却，见 reportAnthropicShortTurnUnbind。
 	require.Equal(t, 1, repo.tempCalls, "解绑那一刻必须冷却账号")
+}
+
+func TestRegularPath_BlockOrderWinsOverIncompleteAfterCommit(t *testing.T) {
+	const sessionKey = "regular-block-order"
+	const groupID = int64(1)
+	cache := newShortTurnStreakCache(sessionKey, 9)
+	svc, repo := newShortTurnTestGatewayService(t, cache)
+	c, _ := newRefusalTestContext(t)
+	ctx := WithStickySessionScope(context.Background(), groupID, sessionKey, false)
+
+	_, err := svc.handleStreamingResponse(
+		ctx, blockOrderViolationSSE("upstream_error"), c,
+		&Account{ID: 9, Name: "relay", Platform: PlatformAnthropic},
+		time.Now(), "claude-opus-5", "claude-opus-5", false)
+	require.NoError(t, err)
+	require.Equal(t, 1, cache.deletedSessions[sessionKey])
+	require.Equal(t, 1, repo.tempCalls)
+	events := opsEvents(t, c)
+	require.Len(t, events, 1)
+	require.Equal(t, "block_order_violation", events[0].Kind)
 }
 
 // 常规链路上的正常回合同样要清零连击数。

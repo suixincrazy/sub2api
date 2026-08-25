@@ -74,17 +74,18 @@ func runHoldbackPassthrough(
 //     3 次尝试攥到 60 秒的成因。
 func TestAnthropicHoldbackVerdict(t *testing.T) {
 	cases := []struct {
-		name         string
-		windowGone   bool
-		deadAir      bool
-		stopReason   string
-		proseRunes   int
-		outputTokens int
-		toolUse      bool
-		discards     int
-		thinking     int
-		blockOrder   bool
-		want         anthropicHoldbackDecision
+		name               string
+		windowGone         bool
+		deadAir            bool
+		stopReason         string
+		proseRunes         int
+		outputTokens       int
+		toolUse            bool
+		heuristicDiscards  int
+		blockOrderDiscards int
+		thinking           int
+		blockOrder         bool
+		want               anthropicHoldbackDecision
 	}{
 		{
 			name: "证据不足时继续攥着",
@@ -145,21 +146,21 @@ func TestAnthropicHoldbackVerdict(t *testing.T) {
 		// 放行。下一条才是真正区分两档的那一行：discards 已经到了短回合的上限，空回合仍然丢。
 		{
 			name:       "零正文且已丢弃过一次：仍然丢弃，这是 4 条 delivered 的根因",
-			stopReason: "end_turn", proseRunes: 0, outputTokens: 1, discards: 1,
+			stopReason: "end_turn", proseRunes: 0, outputTokens: 1, heuristicDiscards: 1,
 			want: anthropicHoldbackDiscard,
 		},
 		{
 			name:       "零正文额度用满前的最后一次仍然丢弃",
 			stopReason: "end_turn", proseRunes: 0, outputTokens: 1,
-			discards: anthropicEmptyAnswerDiscardBudget - 1,
-			want:     anthropicHoldbackDiscard,
+			heuristicDiscards: anthropicEmptyAnswerDiscardBudget - 1,
+			want:              anthropicHoldbackDiscard,
 		},
 		// 仍然留上限：额度耗尽后退化成放行（等于改动前的行为），不会把池子重试到 502。
 		{
 			name:       "零正文丢满额度后放行，不能一路重试到调度耗尽",
 			stopReason: "end_turn", proseRunes: 0, outputTokens: 1,
-			discards: anthropicEmptyAnswerDiscardBudget,
-			want:     anthropicHoldbackRelease,
+			heuristicDiscards: anthropicEmptyAnswerDiscardBudget,
+			want:              anthropicHoldbackRelease,
 		},
 		{
 			name:       "stop_reason 优先于窗口：窗口已过但判据齐了仍然丢弃",
@@ -170,22 +171,22 @@ func TestAnthropicHoldbackVerdict(t *testing.T) {
 		// 就是因为额度只有一次、已被前一个坏号吃光。同时坏掉两个号是常态，所以第二次仍要丢。
 		{
 			name:       "短回合已丢弃过一次：仍然丢弃，这是 19:2x 两发交付的根因",
-			stopReason: "end_turn", proseRunes: 131, outputTokens: 70, discards: 1,
+			stopReason: "end_turn", proseRunes: 131, outputTokens: 70, heuristicDiscards: 1,
 			want: anthropicHoldbackDiscard,
 		},
 		{
 			name:       "短回合丢满额度后放行，不能把真短答案变成 502",
 			stopReason: "end_turn", proseRunes: 131, outputTokens: 70,
-			discards: anthropicShortTurnDiscardBudget,
-			want:     anthropicHoldbackRelease,
+			heuristicDiscards: anthropicShortTurnDiscardBudget,
+			want:              anthropicHoldbackRelease,
 		},
 		// 两档共用一个计数器，所以顺序无关：为空回合丢满之后，短回合那一档立刻判定额度已尽，
 		// 短回合上限的保护不会因为空回合放宽而失效。
 		{
 			name:       "空回合丢满之后短回合不再丢",
 			stopReason: "end_turn", proseRunes: 131, outputTokens: 70,
-			discards: anthropicEmptyAnswerDiscardBudget,
-			want:     anthropicHoldbackRelease,
+			heuristicDiscards: anthropicEmptyAnswerDiscardBudget,
+			want:              anthropicHoldbackRelease,
 		},
 		// 用常量表达而不是写死数字：这一条曾因为闸门从 128 抬到 320 而变成陈旧断言
 		// （outputTokens: 200 在 320 之下，早就不再"上量"了），红了一次没人发现。
@@ -320,16 +321,28 @@ func TestAnthropicHoldbackVerdict(t *testing.T) {
 		// 额度封顶后退化成放行 + 事后归因，不会把池子掏空成 502。
 		{
 			name:       "块序违规丢满额度后退回既有判定：放行",
-			blockOrder: true, discards: anthropicBlockOrderDiscardBudget,
+			blockOrder: true, blockOrderDiscards: anthropicBlockOrderDiscardBudget,
 			stopReason: "end_turn", proseRunes: 872, outputTokens: 591,
 			want: anthropicHoldbackRelease,
 		},
 		// 额度耗尽时不得把「本来该攥着」的回合提前放行：退回既有判定即原样，不是无条件 Release。
 		{
 			name:       "块序违规额度耗尽且判据没齐：照旧攥着",
-			blockOrder: true, discards: anthropicBlockOrderDiscardBudget,
+			blockOrder: true, blockOrderDiscards: anthropicBlockOrderDiscardBudget,
 			proseRunes: 12, outputTokens: 4,
 			want: anthropicHoldbackKeep,
+		},
+		{
+			name:       "启发式额度耗尽不影响块序违规",
+			blockOrder: true, heuristicDiscards: anthropicEmptyAnswerDiscardBudget,
+			stopReason: "end_turn", proseRunes: 872, outputTokens: 591,
+			want: anthropicHoldbackDiscard,
+		},
+		{
+			name:               "块序额度耗尽不影响短回合",
+			blockOrderDiscards: anthropicBlockOrderDiscardBudget,
+			stopReason:         "end_turn", proseRunes: 131, outputTokens: 70,
+			want: anthropicHoldbackDiscard,
 		},
 		// 反面：没有违规时这一档不得改变任何既有判定。
 		{
@@ -343,7 +356,7 @@ func TestAnthropicHoldbackVerdict(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			got := anthropicHoldbackVerdict(
 				tc.windowGone, tc.deadAir, tc.stopReason, tc.proseRunes, tc.outputTokens,
-				tc.toolUse, tc.discards, tc.thinking, tc.blockOrder)
+				tc.toolUse, tc.heuristicDiscards, tc.blockOrderDiscards, tc.thinking, tc.blockOrder)
 			require.Equal(t, tc.want, got)
 		})
 	}
@@ -709,6 +722,47 @@ func TestAnthropicPassthrough_HoldbackDiscardsShortTurnWithoutExposure(t *testin
 	require.Equal(t, 1, cache.deletedSessions[sessionKey], "丢弃必须同时解绑，否则下一发还是这个号")
 	require.NotContains(t, cache.sessionBindings, sessionKey)
 	require.Empty(t, cache.streaks, "解绑后必须清零连击")
+}
+
+func TestAnthropicPassthrough_BlockOrderDiscardHasIndependentBudget(t *testing.T) {
+	const sessionKey = "holdback-block-order-budget"
+	const groupID = int64(1)
+	cache := newShortTurnStreakCache(sessionKey, 9)
+	svc, repo := newHoldbackTestGatewayService(t, cache, 3000)
+
+	rec, c, err := runHoldbackPassthrough(t, svc, groupID, sessionKey, 9,
+		blockOrderViolationSSE("end_turn"), func(c *gin.Context) {
+			c.Set(anthropicHoldbackDiscardsKey, anthropicEmptyAnswerDiscardBudget)
+		})
+
+	var failoverErr *UpstreamFailoverError
+	require.True(t, errors.As(err, &failoverErr))
+	require.Equal(t, GatewayFailureReason("anthropic_block_order_violation"), failoverErr.Reason)
+	require.Empty(t, rec.Body.String())
+	require.Equal(t, anthropicEmptyAnswerDiscardBudget, anthropicHoldbackDiscardsUsed(c))
+	require.Equal(t, 1, anthropicBlockOrderDiscardsUsed(c))
+	require.Equal(t, 1, cache.deletedSessions[sessionKey])
+	require.Equal(t, 1, repo.tempCalls)
+}
+
+func TestAnthropicPassthrough_BlockOrderWinsOverIncompleteAfterCommit(t *testing.T) {
+	const sessionKey = "delivered-block-order"
+	const groupID = int64(1)
+	cache := newShortTurnStreakCache(sessionKey, 9)
+	svc, repo := newShortTurnTestGatewayService(t, cache)
+
+	c, rec := newRefusalTestContext(t)
+	ctx := WithStickySessionScope(context.Background(), groupID, sessionKey, false)
+	_, err := svc.handleStreamingResponseAnthropicAPIKeyPassthrough(
+		ctx, blockOrderViolationSSE("upstream_error"), c,
+		&Account{ID: 9, Name: "primary", Platform: PlatformAnthropic}, time.Now(), "claude-opus-5")
+	require.NoError(t, err)
+	require.NotEmpty(t, rec.Body.String())
+	require.Equal(t, 1, cache.deletedSessions[sessionKey])
+	require.Equal(t, 1, repo.tempCalls)
+	events := opsEvents(t, c)
+	require.Len(t, events, 1)
+	require.Equal(t, "block_order_violation", events[0].Kind)
 }
 
 // 账号 12（sotamodel）的实测形态：协议完整、stop_reason=end_turn、开了正文块，却一个

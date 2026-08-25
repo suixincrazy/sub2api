@@ -738,7 +738,7 @@ const (
 //     真实数据标定过，见 GatewayConfig.AnthropicHoldbackWindowMs /
 //     AnthropicHoldbackMaxHoldMs / AnthropicHoldbackDeadAirBudgetMs。
 //
-// discardsUsed 是本次请求已经因为持流判定丢弃过几次上游响应。额度按形态分档，不是一刀切：
+// heuristicDiscardsUsed 是本次请求已经因为启发式持流判定丢弃过几次上游响应。额度按形态分档，不是一刀切：
 // 「短但有正文」丢满 anthropicShortTurnDiscardBudget 次后就原样放行，因为真短答案确实存在；
 // 「零正文」可以多丢几次，因为不存在「本来就该是空的答案」这种合法解释。见
 // anthropicShortTurnDiscardBudget 与 anthropicEmptyAnswerDiscardBudget。
@@ -767,11 +767,12 @@ func anthropicHoldbackVerdict(
 	proseRunes int,
 	outputTokens int,
 	sawToolUseBlock bool,
-	discardsUsed int,
+	heuristicDiscardsUsed int,
+	blockOrderDiscardsUsed int,
 	thinkingRunes int,
 	blockOrderViolation bool,
 ) anthropicHoldbackDecision {
-	if blockOrderViolation && discardsUsed < anthropicBlockOrderDiscardBudget {
+	if blockOrderViolation && blockOrderDiscardsUsed < anthropicBlockOrderDiscardBudget {
 		return anthropicHoldbackDiscard
 	}
 	if sawToolUseBlock {
@@ -785,7 +786,7 @@ func anthropicHoldbackVerdict(
 	if strings.TrimSpace(stopReason) != "" {
 		if !deadAirExhausted &&
 			anthropicTurnLooksSuspiciouslyShort(stopReason, proseRunes, outputTokens, sawToolUseBlock, thinkingRunes) &&
-			discardsUsed < anthropicHoldbackDiscardBudget(stopReason, proseRunes, outputTokens, sawToolUseBlock) {
+			heuristicDiscardsUsed < anthropicHoldbackDiscardBudget(stopReason, proseRunes, outputTokens, sawToolUseBlock) {
 			return anthropicHoldbackDiscard
 		}
 		return anthropicHoldbackRelease
@@ -812,7 +813,7 @@ func anthropicHoldbackDiscardBudget(
 
 // anthropicBlockOrderDiscardBudget 是块序违规这一档在一次客户端请求里允许丢弃的次数。
 //
-// 与另外两档共用同一个计数器 holdbackDiscardsUsed，各自比自己的上限。给 2 而不是更多：
+// 与另外两档分开计数，各自比自己的上限。给 2 而不是更多：
 // 违规是确定性判据、不存在「本来就该这样」的合法解释，理论上一次换号就够；留第二次是为了
 // 跨过连续两个坏号（短回合那一档实测最长连击就是 2）。额度耗尽后退化成放行 + 事后归因，
 // 不会把池子掏空成 502。
@@ -1693,6 +1694,26 @@ func noteAnthropicHoldbackDiscard(c *gin.Context) {
 	}
 }
 
+const anthropicBlockOrderDiscardsKey = "anthropic_block_order_discards"
+
+func anthropicBlockOrderDiscardsUsed(c *gin.Context) int {
+	if c == nil {
+		return 0
+	}
+	v, ok := c.Get(anthropicBlockOrderDiscardsKey)
+	if !ok {
+		return 0
+	}
+	used, _ := v.(int)
+	return used
+}
+
+func noteAnthropicBlockOrderDiscard(c *gin.Context) {
+	if c != nil {
+		c.Set(anthropicBlockOrderDiscardsKey, anthropicBlockOrderDiscardsUsed(c)+1)
+	}
+}
+
 // anthropicClientRequestStartKey 记录**本次客户端请求**的起点，跨 failover 尝试共享。
 //
 // 为什么不能用每次尝试自己的 startTime：那个每换一次号就重新取一次，导致以它为锚的死气
@@ -1805,7 +1826,7 @@ func anthropicBlockOrderHoldbackErrorBody() []byte {
 func (s *GatewayService) newAnthropicBlockOrderFailoverError(
 	c *gin.Context, resp *http.Response, account *Account, model string, proseRunes, outputTokens int, stopReason string,
 ) *UpstreamFailoverError {
-	noteAnthropicHoldbackDiscard(c)
+	noteAnthropicBlockOrderDiscard(c)
 	upstreamRequestID := ""
 	headers := http.Header{}
 	if resp != nil {
@@ -2069,6 +2090,7 @@ func (s *GatewayService) handleStreamingResponseAnthropicAPIKeyPassthrough(
 		holdbackMaxHold = time.Duration(s.cfg.Gateway.AnthropicHoldbackMaxHoldMs) * time.Millisecond
 	}
 	holdbackDiscardsUsed := anthropicHoldbackDiscardsUsed(c)
+	blockOrderDiscardsUsed := anthropicBlockOrderDiscardsUsed(c)
 	// 客户端死气预算：三条截止线里唯一跨 failover 不归零的一条，见 deadAirElapsed。
 	// 窗口配 0（整个机制关掉）时同样不参与，理由和 maxHold 一致。
 	holdbackDeadAir := time.Duration(0)
@@ -2198,18 +2220,15 @@ func (s *GatewayService) handleStreamingResponseAnthropicAPIKeyPassthrough(
 		if clientDisconnected || refusalReported || c.Request.Context().Err() != nil {
 			return
 		}
+		if blockOrder.violation() {
+			s.unbindStickySessionNow(ctx, account, model, "content block order violation")
+			s.reportAnthropicBlockOrderViolation(ctx, c, resp, account, model,
+				proseRunes, usage.OutputTokens, sawStopReason, "delivered")
+			return
+		}
 		reason, incomplete := anthropicStreamLooksIncompleteDespiteTerminal(
 			sawStopReason, visibleChars, usage.OutputTokens, sawContentBlockStart)
 		if !incomplete {
-			// 块序违规排在启发式判据之前：它是确定性矛盾，而下面的
-			// anthropicTurnProvesUpstreamHealthy 会把「正文很长、stop_reason 正常」判成健康
-			// 并清零连击——21:25:40 那一发正是这个形态，排在后面就会被判健康。
-			if blockOrder.violation() {
-				s.unbindStickySessionNow(ctx, account, model, "content block order violation")
-				s.reportAnthropicBlockOrderViolation(ctx, c, resp, account, model,
-					proseRunes, usage.OutputTokens, sawStopReason, "delivered")
-				return
-			}
 			// 确定性判定放行之后，再看这一回合是否属于「协议合法但疑似没把话说完」。
 			// 三态：可疑 -> 累计连击；有正面证据 -> 清零；其余（典型是 tool_use 中间回合）
 			// -> 不表态，保留连击。见 anthropicTurnProvesUpstreamHealthy。
@@ -2360,7 +2379,7 @@ func (s *GatewayService) handleStreamingResponseAnthropicAPIKeyPassthrough(
 						holdback.releaseDeadlineElapsed(now, holdbackWindow, holdbackMaxHold, holdbackDeadAir),
 						holdback.deadAirElapsed(now, holdbackDeadAir),
 						holdback.stopReason, holdback.proseRunes, holdback.outputTokens,
-						holdback.sawToolUseBlock, holdbackDiscardsUsed, holdback.thinkingRunes,
+						holdback.sawToolUseBlock, holdbackDiscardsUsed, blockOrderDiscardsUsed, holdback.thinkingRunes,
 						holdback.blockOrder.violation(),
 					) {
 					case anthropicHoldbackKeep:

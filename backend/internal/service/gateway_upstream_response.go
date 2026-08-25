@@ -1055,17 +1055,15 @@ func (s *GatewayService) handleStreamingResponse(ctx context.Context, resp *http
 		if clientDisconnected || refusalReported || c.Request.Context().Err() != nil {
 			return
 		}
+		if blockOrder.violation() {
+			s.unbindStickySessionNow(ctx, account, originalModel, "content block order violation")
+			s.reportAnthropicBlockOrderViolation(ctx, c, resp, account, originalModel,
+				proseRunes, usage.OutputTokens, sawStopReason, "delivered")
+			return
+		}
 		reason, incomplete := anthropicStreamLooksIncompleteDespiteTerminal(
 			sawStopReason, visibleChars, usage.OutputTokens, sawContentBlockStart)
 		if !incomplete {
-			// 块序违规排在启发式判据之前，理由同透传链路：它是确定性矛盾，而
-			// anthropicTurnProvesUpstreamHealthy 会把「长正文 + 正常 stop_reason」判成健康。
-			if blockOrder.violation() {
-				s.unbindStickySessionNow(ctx, account, originalModel, "content block order violation")
-				s.reportAnthropicBlockOrderViolation(ctx, c, resp, account, originalModel,
-					proseRunes, usage.OutputTokens, sawStopReason, "delivered")
-				return
-			}
 			// 确定性判定放行之后，再看这一回合是否「协议合法但疑似没把话说完」。
 			// 三态：可疑 -> 累计连击；有正面证据 -> 清零；其余（典型是 tool_use 中间回合）
 			// -> 不表态，保留连击。见 anthropicTurnProvesUpstreamHealthy。
