@@ -749,7 +749,7 @@ func TestAnthropicPassthrough_ExhaustedBlockOrderBudgetFallsBackToHeuristic(t *t
 	const sessionKey = "holdback-block-order-exhausted"
 	const groupID = int64(1)
 	cache := newShortTurnStreakCache(sessionKey, 9)
-	svc, _ := newHoldbackTestGatewayService(t, cache, 3000)
+	svc, repo := newHoldbackTestGatewayService(t, cache, 3000)
 
 	rec, c, err := runHoldbackPassthrough(t, svc, groupID, sessionKey, 9,
 		blockOrderViolationSSEWithOutput("end_turn", 70), func(c *gin.Context) {
@@ -762,6 +762,15 @@ func TestAnthropicPassthrough_ExhaustedBlockOrderBudgetFallsBackToHeuristic(t *t
 	require.Empty(t, rec.Body.String())
 	require.Equal(t, anthropicBlockOrderDiscardBudget, anthropicBlockOrderDiscardsUsed(c))
 	require.Equal(t, 1, anthropicHoldbackDiscardsUsed(c))
+	require.Equal(t, 1, cache.deletedSessions[sessionKey], "块序额度耗尽后的启发式回退仍必须解绑粘性会话")
+	require.Equal(t, 1, repo.tempCalls, "启发式回退解绑时必须冷却账号一次")
+	events := opsEvents(t, c)
+	var kinds []string
+	for _, event := range events {
+		kinds = append(kinds, event.Kind)
+	}
+	require.Contains(t, kinds, "short_turn_streak_unbind")
+	require.Contains(t, kinds, "short_turn_holdback_failover")
 }
 
 func TestAnthropicPassthrough_BlockOrderWinsOverIncompleteAfterCommit(t *testing.T) {
