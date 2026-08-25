@@ -1108,6 +1108,45 @@ type GatewayConfig struct {
 	// 放行权由这一条独占；窗口配得比这个值小时仍由静默那条先兜住「吐两句就卡住」的形态。
 	AnthropicHoldbackMaxHoldMs int `mapstructure:"anthropic_holdback_max_hold_ms"`
 
+	// AnthropicHoldbackDeadAirBudgetMs: 客户端总死气预算（毫秒），0 表示不封顶。
+	//
+	// 前两条都只度量**一次上游尝试**：静默窗口从最后一帧有内容的 data 起算，总时长上限从
+	// firstCommitPointAt 起算。而持流判定失败会 discard + 换号重试，新尝试的 observer 是全新
+	// 的，那两条线连同 10 秒上限一起归零——客户端却还挂在同一个 HTTP 请求上继续干等。于是
+	// 客户端感知的死气 = Σ(每次尝试各自攥的时间)，没有任何上界。
+	//
+	// 2026-08-25 实证，一天内 5 次断流全是同一签名（ftt/dur ≥ 0.975，整发被兜住、到期一次性
+	// flush）：
+	//
+	//	时刻        账号  out   duration     ftt   ratio  客户端真实死气
+	//	13:23:21     5   1110    21716ms  21174ms  0.975  ≥21.2s
+	//	13:50:52     9    461    52332ms  51034ms  0.975   51.0s（单尝试）
+	//	14:10:30     5      0   420167ms 420167ms  1.000  420.2s（上游全程零帧）
+	//	14:26:26     5    982    19383ms  19187ms  0.990   30.8s（跨 2 次尝试）
+	//	14:33:58     5   1236    23592ms  20915ms  0.887  ~60s （跨 3 次尝试）
+	//
+	// 注意后两行：duration_ms 只记**最后一次**尝试，所以 usage_logs 里的
+	// first_token_ms/duration_ms 会系统性低估真实死气，不能拿它当验证口径。正确口径是
+	// security_audit.gateway_check_start 到「Client disconnected during streaming」的跨度，
+	// 或者直接数断连事件条数。
+	//
+	// 25000ms 的标定：取近 36 小时 3512 发流式回合的 first_token_ms（持流上线后它等于**放行
+	// 时刻**，也就是客户端真实死气）分布：
+	//
+	//	band          n     p50     p90     p95      p99      max     >20s   >25s   >30s
+	//	out<=430    1783   9671   22557   32992   137433   420167   13.4%   8.5%   5.9%
+	//	out>430     1729  16543   53647   98009   261222   357435   40.0%  26.3%  18.3%
+	//
+	// 25000 落在可疑区 p90（22557ms）之上：约 91.5% 的可疑回合判定窗口不受影响，仍能完整走到
+	// stop_reason；剩下 8.5% 退化成「放行 + 给下一发解绑」，也就是这个机制存在之前的行为。
+	// 换来的是死气有了硬上界——上游 TTFB 已经超过预算时持流一秒都不再加。
+	//
+	// 上界不是「客户端一定不断连」的保证：上游自己的 TTFB 这一条管不了（14:10:30 那发上游
+	// 420 秒没吐一帧，预算到点时缓冲是空的，放行也放不出东西）。它保证的是**持流不再往上游
+	// 的慢上面叠**，以及死气吃满后不再换号（换号等于让客户端从头再等一轮，见
+	// anthropicHoldbackVerdict 的 deadAirExhausted）。
+	AnthropicHoldbackDeadAirBudgetMs int `mapstructure:"anthropic_holdback_dead_air_budget_ms"`
+
 	// 是否记录上游错误响应体摘要（避免输出请求内容）
 	LogUpstreamErrorBody bool `mapstructure:"log_upstream_error_body"`
 	// 上游错误响应体记录最大字节数（超过会截断）
@@ -2557,6 +2596,8 @@ func setDefaults() {
 	viper.SetDefault("gateway.anthropic_holdback_window_ms", 3000)
 	// 同上，必须显式注册才能靠 GATEWAY_ANTHROPIC_HOLDBACK_MAX_HOLD_MS 免重新构建地改。
 	viper.SetDefault("gateway.anthropic_holdback_max_hold_ms", 10000)
+	// 同上，靠 GATEWAY_ANTHROPIC_HOLDBACK_DEAD_AIR_BUDGET_MS 免重新构建地改。
+	viper.SetDefault("gateway.anthropic_holdback_dead_air_budget_ms", 25000)
 	viper.SetDefault("gateway.scheduling.sticky_session_max_waiting", 3)
 	viper.SetDefault("gateway.scheduling.sticky_session_wait_timeout", 120*time.Second)
 	viper.SetDefault("gateway.scheduling.fallback_wait_timeout", 30*time.Second)
@@ -3454,6 +3495,16 @@ func (c *Config) Validate() error {
 	if c.Gateway.AnthropicHoldbackMaxHoldMs != 0 &&
 		(c.Gateway.AnthropicHoldbackMaxHoldMs < 1000 || c.Gateway.AnthropicHoldbackMaxHoldMs > 120000) {
 		return fmt.Errorf("gateway.anthropic_holdback_max_hold_ms must be 0 or between 1000-120000 milliseconds")
+	}
+	if c.Gateway.AnthropicHoldbackDeadAirBudgetMs < 0 {
+		return fmt.Errorf("gateway.anthropic_holdback_dead_air_budget_ms must be non-negative")
+	}
+	// 下界 5000：这一条量的是**客户端累计**死气，天然要比单次尝试的总时长上限（10s 默认）
+	// 更宽。配到 5 秒以下等于绝大多数可疑回合都等不到 stop_reason 就被迫放行，持流形同关闭，
+	// 那种意图应该显式配 0。
+	if c.Gateway.AnthropicHoldbackDeadAirBudgetMs != 0 &&
+		(c.Gateway.AnthropicHoldbackDeadAirBudgetMs < 5000 || c.Gateway.AnthropicHoldbackDeadAirBudgetMs > 300000) {
+		return fmt.Errorf("gateway.anthropic_holdback_dead_air_budget_ms must be 0 or between 5000-300000 milliseconds")
 	}
 	if c.Gateway.ImageStreamDataIntervalTimeout < 0 {
 		return fmt.Errorf("gateway.image_stream_data_interval_timeout must be non-negative")

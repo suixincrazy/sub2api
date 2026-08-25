@@ -69,10 +69,14 @@ func runHoldbackPassthrough(
 //     给同样的短回合，不设上限会一路重试到调度耗尽，把一个完好的短回答变成 502。
 //   - 额度按形态分档。空回合不存在「本来就该是空的答案」这种合法解释，所以它的上限比短回合
 //     宽；两档共用同一个计数器，各自比自己的上限。
+//   - 客户端死气吃满时也一票否决 Discard，且这一条独立于 windowGone。换号会让新尝试的三条
+//     截止线全部归零、客户端在同一个 HTTP 请求上从头再等一轮，这正是 14:33:58 那一发跨
+//     3 次尝试攥到 60 秒的成因。
 func TestAnthropicHoldbackVerdict(t *testing.T) {
 	cases := []struct {
 		name         string
 		windowGone   bool
+		deadAir      bool
 		stopReason   string
 		proseRunes   int
 		outputTokens int
@@ -247,12 +251,47 @@ func TestAnthropicHoldbackVerdict(t *testing.T) {
 			stopReason: "end_turn", proseRunes: 0, outputTokens: 0,
 			want: anthropicHoldbackRelease,
 		},
+		// 死气闸门：下面四条钉住它的语义。
+		//
+		// 第一条是 14:33:58 那一发的回归——形态完全可疑、额度也还有，但客户端已经吃满预算，
+		// 此时换号是纯亏，宁可把疑似截断交出去（截断还有 noteAnthropicShortTurnStreak 给下一发
+		// 解绑兜着，断流是整发白丢）。
+		{
+			name:    "死气吃满：可疑形态也不再丢弃",
+			deadAir: true,
+			// 与「拿到 stop_reason 且形态可疑：丢弃重试」同一组量，只多了 deadAir。
+			stopReason: "end_turn", proseRunes: 131, outputTokens: 70,
+			want: anthropicHoldbackRelease,
+		},
+		{
+			name:    "死气吃满：零正文也不再丢弃",
+			deadAir: true,
+			// 与「零正文的 end_turn：丢弃重试」同一组量。空回合那一档额度更宽，也照样否决。
+			stopReason: "end_turn", proseRunes: 0, outputTokens: 1,
+			want: anthropicHoldbackRelease,
+		},
+		// 这一条钉住「死气必须独立传参」：它得在 stop_reason **已到**的分支里生效。若只把它
+		// 并进 windowGone，那个参数只在 stop_reason 还没到时才被读到，而 discard 恰恰发生在
+		// stop_reason 已到的分支里，闸门会完全失效。
+		{
+			name:       "死气吃满而窗口没到：仍然否决丢弃",
+			deadAir:    true,
+			windowGone: false,
+			stopReason: "end_turn", proseRunes: 131, outputTokens: 70,
+			want: anthropicHoldbackRelease,
+		},
+		// 反面：死气没吃满时闸门不得改变任何既有判定，尤其不能提前放行还没定案的回合。
+		{
+			name:    "死气没吃满且判据没齐：照旧攥着",
+			deadAir: false, proseRunes: 12, outputTokens: 4,
+			want: anthropicHoldbackKeep,
+		},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			got := anthropicHoldbackVerdict(
-				tc.windowGone, tc.stopReason, tc.proseRunes, tc.outputTokens, tc.toolUse, tc.discards,
-				tc.thinking)
+				tc.windowGone, tc.deadAir, tc.stopReason, tc.proseRunes, tc.outputTokens,
+				tc.toolUse, tc.discards, tc.thinking)
 			require.Equal(t, tc.want, got)
 		})
 	}
@@ -380,58 +419,117 @@ func TestAnthropicHoldbackObserverMaxHoldCapsTotalHold(t *testing.T) {
 	require.Equal(t, base, o.firstCommitPointAt, "上限从第一个提交点起算")
 	require.False(t, o.maxHoldElapsed(base.Add(maxHold-time.Millisecond), maxHold))
 	require.True(t, o.maxHoldElapsed(base.Add(maxHold), maxHold))
-	require.True(t, o.releaseDeadlineElapsed(base.Add(maxHold), window, maxHold),
+	require.True(t, o.releaseDeadlineElapsed(base.Add(maxHold), window, maxHold, 0),
 		"两条截止线任意一条到点就该放行")
-	require.False(t, o.releaseDeadlineElapsed(base.Add(maxHold-time.Millisecond), window, maxHold))
+	require.False(t, o.releaseDeadlineElapsed(base.Add(maxHold-time.Millisecond), window, maxHold, 0))
 
 	// 上限配 0 表示不封顶，退化成只有静默一条。now 停在最后一帧之后 200ms，此刻静默那条
 	// 也没到点：两条都不放行，这正是改动前的行为——帧一直到，就一直攥着。
 	require.False(t, o.maxHoldElapsed(base.Add(time.Hour), 0), "上限配 0 时永不封顶")
 	require.True(t, o.holdbackMaxHoldDeadline(0).IsZero())
-	require.False(t, o.releaseDeadlineElapsed(now, window, 0),
+	require.False(t, o.releaseDeadlineElapsed(now, window, 0, 0),
 		"上限配 0 且帧刚到过，谁都不该放行——这就是改动前的行为")
 	// 而上限配 0 时放行权仍归静默那条：等它耗尽照样放行，不会因为上限缺席就永久攥着。
-	require.True(t, o.releaseDeadlineElapsed(now.Add(window), window, 0))
+	require.True(t, o.releaseDeadlineElapsed(now.Add(window), window, 0, 0))
 }
 
 // 上限没起算之前不得放行：还没到提交点就说明持流一秒都还没开始。
+//
+// 死气那条不受这条约束——它锚在客户端请求起点上，从第一次尝试就已经在走，见
+// TestAnthropicHoldbackObserverDeadAirSpansFailoverAttempts。这里传 0 把它关掉，单独考察
+// 前两条。
 func TestAnthropicHoldbackObserverMaxHoldNeedsCommitPoint(t *testing.T) {
 	o := &anthropicHoldbackObserver{}
 	now := time.Date(2026, 8, 25, 8, 0, 0, 0, time.UTC)
 	o.observe(gjson.Parse(`{"type":"ping"}`), false, now)
 	require.False(t, o.maxHoldElapsed(now.Add(time.Hour), time.Second))
 	require.True(t, o.holdbackMaxHoldDeadline(time.Second).IsZero())
-	require.True(t, o.holdbackReleaseDeadline(time.Second, time.Second).IsZero())
+	require.True(t, o.holdbackReleaseDeadline(time.Second, time.Second, 0).IsZero())
 }
 
-// 定时器分支只认 holdbackReleaseDeadline 一个口径，所以它必须始终等于两条截止线里先到的
+// 定时器分支只认 holdbackReleaseDeadline 一个口径，所以它必须始终等于三条截止线里先到的
 // 那个。口径分歧的后果是定时器睡过上限、白攥一段——正是这一条要钉死的。
-func TestAnthropicHoldbackReleaseDeadlineTakesEarlierOfTwo(t *testing.T) {
+func TestAnthropicHoldbackReleaseDeadlineTakesEarlierOfThree(t *testing.T) {
 	base := time.Date(2026, 8, 25, 8, 28, 10, 0, time.UTC)
-	o := &anthropicHoldbackObserver{}
+	o := &anthropicHoldbackObserver{streamStartedAt: base.Add(-5 * time.Second)}
 	o.observe(gjson.Parse(`{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"我看一下。"}}`), true, base)
 
 	// 线上配置：窗口 15s、上限 10s。上游此刻静默，两条都已起算，上限先到。
 	require.Equal(t, base.Add(10*time.Second),
-		o.holdbackReleaseDeadline(15*time.Second, 10*time.Second),
+		o.holdbackReleaseDeadline(15*time.Second, 10*time.Second, 0),
 		"上限比窗口近时取上限")
 	// 反过来窗口更近时取窗口。
 	require.Equal(t, base.Add(3*time.Second),
-		o.holdbackReleaseDeadline(3*time.Second, 10*time.Second),
+		o.holdbackReleaseDeadline(3*time.Second, 10*time.Second, 0),
 		"窗口比上限近时取窗口")
 	// 各自配 0 时退化成另一条。
-	require.Equal(t, base.Add(10*time.Second), o.holdbackReleaseDeadline(0, 10*time.Second))
-	require.Equal(t, base.Add(3*time.Second), o.holdbackReleaseDeadline(3*time.Second, 0))
-	require.True(t, o.holdbackReleaseDeadline(0, 0).IsZero(), "两条都配 0 时没有截止时刻")
+	require.Equal(t, base.Add(10*time.Second), o.holdbackReleaseDeadline(0, 10*time.Second, 0))
+	require.Equal(t, base.Add(3*time.Second), o.holdbackReleaseDeadline(3*time.Second, 0, 0))
+	require.True(t, o.holdbackReleaseDeadline(0, 0, 0).IsZero(), "三条都配 0 时没有截止时刻")
 
-	// 帧持续到达会把静默那条不断推后，上限那条不动——这正是两条并存的意义。
+	// 死气那条从 streamStartedAt 起算，已经先走了 5 秒：25s 预算折算到 base 上只剩 20s，
+	// 比 15s 窗口远、比不上上限；而 12s 预算折算后只剩 7s，比 10s 上限还近，该由它当先到的。
+	require.Equal(t, base.Add(20*time.Second), o.holdbackDeadAirDeadline(25*time.Second),
+		"死气截止时刻锚在客户端请求起点上，不是本次尝试起点")
+	require.Equal(t, base.Add(7*time.Second),
+		o.holdbackReleaseDeadline(15*time.Second, 10*time.Second, 12*time.Second),
+		"死气预算折算后最近时由它当先到的")
+	require.True(t, o.holdbackDeadAirDeadline(0).IsZero(), "死气配 0 时没有截止时刻")
+
+	// 帧持续到达会把静默那条不断推后，上限和死气两条都不动——这正是三条并存的意义。
 	later := base.Add(20 * time.Second)
 	o.observe(gjson.Parse(`{"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"再想一层"}}`), true, later)
 	require.Equal(t, later.Add(15*time.Second), o.holdbackSilenceDeadline(15*time.Second),
 		"静默那条被新帧推后了")
 	require.Equal(t, base.Add(10*time.Second),
-		o.holdbackReleaseDeadline(15*time.Second, 10*time.Second),
+		o.holdbackReleaseDeadline(15*time.Second, 10*time.Second, 0),
 		"上限那条不受新帧影响，仍然是先到的那个")
+	require.Equal(t, base.Add(20*time.Second), o.holdbackDeadAirDeadline(25*time.Second),
+		"死气那条同样不受新帧影响")
+}
+
+// 2026-08-25 14:26:26 / 14:33:58 两发的回归用例：死气必须跨 failover 尝试累加。
+//
+// 前两条截止线都锚在**本次上游尝试**上（静默锚最后一帧、上限锚 firstCommitPointAt），一次
+// discard 换号之后新尝试的 observer 是全新的，两条连同 10 秒上限一起归零，客户端却还挂在
+// 同一个 HTTP 请求上继续干等。14:26:26 那一发跨 2 次尝试攥到 30.8 秒，14:33:58 跨 3 次约
+// 60 秒——两者的 duration_ms 只记到 19.4s / 23.6s，因为它也是每次尝试重取的。
+//
+// 死气这条锚在 streamStartedAt 上，由 anthropicClientRequestStartedAt 从 gin.Context 取，
+// 跨尝试是同一个值，所以它是三条里唯一不会被换号重置的。
+func TestAnthropicHoldbackObserverDeadAirSpansFailoverAttempts(t *testing.T) {
+	const budget = 25 * time.Second
+	requestStart := time.Date(2026, 8, 25, 14, 25, 55, 0, time.UTC)
+
+	// 第一次尝试：账号 9，11.6 秒后判定可疑并 discard 换号（实测 14:26:07.529）。
+	first := &anthropicHoldbackObserver{streamStartedAt: requestStart}
+	discardAt := requestStart.Add(11*time.Second + 600*time.Millisecond)
+	first.observe(gjson.Parse(`{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"我看一下。"}}`), true, discardAt)
+	require.False(t, first.deadAirElapsed(discardAt, budget), "11.6 秒还没吃满预算，此时换号是对的")
+
+	// 第二次尝试：换到账号 5，observer 全新，但 streamStartedAt 仍是同一个客户端请求起点。
+	second := &anthropicHoldbackObserver{streamStartedAt: requestStart}
+	secondFrame := discardAt.Add(500 * time.Millisecond)
+	second.observe(gjson.Parse(`{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"我再看一下。"}}`), true, secondFrame)
+
+	// 关键断言：以本次尝试为锚的两条线在这一刻都远没到点，唯独死气那条已经吃满。
+	release := requestStart.Add(30*time.Second + 760*time.Millisecond) // 实测客户端 30.76 秒零字节
+	require.False(t, second.windowElapsed(release, 15*time.Second), "换号后静默那条重新起算，没到点")
+	require.False(t, second.maxHoldElapsed(release, 10*time.Second), "换号后上限那条重新起算，没到点")
+	require.True(t, second.deadAirElapsed(release, budget), "死气跨尝试累加，此刻必须已经吃满")
+	require.True(t, second.releaseDeadlineElapsed(release, 15*time.Second, 10*time.Second, budget),
+		"三条任意一条到点就该放行——这一刻只有死气那条在说话")
+
+	// 预算耗尽的那一刻正好是边界，前一毫秒不算。
+	require.False(t, second.deadAirElapsed(requestStart.Add(budget-time.Millisecond), budget))
+	require.True(t, second.deadAirElapsed(requestStart.Add(budget), budget))
+
+	// 配 0 关掉；没有锚点（单测直接构造 observer 不播种）时同样不参与，避免零值时间被当成
+	// 「1970 年就起算了」而恒定判为吃满。
+	require.False(t, second.deadAirElapsed(requestStart.Add(time.Hour), 0), "配 0 时永不吃满")
+	bare := &anthropicHoldbackObserver{}
+	require.False(t, bare.deadAirElapsed(requestStart.Add(time.Hour), budget), "没有锚点时不参与判定")
+	require.True(t, bare.holdbackDeadAirDeadline(budget).IsZero())
 }
 
 // 端到端：疑似截断在客户端看到任何字节之前被丢掉并换号。这是整个改动的目的。

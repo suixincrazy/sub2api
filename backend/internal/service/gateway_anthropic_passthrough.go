@@ -734,15 +734,23 @@ const (
 // 撑到 message_delta 的代价是首字延迟，所以给三条提前放行的出口，任何一条成立就立刻放行：
 //  1. 出现 tool_use 块——工具回合永远不是截断形态，没有再等的理由；
 //  2. 正文已超过短回合上限——已经不可能被判可疑，再等只是白等；
-//  3. 放行截止线到点——静默窗口耗尽或持流总时长撞上限，两条都拿真实数据标定过，见
-//     GatewayConfig.AnthropicHoldbackWindowMs 与 GatewayConfig.AnthropicHoldbackMaxHoldMs。
+//  3. 放行截止线到点——静默窗口耗尽、持流总时长撞上限、或客户端总死气吃满预算，三条都拿
+//     真实数据标定过，见 GatewayConfig.AnthropicHoldbackWindowMs /
+//     AnthropicHoldbackMaxHoldMs / AnthropicHoldbackDeadAirBudgetMs。
 //
 // discardsUsed 是本次请求已经因为持流判定丢弃过几次上游响应。额度按形态分档，不是一刀切：
 // 「短但有正文」丢满 anthropicShortTurnDiscardBudget 次后就原样放行，因为真短答案确实存在；
 // 「零正文」可以多丢几次，因为不存在「本来就该是空的答案」这种合法解释。见
 // anthropicShortTurnDiscardBudget 与 anthropicEmptyAnswerDiscardBudget。
+//
+// deadAirExhausted 单独作为一条否决 discard 的闸门，不能只并进 releaseDeadlineElapsed：
+// 那个参数只在 stop_reason 还没到时才被读到，而 discard 恰恰发生在 stop_reason 已到的分支里。
+// 死气吃满时换号是纯亏——客户端已经等了整个预算，新尝试的三条线全部归零、又要从头等一遍，
+// 这正是 14:33:58 那一发跨 3 次尝试攥到 60 秒的成因。此时宁可把疑似截断的内容交出去：
+// 截断至少还有 noteAnthropicShortTurnStreak 给下一发解绑兜着，断流则是整发白丢。
 func anthropicHoldbackVerdict(
 	releaseDeadlineElapsed bool,
+	deadAirExhausted bool,
 	stopReason string,
 	proseRunes int,
 	outputTokens int,
@@ -759,7 +767,8 @@ func anthropicHoldbackVerdict(
 	// stop_reason 已知时判定是确定的，优先于窗口：窗口只是「等不起了」的兜底，
 	// 而这里已经拿到了全部判据。
 	if strings.TrimSpace(stopReason) != "" {
-		if anthropicTurnLooksSuspiciouslyShort(stopReason, proseRunes, outputTokens, sawToolUseBlock, thinkingRunes) &&
+		if !deadAirExhausted &&
+			anthropicTurnLooksSuspiciouslyShort(stopReason, proseRunes, outputTokens, sawToolUseBlock, thinkingRunes) &&
 			discardsUsed < anthropicHoldbackDiscardBudget(stopReason, proseRunes, outputTokens, sawToolUseBlock) {
 			return anthropicHoldbackDiscard
 		}
@@ -800,6 +809,9 @@ type anthropicHoldbackObserver struct {
 	// lastContentFrameAt 是最后一帧**有内容**的 SSE data 的到达时刻，窗口靠它度量静默。
 	// ping 刻意不计入：它只证明连接活着，不证明上游还在产出，正是要判为「静默」的形态。
 	lastContentFrameAt time.Time
+	// streamStartedAt 是**客户端请求**的起点（与 duration_ms / first_token_ms 同一口径），
+	// 不是上游首帧到达时刻。死气预算靠它度量「客户端到底干等了多久」。
+	streamStartedAt time.Time
 }
 
 // observe 吃下一帧已解析的 SSE data。commits 是这一帧在旧行为下会不会提交响应，
@@ -931,29 +943,61 @@ func (o *anthropicHoldbackObserver) holdbackMaxHoldDeadline(maxHold time.Duratio
 	return o.firstCommitPointAt.Add(maxHold)
 }
 
-// holdbackReleaseDeadline 给出「无论上游再说什么都必须放行」的时刻：静默窗口与总时长上限
-// 两条截止线里先到的那个。返回零值表示两条都还没起算。
+// deadAirElapsed 判断**客户端总死气**是否已经吃满预算。
 //
-// 定时器分支只认这一个口径，保证不会出现「定时器认为到点、判定认为没到」的分歧——判定侧
-// 走 releaseDeadlineElapsed，两者由同样的两条截止线导出。
-func (o *anthropicHoldbackObserver) holdbackReleaseDeadline(window, maxHold time.Duration) time.Time {
-	silence := o.holdbackSilenceDeadline(window)
-	ceiling := o.holdbackMaxHoldDeadline(maxHold)
-	switch {
-	case silence.IsZero():
-		return ceiling
-	case ceiling.IsZero():
-		return silence
-	case ceiling.Before(silence):
-		return ceiling
-	default:
-		return silence
+// 与前两条的区别是锚点，而这个区别决定了它治的是另一类故障：windowElapsed 从最后一帧有内容
+// 的 data 起算、maxHoldElapsed 从 firstCommitPointAt 起算，两者都只度量「本次上游尝试」。
+// 而客户端感知的死气是跨 failover **累加**的——一次 discard 换号之后，新尝试的 observer 是
+// 全新的，那两条线连同 10 秒上限一起归零，客户端却还在同一个 HTTP 请求上继续干等。
+//
+// 2026-08-25 实证，5 次断流全同一签名（13:23:21 / 13:50:52 / 14:10:30 / 14:26:26 /
+// 14:33:58）：14:26:26 那一发跨 2 次尝试、客户端零字节 30.76 秒；14:33:58 那一发跨 3 次
+// 尝试、约 60 秒。单次尝试的 duration_ms 分别只记到 19.4s / 23.6s，所以
+// usage_logs.first_token_ms/duration_ms 会**系统性低估**真实死气，别拿它当验证口径——
+// 要么按 gateway_check_start 到 Client disconnected 的跨度量，要么直接数断连事件。
+//
+// streamStartedAt 由 anthropicClientRequestStartedAt 从 gin.Context 上取，跨尝试是同一个
+// 值，所以这一条是三条里唯一不会被换号重置的。
+func (o *anthropicHoldbackObserver) deadAirElapsed(now time.Time, budget time.Duration) bool {
+	if budget <= 0 || o.streamStartedAt.IsZero() {
+		return false
 	}
+	return now.Sub(o.streamStartedAt) >= budget
 }
 
-// releaseDeadlineElapsed 判断两条放行截止线有没有任意一条到点。
-func (o *anthropicHoldbackObserver) releaseDeadlineElapsed(now time.Time, window, maxHold time.Duration) bool {
-	return o.windowElapsed(now, window) || o.maxHoldElapsed(now, maxHold)
+// holdbackDeadAirDeadline 给出客户端死气预算耗尽的时刻。返回零值表示没配预算或没有锚点。
+func (o *anthropicHoldbackObserver) holdbackDeadAirDeadline(budget time.Duration) time.Time {
+	if budget <= 0 || o.streamStartedAt.IsZero() {
+		return time.Time{}
+	}
+	return o.streamStartedAt.Add(budget)
+}
+
+// holdbackReleaseDeadline 给出「无论上游再说什么都必须放行」的时刻：三条截止线里先到的那个。
+// 返回零值表示三条都还没起算。
+//
+// 定时器分支只认这一个口径，保证不会出现「定时器认为到点、判定认为没到」的分歧——判定侧
+// 走 releaseDeadlineElapsed，两者由同样的三条截止线导出。
+func (o *anthropicHoldbackObserver) holdbackReleaseDeadline(window, maxHold, deadAir time.Duration) time.Time {
+	earliest := time.Time{}
+	for _, candidate := range []time.Time{
+		o.holdbackSilenceDeadline(window),
+		o.holdbackMaxHoldDeadline(maxHold),
+		o.holdbackDeadAirDeadline(deadAir),
+	} {
+		if candidate.IsZero() {
+			continue
+		}
+		if earliest.IsZero() || candidate.Before(earliest) {
+			earliest = candidate
+		}
+	}
+	return earliest
+}
+
+// releaseDeadlineElapsed 判断三条放行截止线有没有任意一条到点。
+func (o *anthropicHoldbackObserver) releaseDeadlineElapsed(now time.Time, window, maxHold, deadAir time.Duration) bool {
+	return o.windowElapsed(now, window) || o.maxHoldElapsed(now, maxHold) || o.deadAirElapsed(now, deadAir)
 }
 
 // anthropicTurnLooksSuspiciouslyShort 判定这一回合是否为「协议合法但疑似没把话说完」。
@@ -1443,6 +1487,30 @@ func noteAnthropicHoldbackDiscard(c *gin.Context) {
 	}
 }
 
+// anthropicClientRequestStartKey 记录**本次客户端请求**的起点，跨 failover 尝试共享。
+//
+// 为什么不能用每次尝试自己的 startTime：那个每换一次号就重新取一次，导致以它为锚的死气
+// 上限跟着归零。客户端在同一个 HTTP 请求上感知的是累加值，锚点必须和它同寿命。
+// gin.Context 的生命周期正好是一次客户端请求，与 anthropicHoldbackDiscardsKey 同理。
+const anthropicClientRequestStartKey = "anthropic_client_request_start"
+
+// anthropicClientRequestStartedAt 取本次客户端请求的起点；首次调用用 fallback 播种。
+//
+// 首次尝试拿自己的 startTime 播种，之后每次 failover 尝试读到的都是同一个值。c 为 nil
+// （单测直接构造 observer）时退化成 fallback，等价于「只有一次尝试」，不影响判据。
+func anthropicClientRequestStartedAt(c *gin.Context, fallback time.Time) time.Time {
+	if c == nil {
+		return fallback
+	}
+	if v, ok := c.Get(anthropicClientRequestStartKey); ok {
+		if seeded, ok := v.(time.Time); ok && !seeded.IsZero() {
+			return seeded
+		}
+	}
+	c.Set(anthropicClientRequestStartKey, fallback)
+	return fallback
+}
+
 const anthropicShortTurnHoldbackMessage = "Anthropic upstream ended the turn after an unusually short reply"
 
 func anthropicShortTurnHoldbackErrorBody() []byte {
@@ -1734,25 +1802,41 @@ func (s *GatewayService) handleStreamingResponseAnthropicAPIKeyPassthrough(
 		holdbackMaxHold = time.Duration(s.cfg.Gateway.AnthropicHoldbackMaxHoldMs) * time.Millisecond
 	}
 	holdbackDiscardsUsed := anthropicHoldbackDiscardsUsed(c)
-	holdback := &anthropicHoldbackObserver{}
+	// 客户端死气预算：三条截止线里唯一跨 failover 不归零的一条，见 deadAirElapsed。
+	// 窗口配 0（整个机制关掉）时同样不参与，理由和 maxHold 一致。
+	holdbackDeadAir := time.Duration(0)
+	if holdbackActive && s.cfg != nil && s.cfg.Gateway.AnthropicHoldbackDeadAirBudgetMs > 0 {
+		holdbackDeadAir = time.Duration(s.cfg.Gateway.AnthropicHoldbackDeadAirBudgetMs) * time.Millisecond
+	}
+	holdback := &anthropicHoldbackObserver{
+		streamStartedAt: anthropicClientRequestStartedAt(c, startTime),
+	}
 	// 独立定时器，不复用 keepalive：窗口是毫秒级而 keepalive 默认 10 秒，靠它兜底会让
-	// 「上游吐了两句就长时间静默」的流白等十秒。定时器在首帧可见增量到达时才 arm。
+	// 「上游吐了两句就长时间静默」的流白等十秒。
 	//
 	// 定时器只是**唤醒器**，判据由 holdback.holdbackReleaseDeadline 单独持有：静默窗口量的
 	// 是静默时长、会随新帧不断续期，而定时器一旦 arm 就按固定时长走，帧还在到达时它照样会
 	// 开火。所以开火之后必须复核，复核不通过就按剩余时间续期，见 case <-holdbackCh。
 	//
-	// arm 的时长取两条截止线里近的那个：总时长上限比静默窗口小时（线上 10000 vs 15000），
-	// 按窗口 arm 会睡过上限、白攥那一段。
+	// arm 的时长直接取 holdbackReleaseDeadline（三条截止线里先到的那个）到现在的差值，不再
+	// 自己 min 一遍：口径只留一处，免得定时器与判定各算一套。
+	//
+	// 刻意不再要求 firstCommitPointAt 已就位：配了死气预算时，「上游只发了 message_start /
+	// ping 这类不提交的帧然后彻底卡住」也必须能被唤醒。2026-08-25 14:10:30 那一发正是这个
+	// 形态——out=0、客户端零字节 420 秒，前两条线全都没起算，唯一兜得住的是死气那一条。
 	var holdbackTimer *time.Timer
 	var holdbackCh <-chan time.Time
 	armHoldbackTimer := func() {
-		if !holdbackActive || holdbackTimer != nil || holdback.firstCommitPointAt.IsZero() {
+		if !holdbackActive || holdbackTimer != nil {
 			return
 		}
-		wake := holdbackWindow
-		if holdbackMaxHold > 0 && holdbackMaxHold < wake {
-			wake = holdbackMaxHold
+		deadline := holdback.holdbackReleaseDeadline(holdbackWindow, holdbackMaxHold, holdbackDeadAir)
+		if deadline.IsZero() {
+			return
+		}
+		wake := time.Until(deadline)
+		if wake <= 0 {
+			wake = time.Millisecond
 		}
 		holdbackTimer = time.NewTimer(wake)
 		holdbackCh = holdbackTimer.C
@@ -1992,7 +2076,8 @@ func (s *GatewayService) handleStreamingResponseAnthropicAPIKeyPassthrough(
 					holdback.observe(holdFrame, commitPrelude, now)
 					armHoldbackTimer()
 					switch anthropicHoldbackVerdict(
-						holdback.releaseDeadlineElapsed(now, holdbackWindow, holdbackMaxHold),
+						holdback.releaseDeadlineElapsed(now, holdbackWindow, holdbackMaxHold, holdbackDeadAir),
+						holdback.deadAirElapsed(now, holdbackDeadAir),
 						holdback.stopReason, holdback.proseRunes, holdback.outputTokens,
 						holdback.sawToolUseBlock, holdbackDiscardsUsed, holdback.thinkingRunes,
 					) {
@@ -2031,12 +2116,13 @@ func (s *GatewayService) handleStreamingResponseAnthropicAPIKeyPassthrough(
 		case <-holdbackCh:
 			// 定时器只是唤醒器，判据在 holdback.holdbackReleaseDeadline 手里：静默窗口量的
 			// 是**静默**时长、会随新帧续期，而定时器 arm 之后按固定时长走，帧还在源源到达时
-			// 它照样开火。所以开火先复核，两条截止线都没到就按剩余时间续期、继续持流；只有
-			// 静默真的满了一个窗口（判定要的 stop_reason 始终没来）、或者持流总时长撞到上限
-			// （上游一直在吐但客户端一个字节都还没拿到），才认定等不起，原样放行。
+			// 它照样开火。所以开火先复核，三条截止线都没到就按剩余时间续期、继续持流；只有
+			// 静默真的满了一个窗口（判定要的 stop_reason 始终没来）、持流总时长撞到上限
+			// （上游一直在吐但客户端一个字节都还没拿到）、或者客户端总死气吃满预算（跨
+			// failover 累加，见 deadAirElapsed），才认定等不起，原样放行。
 			holdbackCh = nil
 			now := time.Now()
-			deadline := holdback.holdbackReleaseDeadline(holdbackWindow, holdbackMaxHold)
+			deadline := holdback.holdbackReleaseDeadline(holdbackWindow, holdbackMaxHold, holdbackDeadAir)
 			switch {
 			case streamCommitted:
 				// 已经提交过，窗口没有可做的事。
