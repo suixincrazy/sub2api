@@ -1108,12 +1108,13 @@ type GatewayConfig struct {
 	// 放行权由这一条独占；窗口配得比这个值小时仍由静默那条先兜住「吐两句就卡住」的形态。
 	AnthropicHoldbackMaxHoldMs int `mapstructure:"anthropic_holdback_max_hold_ms"`
 
-	// AnthropicHoldbackDeadAirBudgetMs: 客户端总死气预算（毫秒），0 表示不封顶。
+	// AnthropicHoldbackDeadAirBudgetMs: 首帧后的累计持流预算（毫秒），0 表示不封顶。
 	//
 	// 前两条都只度量**一次上游尝试**：静默窗口从最后一帧有内容的 data 起算，总时长上限从
 	// firstCommitPointAt 起算。而持流判定失败会 discard + 换号重试，新尝试的 observer 是全新
-	// 的，那两条线连同 10 秒上限一起归零——客户端却还挂在同一个 HTTP 请求上继续干等。于是
-	// 客户端感知的死气 = Σ(每次尝试各自攥的时间)，没有任何上界。
+	// 的，那两条线连同 10 秒上限一起归零。此预算把每次尝试从**第一帧合法 SSE 到 discard**的
+	// 实际持流时长累加到同一个客户端请求上；首帧到达前的上游 TTFB 不计入，message_start /
+	// ping 到达后再卡住则计入。
 	//
 	// 2026-08-25 实证，一天内 5 次断流全是同一签名（ftt/dur ≥ 0.975，整发被兜住、到期一次性
 	// flush）：
@@ -1139,11 +1140,12 @@ type GatewayConfig struct {
 	//
 	// 25000 落在可疑区 p90（22557ms）之上：约 91.5% 的可疑回合判定窗口不受影响，仍能完整走到
 	// stop_reason；剩下 8.5% 退化成「放行 + 给下一发解绑」，也就是这个机制存在之前的行为。
-	// 换来的是死气有了硬上界——上游 TTFB 已经超过预算时持流一秒都不再加。
+	// 换来的是首帧后的持流有了硬上界——首帧前的上游 TTFB 不消耗这条预算，首帧到达后才开始累计。
 	//
-	// 上界不是「客户端一定不断连」的保证：上游自己的 TTFB 这一条管不了（14:10:30 那发上游
-	// 420 秒没吐一帧，预算到点时缓冲是空的，放行也放不出东西）。它保证的是**持流不再往上游
-	// 的慢上面叠**，以及死气吃满后不再换号（换号等于让客户端从头再等一轮，见
+	// 上界不是「客户端一定不断连」的保证：首帧前上游自己的 TTFB 这一条管不了（14:10:30 那发
+	// 上游 420 秒没吐一帧，预算尚未起算，放行也放不出东西）。它保证的是**首帧后的持流不再
+	// 往上游的慢上面叠**；预算吃满但 stop_reason 仍未到时会放行，终止证据已经到齐时仍优先
+	// 丢弃可疑短回合，见
 	// anthropicHoldbackVerdict 的 deadAirExhausted）。
 	AnthropicHoldbackDeadAirBudgetMs int `mapstructure:"anthropic_holdback_dead_air_budget_ms"`
 
@@ -3499,7 +3501,7 @@ func (c *Config) Validate() error {
 	if c.Gateway.AnthropicHoldbackDeadAirBudgetMs < 0 {
 		return fmt.Errorf("gateway.anthropic_holdback_dead_air_budget_ms must be non-negative")
 	}
-	// 下界 5000：这一条量的是**客户端累计**死气，天然要比单次尝试的总时长上限（10s 默认）
+	// 下界 5000：这一条量的是**首帧后的累计持流**，天然要比单次尝试的总时长上限（10s 默认）
 	// 更宽。配到 5 秒以下等于绝大多数可疑回合都等不到 stop_reason 就被迫放行，持流形同关闭，
 	// 那种意图应该显式配 0。
 	if c.Gateway.AnthropicHoldbackDeadAirBudgetMs != 0 &&
