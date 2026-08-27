@@ -1104,8 +1104,12 @@ type GatewayConfig struct {
 	// 存在之前的行为，不会更差）。代价换来的是长回合那 49% 的死气从 52~95s 压回 10s 以内。
 	//
 	// 与静默窗口的分工：这一条从 firstCommitPointAt 起算**总时长**，那一条从最后一帧有内容
-	// 的 data 起算**静默时长**，两者取先到者放行。线上窗口配成 15000 时静默那条永不先到，
-	// 放行权由这一条独占；窗口配得比这个值小时仍由静默那条先兜住「吐两句就卡住」的形态。
+	// 的 data 起算**静默时长**，两者取先到者放行。因为 silenceSince 永不早于
+	// firstCommitPointAt，只要这一条的时长不大于窗口，它就必然先到——线上窗口 15000、这一条
+	// 10000，放行权由这一条独占；窗口配得比这个值小时才轮到静默那条先兜住「吐两句就卡住」。
+	// 这个序关系要求两条线**同步放宽**：长思考放宽只抬这一条的话，10000→60000 会让 15000 的
+	// 窗口反过来先到点，把放宽悄悄作废（2026-08-27 23:24:24 实证），所以 effectiveHoldCap
+	// 三条线一起抬，见那里的说明。
 	AnthropicHoldbackMaxHoldMs int `mapstructure:"anthropic_holdback_max_hold_ms"`
 
 	// AnthropicHoldbackDeadAirBudgetMs: 首帧后的累计持流预算（毫秒），0 表示不封顶。
@@ -1151,10 +1155,15 @@ type GatewayConfig struct {
 
 	// AnthropicHoldbackLongThinkingHoldMs: 长思考回合的持流下限（毫秒），0 表示不放宽。
 	//
-	// 放宽的对象只有两条**总时长**类截止线（AnthropicHoldbackMaxHoldMs 与
-	// AnthropicHoldbackDeadAirBudgetMs）：长思考回合里它们量的那段时间正是模型在思考，
-	// 到点放行等于在判据成形之前就把窗口关掉。静默窗口（AnthropicHoldbackWindowMs）刻意
-	// 不放宽——它量的是上游**不说话**，那才是真的等不起。
+	// 放宽的对象是全部三条放行截止线（AnthropicHoldbackWindowMs、
+	// AnthropicHoldbackMaxHoldMs、AnthropicHoldbackDeadAirBudgetMs）：长思考回合里它们量的
+	// 那段时间正是模型在思考，任何一条到点放行都等于在判据成形之前就把窗口关掉。
+	//
+	// 静默窗口一度刻意不放宽，理由是「它量的是上游**不说话**，那才是真的等不起」。2026-08-27
+	// 23:24:24 那一发否掉了这个例外：等不起的前提是等到了有用的东西，而长思考未决时放行交付
+	// 的是一个 stop_reason 为空、判据不全的回合，零正文那一档更是必然交付一个没有答案的 200，
+	// 「早放行」省下的不是时间，是唯一的换号机会。更直接的问题是只放宽一部分等于没放宽：
+	// 10s 上限抬到 60s 之后，15s 的窗口成了最短的那条，放行权原封不动地换了个持有者。
 	//
 	// 2026-08-27 14:12:03 实证（usage_logs id=14596，账号 9，stream=t）：
 	// out=851、prose=481 rune、first_token_ms=18174、duration_ms=54785。持流上线后
@@ -1168,13 +1177,23 @@ type GatewayConfig struct {
 	// 这个立论的例外——anthropicVisibleOutputTokens 会把 output_tokens 按
 	// prose/(prose+thinking) 折算，14:12:03 那一发 851 折算成 851×481/(481+thinking)，
 	// thinking≥509 rune 时就落回 430 闸门之内，所以它**能**被判可疑，攥着有收益。
-	// 判别信号在持流期就拿得到：thinkingRunes 已经累到
-	// anthropicShortTurnThinkingRuneFloor(200) 以上、而 stop_reason 还没来。
+	// 判别信号在持流期就拿得到，见 longThinkingJudgementPending 的两个入口：thinkingRunes 已经
+	// 累到 anthropicShortTurnThinkingRuneFloor(200) 以上、或者思考已开始而正文仍是零，
+	// 且两者都要求 stop_reason 还没来。
 	//
-	// 代价与上界：放宽期间客户端零字节，但三条提前放行的出口全都还在——正文越过
-	// anthropicShortTurnProseRuneLimit(1300)、出现 tool_use 块、或上游静默满一个窗口，
-	// 任何一条成立立刻放行。也就是说健康的长思考长回答一旦开始写正文就会在 1300 rune 处放行，
-	// 真正攥满这个下限的只有「想了很久却几乎没说话」——正是要治的形态。
+	// 第二个入口来自 2026-08-27 23:24:24 实证（usage_logs id=15219，账号 11，stream=t）：
+	// in=226880、out=0、first_token_ms=15361、duration_ms=33445。思考只涨到 337 rune 就断了，
+	// 速率约 12 rune/s，200 那道闸门在 10s 上限到点时还没够，放宽拿不到，缓冲在 15361ms
+	// （firstCommitPointAt 5361ms + 10s）被放出去；上游 18.084 秒后 EOF，streamCommitted 已为真，
+	// 只能走 reportStreamTruncatedAfterCommit，failover 出口已关。零正文回合的可判性压根不经过
+	// anthropicVisibleOutputTokens 的折算（anthropicTurnIsEmptyAnswer 刻意传 thinkingRunes=0），
+	// 所以那道闸门对这一档只有副作用。
+	//
+	// 代价与上界：放宽期间客户端零字节，提前放行的出口还剩两条——正文越过
+	// anthropicShortTurnProseRuneLimit(1300)、或出现 tool_use 块，任何一条成立立刻放行。
+	// 静默窗口不再算一条出口（它同样被放宽了），所以这个下限是三条线共同的实际上界。
+	// 健康的长思考长回答一旦开始写正文就会在 1300 rune 处放行，真正攥满这个下限的只有
+	// 「想了很久却几乎没说话」——正是要治的形态。
 	//
 	// 60000ms 的取值：覆盖 14:12:03 那一发所需的 46.6s（firstCommitPointAt 到 stop_reason）
 	// 并留 29% 余量，同时远低于 gateway.stream_data_interval_timeout（180s）那一级，也低于

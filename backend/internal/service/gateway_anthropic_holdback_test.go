@@ -1188,6 +1188,41 @@ func (p *pacedBody) Read(dst []byte) (int, error) {
 
 func (p *pacedBody) Close() error { return nil }
 
+// pacedThenReadError 与 pacedBody 的唯一差别是收尾：事件放完之后给一个读错误而不是 io.EOF，
+// 复现 2026-08-27 23:24:24 那一发上游中途 unexpected EOF 的形态。EOF 走的是 scanner 正常结束
+// 那条分支，读错误走 ev.err 那条——线上那一发是后者。
+type pacedThenReadError struct {
+	pacedBody
+	err error
+}
+
+func (p *pacedThenReadError) Read(dst []byte) (int, error) {
+	n, err := p.pacedBody.Read(dst)
+	if err == io.EOF {
+		return n, p.err
+	}
+	return n, err
+}
+
+func (p *pacedThenReadError) Close() error { return nil }
+
+// zeroProseThinkingTrickleEvents 构造 23:24:24 那一发的形态：只有 message_start + 一个思考块 +
+// 慢速涓流的 thinking_delta，全程零正文、没有 stop_reason、没有终止事件。
+//
+// 思考刻意压在 anthropicShortTurnThinkingRuneFloor(200) 之下（12 帧 × 14 = 168 rune），
+// 这样放宽只可能来自 longThinkingJudgementPending 的零正文入口，不会被 200 那道闸门顺带解锁。
+func zeroProseThinkingTrickleEvents() []string {
+	events := []string{
+		`data: {"type":"message_start","message":{"usage":{"input_tokens":226880,"output_tokens":1}}}`,
+		`data: {"type":"content_block_start","index":0,"content_block":{"type":"thinking","thinking":""}}`,
+	}
+	for i := 0; i < 12; i++ {
+		events = append(events,
+			`data: {"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"我得先想清楚这里的因果链条。"}}`)
+	}
+	return events
+}
+
 // 2026-08-25 02:06:53 那一发的端到端回归：长思考回合里帧一直在来，总持流时长是窗口的
 // 一倍半，但任何相邻两帧之间都没有静默满一个窗口。
 //
@@ -1716,27 +1751,29 @@ func TestAnthropicHoldbackObserverLongThinkingExtendsTotalHoldCaps(t *testing.T)
 	require.True(t, off.releaseDeadlineElapsed(stopReasonAt, window, maxHold, deadAir),
 		"于是缓冲在判定成形之前就被放行——这就是 14:12:03 的根因")
 
-	// 放宽打开后，两条线都推到 60 秒，stop_reason 到达时判定窗口仍然完好。
+	// 放宽打开后，三条线全部推到 60 秒，stop_reason 到达时判定窗口仍然完好。
 	on := newObserver(floor)
 	require.False(t, on.maxHoldElapsed(stopReasonAt, maxHold), "长思考回合的总时长上限抬到 60 秒")
 	require.False(t, on.deadAirElapsed(stopReasonAt, deadAir), "死气预算必须同步抬高，只放宽一条等于没放宽")
+	require.False(t, on.windowElapsed(stopReasonAt, window), "静默窗口同样抬到 60 秒")
 	require.False(t, on.releaseDeadlineElapsed(stopReasonAt, window, maxHold, deadAir),
 		"判定得以等到 stop_reason，这一发才可能被零暴露丢弃")
-	// 定时器与判定共用一个口径：两条总时长线都必须同样被推到 60 秒处。
+	// 定时器与判定共用一个口径：三条线都必须同样被推到 60 秒处。
 	require.Equal(t, commitPointAt.Add(floor), on.holdbackMaxHoldDeadline(maxHold))
 	require.Equal(t, firstFrameAt.Add(floor), on.holdbackDeadAirDeadline(deadAir))
-	// 两条被推远之后，三条里先到的换成了静默那一条（最后一帧思考 +15s）。它仍在
-	// stop_reason 之后，判定窗口完好；定时器只认这一个口径，不得与判定分叉。
+	require.Equal(t, on.lastContentFrameAt.Add(floor), on.holdbackSilenceDeadline(window))
+	// 三条一起被推远之后，先到的是死气那条（第一帧 SSE +60s，比 firstCommitPointAt 更早起算）。
+	// 它仍在 stop_reason 之后，判定窗口完好；定时器只认这一个口径，不得与判定分叉。
 	releaseAt := on.holdbackReleaseDeadline(window, maxHold, deadAir)
-	require.Equal(t, on.holdbackSilenceDeadline(window), releaseAt,
-		"放宽后先到的是静默那条，说明两条总时长线确实被推到了它之后")
+	require.Equal(t, on.holdbackDeadAirDeadline(deadAir), releaseAt,
+		"三条同步放宽后先到的是起算最早的死气那条")
 	require.True(t, releaseAt.After(stopReasonAt), "先到的截止线必须晚于 stop_reason")
 	require.False(t, on.releaseDeadlineElapsed(releaseAt.Add(-time.Millisecond), window, maxHold, deadAir))
 	require.True(t, on.releaseDeadlineElapsed(releaseAt, window, maxHold, deadAir),
 		"判定必须与 holdbackReleaseDeadline 在同一毫秒上翻转")
 
-	// 抬高仍有硬上界。上面那条流在末尾静默了几秒，所以由静默线兜住；这里换成帧一路铺过
-	// 60 秒的流，专门验下限本身封得住——否则放宽就变成了无限攥着。
+	// 抬高仍有硬上界。上面那条流由起算最早的死气线兜住；这里换成帧一路铺过 60 秒的流，
+	// 专门验总时长上限这条下限本身封得住——否则放宽就变成了无限攥着。
 	paced := &anthropicHoldbackObserver{longThinkingHoldFloor: floor}
 	paced.observe(gjson.Parse(`{"type":"message_start","message":{"usage":{"input_tokens":32944}}}`), false, firstFrameAt)
 	for at := commitPointAt; !at.After(commitPointAt.Add(floor + 10*time.Second)); at = at.Add(time.Second) {
@@ -1758,11 +1795,15 @@ func TestAnthropicHoldbackObserverLongThinkingExtendsTotalHoldCaps(t *testing.T)
 	require.Equal(t, commitPointAt.Add(maxHold), on.holdbackMaxHoldDeadline(maxHold))
 }
 
-// 放宽的边界：思考不够长的回合一律不放宽。
+// 放宽的边界：思考不够长**且已经在写正文**的回合一律不放宽。
 //
 // 这一条守的正是 AnthropicHoldbackMaxHoldMs 的立论——思考短于
 // anthropicShortTurnThinkingRuneFloor 时 output_tokens 不会被思考撑大，闸门本来就有效，
 // out>430 的长回答结构性不可判，攥着纯亏首字延迟（改静默口径时实测 p90 首字节 42s→113s）。
+//
+// 「已经在写正文」是必要条件：正文仍是零的思考回合走
+// longThinkingJudgementPending 的第二个入口，那一档的可判性不经过折算，与思考长短无关，
+// 见 TestAnthropicHoldbackObserverZeroProseThinkingExtendsAllThreeCaps。
 func TestAnthropicHoldbackObserverLongThinkingFloorIgnoresShortThinking(t *testing.T) {
 	const maxHold = 10 * time.Second
 	const deadAir = 25 * time.Second
@@ -1775,11 +1816,16 @@ func TestAnthropicHoldbackObserverLongThinkingFloorIgnoresShortThinking(t *testi
 	o.observe(gjson.Parse(fmt.Sprintf(
 		`{"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":%q}}`,
 		strings.Repeat("我得先想清楚这里的因果链条。", 10))), true, base)
+	// 正文已经开始，于是零正文那个入口不成立，只剩 200 rune 那道闸门说话。
+	o.observe(gjson.Parse(`{"type":"content_block_delta","index":1,"delta":{"type":"text_delta","text":"先按这个方案往下做。"}}`), true, base)
 	require.Less(t, o.thinkingRunes, anthropicShortTurnThinkingRuneFloor, "构造前提：思考不够长")
+	require.Positive(t, o.proseRunes, "构造前提：正文已经在写，零正文入口不该成立")
 	require.False(t, o.longThinkingJudgementPending())
 	require.True(t, o.maxHoldElapsed(base.Add(maxHold), maxHold), "思考不够长时 10 秒上限照旧生效")
 	require.True(t, o.deadAirElapsed(base.Add(deadAir), deadAir))
 	require.Equal(t, base.Add(maxHold), o.holdbackMaxHoldDeadline(maxHold))
+	require.Equal(t, base.Add(15*time.Second), o.holdbackSilenceDeadline(15*time.Second),
+		"不放宽时静默窗口保持基准值")
 
 	// 显式配 0 关掉的截止线不得被下限重新打开：那会让「关掉某条线」的意图被悄悄推翻。
 	long := &anthropicHoldbackObserver{longThinkingHoldFloor: floor}
@@ -1795,6 +1841,113 @@ func TestAnthropicHoldbackObserverLongThinkingFloorIgnoresShortThinking(t *testi
 	// 下限比基准值还小时等于不放宽，取两者的大者。
 	require.True(t, long.maxHoldElapsed(base.Add(2*time.Minute), 90*time.Second),
 		"基准值本身比下限更宽时以基准值为准")
+}
+
+// 2026-08-27 23:24:24 那一发的观察器级回归（usage_logs id=15219，账号 11 justwoker-anthropic，
+// in=226880 out=0 first_token_ms=15361 duration_ms=33445）。
+//
+// 形态：思考慢速涓流、全程零正文、stop_reason 始终没来。整发只积了 337 rune 思考、耗时
+// 33.4 秒，约 12 rune/s；放行发生在 firstCommitPointAt(5361ms) + 10s 上限 = 15361ms，
+// 那一刻思考只累到 120 rune 上下，200 那道闸门够不着，于是放宽拿不到、缓冲被放出去。上游
+// 18.084 秒之后才 EOF，此时 streamCommitted 已为真，读错误只能走
+// reportStreamTruncatedAfterCommit——「stream truncated after commit, no failover possible」。
+//
+// 判定按帧推进，所以每一处判定都必须拿**那一刻**的观察器状态去问，不能拿整发终值。下面按
+// 时刻各建一个观察器，就是为了不把 337 这个终值误当成放行时刻的状态。
+//
+// 这一条要钉死两件事：
+//  1. 零正文入口不看思考长短。放行时刻的 126 rune 远低于闸门，放宽照样必须成立。
+//  2. 三条线必须一起被推远。只抬两条总时长线的话，静默窗口反过来成了最短的那条，放行权
+//     原封不动地换了个持有者，放宽等于没做。
+func TestAnthropicHoldbackObserverZeroProseThinkingExtendsAllThreeCaps(t *testing.T) {
+	const window = 15 * time.Second
+	const maxHold = 10 * time.Second
+	const deadAir = 25 * time.Second
+	const floor = 60 * time.Second
+
+	// 真实时间轴：t0 是 gateway_check_start，首个 thinking_delta 在 5361ms（= 放行时刻
+	// 15361ms - 10s 上限），上游 EOF 在 33445ms。
+	t0 := time.Date(2026, 8, 27, 15, 23, 50, 992000000, time.UTC)
+	firstFrameAt := t0.Add(5200 * time.Millisecond)
+	commitPointAt := t0.Add(5361 * time.Millisecond)
+	releasedAt := t0.Add(15361 * time.Millisecond) // 线上实际放行时刻
+	eofAt := t0.Add(33445 * time.Millisecond)
+
+	// 每帧 14 rune，按 gap 铺 frames 帧。12 rune/s 的实测速率下 10 秒约合 9 帧 126 rune，
+	// 整发 33.4 秒约合 24 帧 336 rune ≈ 线上的 337。
+	newObserver := func(longThinkingFloor, gap time.Duration, frames int) *anthropicHoldbackObserver {
+		o := &anthropicHoldbackObserver{longThinkingHoldFloor: longThinkingFloor}
+		o.observe(gjson.Parse(`{"type":"message_start","message":{"usage":{"input_tokens":226880,"output_tokens":1}}}`), false, firstFrameAt)
+		o.observe(gjson.Parse(`{"type":"content_block_start","index":0,"content_block":{"type":"thinking","thinking":""}}`), false, commitPointAt)
+		at := commitPointAt
+		for i := 0; i < frames; i++ {
+			o.observe(gjson.Parse(fmt.Sprintf(
+				`{"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":%q}}`,
+				"我得先想清楚这里的因果链条。")), true, at)
+			at = at.Add(gap)
+		}
+		return o
+	}
+	const trickleGap = 1150 * time.Millisecond
+	const framesAtRelease = 9 // 放行时刻已到的帧数
+	const framesAtEOF = 24    // 整发的帧数
+
+	// 放行时刻的状态：10 秒上限到点，而 200 那道闸门还差得远。这就是线上的结局。
+	off := newObserver(0, trickleGap, framesAtRelease)
+	require.Equal(t, commitPointAt, off.firstCommitPointAt)
+	require.Zero(t, off.proseRunes, "构造前提：全程零正文")
+	require.Less(t, off.thinkingRunes, anthropicShortTurnThinkingRuneFloor,
+		"构造前提：放行那一刻思考涓流还够不到 200 那道闸门")
+	require.Empty(t, off.stopReason, "构造前提：stop_reason 始终没来")
+	require.False(t, off.windowElapsed(releasedAt, window),
+		"构造前提：帧一直在来，放行的不是静默那条")
+	require.True(t, off.maxHoldElapsed(releasedAt, maxHold), "线上现状：10 秒上限在 15361ms 到点")
+	require.True(t, off.releaseDeadlineElapsed(releasedAt, window, maxHold, deadAir),
+		"于是缓冲在 EOF 之前 18.084 秒就被放行——放行之后 streamCommitted 为真，failover 出口关掉")
+
+	// 同一时刻打开放宽：零正文入口必须在这里就成立，否则救不了这一发。
+	onAtRelease := newObserver(floor, trickleGap, framesAtRelease)
+	require.True(t, onAtRelease.longThinkingJudgementPending(),
+		"零正文入口不看思考长短：放行时刻的 126 rune 也必须成立")
+	require.False(t, onAtRelease.releaseDeadlineElapsed(releasedAt, window, maxHold, deadAir),
+		"放宽必须在放行时刻之前生效，晚一帧都来不及")
+
+	// EOF 时刻的状态：三条线全部抬到 60 秒，缓冲仍在手里。
+	on := newObserver(floor, trickleGap, framesAtEOF)
+	require.Equal(t, 336, on.thinkingRunes, "构造前提：整发思考总量对齐线上的 337")
+	require.False(t, on.maxHoldElapsed(eofAt, maxHold), "总时长上限抬到 60 秒")
+	require.False(t, on.deadAirElapsed(eofAt, deadAir), "死气预算同步抬高")
+	require.False(t, on.releaseDeadlineElapsed(eofAt, window, maxHold, deadAir),
+		"EOF 到达时三条都没到点，streamCommitted 仍为假，failover 出口完好")
+	require.Equal(t, commitPointAt.Add(floor), on.holdbackMaxHoldDeadline(maxHold))
+	require.Equal(t, firstFrameAt.Add(floor), on.holdbackDeadAirDeadline(deadAir))
+	require.Equal(t, on.lastContentFrameAt.Add(floor), on.holdbackSilenceDeadline(window))
+	require.True(t, on.holdbackReleaseDeadline(window, maxHold, deadAir).After(eofAt),
+		"定时器口径必须与判定一致：先到的那条也要晚于 EOF")
+
+	// 为什么第三条也必须交出去：涓流在 EOF 之前就停住时，静默那条成为最短的一条。上面那条
+	// 铺到 EOF 前 1.6 秒的流验不出这一点（静默按定义到不了点），换成同样 336 rune、但在 EOF
+	// 前约 19 秒就停住的疏涓流——两条流思考总量相同，唯一差别是帧的疏密。
+	stalledOff := newObserver(0, 400*time.Millisecond, framesAtEOF)
+	require.True(t, stalledOff.lastContentFrameAt.Add(window).Before(eofAt),
+		"构造前提：这条流确实静默满一个基准窗口")
+	require.True(t, stalledOff.windowElapsed(eofAt, window),
+		"不放宽静默那条时它在 EOF 之前到点——只抬两条总时长线等于把放行权换个持有者")
+	stalledOn := newObserver(floor, 400*time.Millisecond, framesAtEOF)
+	require.False(t, stalledOn.windowElapsed(eofAt, window),
+		"三条同步放宽后静默那条也撑过 EOF")
+	require.False(t, stalledOn.releaseDeadlineElapsed(eofAt, window, maxHold, deadAir),
+		"这才是放宽真正生效：疏涓流同样保住 failover 窗口")
+
+	// 自限：stop_reason 一到，放宽立刻失效，三条线全部回落到基准值。
+	// message_delta 不是 ping，所以它同时把静默起点刷到 eofAt——静默那条从这一刻重新起算 15 秒。
+	on.observe(gjson.Parse(`{"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":337}}`), false, eofAt)
+	require.False(t, on.longThinkingJudgementPending())
+	require.Equal(t, commitPointAt.Add(maxHold), on.holdbackMaxHoldDeadline(maxHold))
+	require.Equal(t, eofAt.Add(window), on.holdbackSilenceDeadline(window),
+		"拿到 stop_reason 后静默窗口回落到基准值")
+	require.Equal(t, firstFrameAt.Add(deadAir), on.holdbackDeadAirDeadline(deadAir),
+		"死气预算同样回落")
 }
 
 // longThinkingTruncatedEvents 构造 2026-08-27 14:12:03 那一发的形态：思考期远长于两条总时长
@@ -1941,4 +2094,79 @@ func TestAnthropicPassthrough_HoldbackShortThinkingStillReleasesAtMaxHold(t *tes
 		"思考不够长时总时长上限必须按时放行，不能被放宽拖成换号")
 	require.Contains(t, rec.Body.String(), "这一段还在往下写。",
 		"200ms 上限到点就该把攒下的帧写出去")
+}
+
+// 2026-08-27 23:24:24 的端到端回归（usage_logs id=15219，账号 11 justwoker-anthropic，
+// in=226880 out=0 first_token_ms=15361 duration_ms=33445）。
+//
+// 线上时间轴：首个 thinking_delta 在 5361ms 落地 → 10 秒总时长上限在 15361ms 到点放行 →
+// 上游在 33445ms 才 unexpected EOF。放行那一刻 streamCommitted 变真、HTTP 200 钉死，18 秒后
+// 的读错误只能走 reportStreamTruncatedAfterCommit：
+//
+//	ERROR [Anthropic Passthrough] stream truncated after commit, no failover possible:
+//	account=11(justwoker-anthropic) model=claude-opus-5
+//	reason=stream read error after commit: unexpected EOF
+//
+// 与 TestAnthropicPassthrough_HoldbackLongThinkingOutlastsTotalHoldCaps 的分工：那一条的思考
+// 第一帧就顶过 200 rune，靠的是 longThinkingJudgementPending 的折算入口；这一条的思考全程
+// 168 rune，只可能走零正文那个入口。两条用例合起来盖住放宽的两个入口。
+func TestAnthropicPassthrough_HoldbackZeroProseThinkingSurvivesReadError(t *testing.T) {
+	const sessionKey = "holdback-zero-prose-thinking-read-error"
+	const groupID = int64(1)
+	cache := newShortTurnStreakCache(sessionKey, 11)
+	svc, _ := newHoldbackTestGatewayService(t, cache, 200)
+	// 三条线都远短于整条流（14 帧 × 30ms ≈ 420ms），放宽下限远长于整条流。
+	svc.cfg.Gateway.AnthropicHoldbackMaxHoldMs = 150
+	svc.cfg.Gateway.AnthropicHoldbackDeadAirBudgetMs = 250
+	svc.cfg.Gateway.AnthropicHoldbackLongThinkingHoldMs = 20000
+
+	resp := &http.Response{
+		StatusCode: http.StatusOK,
+		Header:     http.Header{"Content-Type": []string{"text/event-stream"}},
+		Body: &pacedThenReadError{
+			pacedBody: pacedBody{events: zeroProseThinkingTrickleEvents(), gap: 30 * time.Millisecond},
+			err:       io.ErrUnexpectedEOF,
+		},
+	}
+
+	rec, c, err := runHoldbackPassthrough(t, svc, groupID, sessionKey, 11, resp, nil)
+
+	var failoverErr *UpstreamFailoverError
+	require.True(t, errors.As(err, &failoverErr),
+		"读错误到达时缓冲必须还在手里，才谈得上换号——线上这里是 no failover possible")
+	require.True(t, failoverErr.ShouldRetryNextAccount())
+	require.Empty(t, rec.Body.String(), "换号窗口的前提是客户端一个字节都没收到")
+	require.False(t, c.Writer.Written())
+}
+
+// 同一条流、只把放宽关掉，复现线上 23:24:24 的结局：总时长上限在读错误之前到点放行，
+// 字节出去、200 钉死，读错误只能报 truncated after commit。
+//
+// 这一条是上一条的反证：两条用例的唯一差别就是 AnthropicHoldbackLongThinkingHoldMs，
+// 所以能证明零暴露确实来自零正文那个入口，而不是这条流本身就不会被提前放行。
+func TestAnthropicPassthrough_HoldbackZeroProseThinkingExposedWhenExtensionDisabled(t *testing.T) {
+	const sessionKey = "holdback-zero-prose-thinking-no-extension"
+	const groupID = int64(1)
+	cache := newShortTurnStreakCache(sessionKey, 11)
+	svc, _ := newHoldbackTestGatewayService(t, cache, 200)
+	svc.cfg.Gateway.AnthropicHoldbackMaxHoldMs = 150
+	svc.cfg.Gateway.AnthropicHoldbackDeadAirBudgetMs = 250
+	svc.cfg.Gateway.AnthropicHoldbackLongThinkingHoldMs = 0
+
+	resp := &http.Response{
+		StatusCode: http.StatusOK,
+		Header:     http.Header{"Content-Type": []string{"text/event-stream"}},
+		Body: &pacedThenReadError{
+			pacedBody: pacedBody{events: zeroProseThinkingTrickleEvents(), gap: 30 * time.Millisecond},
+			err:       io.ErrUnexpectedEOF,
+		},
+	}
+
+	rec, _, err := runHoldbackPassthrough(t, svc, groupID, sessionKey, 11, resp, nil)
+
+	require.Error(t, err)
+	var failoverErr *UpstreamFailoverError
+	require.False(t, errors.As(err, &failoverErr), "字节已经出去，不存在换号窗口")
+	require.Contains(t, rec.Body.String(), "我得先想清楚这里的因果链条。",
+		"这就是要治的暴露：150ms 上限到点把思考段写给了客户端")
 }

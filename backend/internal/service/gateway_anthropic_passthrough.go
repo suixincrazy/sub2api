@@ -885,30 +885,55 @@ type anthropicHoldbackObserver struct {
 	longThinkingHoldFloor time.Duration
 }
 
-// longThinkingJudgementPending 判断这一回合是否处于「还在长思考、判据尚未成形」的状态。
+// longThinkingJudgementPending 判断这一回合是否处于「还在思考、判据尚未成形」的状态。
 //
-// 两个条件缺一不可：
-//   - thinkingRunes 已越过 anthropicShortTurnThinkingRuneFloor：只有到了这个量级，
-//     anthropicVisibleOutputTokens 的折算才会把 output_tokens 显著拉低，也就是说这一回合
-//     **有可能**被判可疑，攥着才有收益。低于这个量级的长回合仍旧结构性不可判，那是
-//     AnthropicHoldbackMaxHoldMs 那条上限存在的理由，不能一起放宽。
-//   - stop_reason 还没来：判据一到齐，anthropicHoldbackVerdict 当帧就出结论，再放宽没有意义。
-//     反过来说这个状态是自限的，不会把已经能判定的回合继续攥着。
+// stop_reason 未到是硬前提：判据一到齐，anthropicHoldbackVerdict 当帧就出结论，再放宽没有
+// 意义。反过来说这个状态是自限的，不会把已经能判定的回合继续攥着。
 //
-// 刻意不看正文长度：正文越过 anthropicShortTurnProseRuneLimit 时 verdict 自己那条提前放行
-// 出口会先生效，在这里重复一遍只会让两处口径有分叉的机会。
+// 在此之上有两个各自独立的入口，命中任一条即成立：
+//   - thinkingRunes 已越过 anthropicShortTurnThinkingRuneFloor：到了这个量级，
+//     anthropicVisibleOutputTokens 的折算才会把 output_tokens 显著拉低，也就是说带正文的
+//     回合**有可能**被判可疑，攥着才有收益。
+//   - 思考已经开始、正文仍是零（thinkingRunes > 0 && proseRunes == 0）：这一档的可判性压根
+//     不经过折算。anthropicTurnLooksSuspiciouslyShort 的「空回合」分支明确不受
+//     anthropicShortTurnOutputTokenLimit 约束，anthropicTurnIsEmptyAnswer 调它时也刻意传
+//     thinkingRunes=0，所以零正文回合只要 stop_reason 一到就一定判得动，思考攒了多少 rune
+//     都不影响结论。既然可判性是结构性保证的，那道 200 rune 的闸门对这一档只有副作用。
+//
+// 第二条入口是 2026-08-27 23:24:24 那一发的根因（usage_logs id=15219，账号 11
+// justwoker-anthropic，in=226880 out=0）：思考只涨到 337 rune 就再没了下文，速率约 12 rune/s，
+// 于是 firstCommitPointAt+10s 到点时 thinkingRunes 还远不到 200，放宽拿不到，
+// AnthropicHoldbackMaxHoldMs 原值把缓冲放了出去（first_token_ms 15361 = 首个 thinking_delta
+// 5361ms + 10s）。上游 18.084 秒后才 EOF（duration_ms 33445），此时 streamCommitted 已为真，
+// 读错误只能走 reportStreamTruncatedAfterCommit，failover 出口已经关掉 ——「stream truncated
+// after commit, no failover possible」。这一发全程零正文、stop_reason 始终为空，放行的结果
+// 必然是客户端吃到一个没有答案的 200，攥着才有换号的可能。
+//
+// 刻意不看正文长度上限：正文越过 anthropicShortTurnProseRuneLimit 时 verdict 自己那条提前
+// 放行出口会先生效，在这里重复一遍只会让两处口径有分叉的机会。
 func (o *anthropicHoldbackObserver) longThinkingJudgementPending() bool {
-	if o.thinkingRunes < anthropicShortTurnThinkingRuneFloor {
+	if strings.TrimSpace(o.stopReason) != "" {
 		return false
 	}
-	return strings.TrimSpace(o.stopReason) == ""
+	if o.thinkingRunes >= anthropicShortTurnThinkingRuneFloor {
+		return true
+	}
+	return o.thinkingRunes > 0 && o.proseRunes == 0
 }
 
-// effectiveHoldCap 把一条**总时长**类截止线按长思考形态放宽到下限。
+// effectiveHoldCap 把一条放行截止线按长思考形态放宽到下限。
 //
-// 只有这一个函数持有放宽口径，maxHoldElapsed / holdbackMaxHoldDeadline / deadAirElapsed /
-// holdbackDeadAirDeadline 四个读者全部经过它，所以定时器（走 holdbackReleaseDeadline）与
-// 判定（走 releaseDeadlineElapsed）不可能各算一套。
+// 只有这一个函数持有放宽口径，三条线的六个读者（windowElapsed / holdbackSilenceDeadline /
+// maxHoldElapsed / holdbackMaxHoldDeadline / deadAirElapsed / holdbackDeadAirDeadline）全部
+// 经过它，所以定时器（走 holdbackReleaseDeadline）与判定（走 releaseDeadlineElapsed）不可能
+// 各算一套。
+//
+// 静默窗口原本刻意不放宽，理由是「它量的是上游**不说话**，那才是真的等不起」。2026-08-27
+// 23:24:24 那一发把这个理由的边界划清了：等不起的前提是等到了有用的东西，而长思考未决时
+// 放行只能交付一个 stop_reason 为空、判据不全的回合 —— 零正文那一档更是必然交付一个没有
+// 答案的 200。这种形态下「等不起」不成立，早放行不是省时间，是把唯一的换号机会关掉。
+// 放宽的上界仍由 AnthropicHoldbackLongThinkingHoldMs 单点控制，三条线一起抬到同一个下限，
+// 总持流时长不会因为多放宽一条而变长。
 //
 // base<=0 表示这条线本来就关着，放宽不能把它重新打开——否则「显式关掉某条截止线」的意图会
 // 被这个下限悄悄推翻。
@@ -997,7 +1022,10 @@ func (o *anthropicHoldbackObserver) silenceSince() time.Time {
 // 长回答不会一直攥到最后；而这一条本身没有上界（上游一直出帧就一直续期），所以死气的上界
 // 由 maxHoldElapsed 那条总时长上限单独兜着——2026-08-25 加，之前只有
 // gateway.stream_data_interval_timeout（180s）那一级，实测出现过攥 83.4 秒的回合。
+// 长思考未决时这一条也走 effectiveHoldCap 放宽，见那里的说明：静默满一个窗口只说明上游卡住，
+// 并不说明这一回合的判据已经成形，而判据不成形时放行交付的一定是残缺回合。
 func (o *anthropicHoldbackObserver) windowElapsed(now time.Time, window time.Duration) bool {
+	window = o.effectiveHoldCap(window)
 	if window <= 0 {
 		return false
 	}
@@ -1012,8 +1040,10 @@ func (o *anthropicHoldbackObserver) windowElapsed(now time.Time, window time.Dur
 //
 // 给 select 里的定时器分支用：定时器 arm 之后按固定时长走，帧还在到达时也会开火，所以
 // 开火后拿这个时刻复核——没到就按差值续期，到了才放行。判据只有这一处口径，和
-// windowElapsed 共用 silenceSince，不会出现「定时器认为到点、判定认为没到」的分歧。
+// windowElapsed 共用 silenceSince 与 effectiveHoldCap，不会出现「定时器认为到点、判定认为
+// 没到」的分歧。
 func (o *anthropicHoldbackObserver) holdbackSilenceDeadline(window time.Duration) time.Time {
+	window = o.effectiveHoldCap(window)
 	if window <= 0 {
 		return time.Time{}
 	}
@@ -1036,9 +1066,9 @@ func (o *anthropicHoldbackObserver) holdbackSilenceDeadline(window time.Duration
 // 42s→113s），而这一批在判据上结构性不可能被判可疑，攥着纯亏。完整标定见
 // GatewayConfig.AnthropicHoldbackMaxHoldMs。
 // 长思考回合是这条上限唯一的例外，见 effectiveHoldCap 与
-// GatewayConfig.AnthropicHoldbackLongThinkingHoldMs：那一类会被
-// anthropicVisibleOutputTokens 折算回闸门之内，也就是说它**能**被判可疑，10 秒到点放行等于
-// 在判据成形之前关掉窗口（2026-08-27 14:12:03 实证）。
+// GatewayConfig.AnthropicHoldbackLongThinkingHoldMs：思考越过 200 rune 的那一类会被
+// anthropicVisibleOutputTokens 折算回闸门之内，零正文的那一类压根不受闸门约束，两者都**能**
+// 被判可疑，10 秒到点放行等于在判据成形之前关掉窗口（2026-08-27 14:12:03 与 23:24:24 实证）。
 func (o *anthropicHoldbackObserver) maxHoldElapsed(now time.Time, maxHold time.Duration) bool {
 	maxHold = o.effectiveHoldCap(maxHold)
 	if maxHold <= 0 {
@@ -1080,8 +1110,9 @@ func (o *anthropicHoldbackObserver) holdbackElapsed(now time.Time) time.Duration
 
 // deadAirElapsed 判断实际持流时间是否已经吃满预算。
 //
-// 与 maxHoldElapsed 同样受长思考放宽影响：两条线同为「总时长」口径，只放宽一条等于没放宽
-// ——14:12:03 那一发若只抬 maxHold，25 秒的死气预算照样会先到点放行。
+// 与另外两条线同样受长思考放宽影响：三条线只放宽一部分等于没放宽 —— 14:12:03 那一发若只抬
+// maxHold，25 秒的死气预算照样会先到点放行；23:24:24 那一发若只抬这两条总时长线，15 秒的
+// 静默窗口同样会先到点放行。放行权必须三条一起交出去，否则最短的那条独占。
 func (o *anthropicHoldbackObserver) deadAirElapsed(now time.Time, budget time.Duration) bool {
 	budget = o.effectiveHoldCap(budget)
 	if budget <= 0 || o.holdbackStartedAt.IsZero() {
