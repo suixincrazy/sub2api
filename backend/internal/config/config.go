@@ -1178,7 +1178,7 @@ type GatewayConfig struct {
 	// prose/(prose+thinking) 折算，14:12:03 那一发 851 折算成 851×481/(481+thinking)，
 	// thinking≥509 rune 时就落回 430 闸门之内，所以它**能**被判可疑，攥着有收益。
 	// 判别信号在持流期就拿得到，见 longThinkingJudgementPending 的两个入口：thinkingRunes 已经
-	// 累到 anthropicShortTurnThinkingRuneFloor(200) 以上、或者思考已开始而正文仍是零，
+	// 累到 anthropicShortTurnThinkingRuneFloor(200) 以上、或者正文仍是零，
 	// 且两者都要求 stop_reason 还没来。
 	//
 	// 第二个入口来自 2026-08-27 23:24:24 实证（usage_logs id=15219，账号 11，stream=t）：
@@ -1187,7 +1187,8 @@ type GatewayConfig struct {
 	// （firstCommitPointAt 5361ms + 10s）被放出去；上游 18.084 秒后 EOF，streamCommitted 已为真，
 	// 只能走 reportStreamTruncatedAfterCommit，failover 出口已关。零正文回合的可判性压根不经过
 	// anthropicVisibleOutputTokens 的折算（anthropicTurnIsEmptyAnswer 刻意传 thinkingRunes=0），
-	// 所以那道闸门对这一档只有副作用。
+	// 所以那道闸门对这一档只有副作用。第二个入口最初还附加了 thinkingRunes > 0，2026-08-28
+	// 06:55:07 那一发证明这个附加条件是个洞，已去掉——详见 longThinkingJudgementPending。
 	//
 	// 代价与上界：放宽期间客户端零字节，提前放行的出口还剩两条——正文越过
 	// anthropicShortTurnProseRuneLimit(1300)、或出现 tool_use 块，任何一条成立立刻放行。
@@ -1195,11 +1196,25 @@ type GatewayConfig struct {
 	// 健康的长思考长回答一旦开始写正文就会在 1300 rune 处放行，真正攥满这个下限的只有
 	// 「想了很久却几乎没说话」——正是要治的形态。
 	//
-	// 60000ms 的取值：覆盖 14:12:03 那一发所需的 46.6s（firstCommitPointAt 到 stop_reason）
-	// 并留 29% 余量，同时远低于 gateway.stream_data_interval_timeout（180s）那一级，也低于
-	// 改静默口径时实测的长回合 p90 首字节 113s。超过这个下限的回合退化成放行 + 给下一发解绑，
-	// 也就是这个放宽存在之前的行为，不会更差——所以这个值只决定覆盖多少尾巴，调错方向不会
-	// 引入新的失败模式。
+	// 360000ms 的取值（2026-08-28 从 60000 抬上来）：60000 覆盖了 14:12:03 所需的 46.6s 与
+	// 23:24:24 所需的 33.4s，但线上 12 发 stream_truncated_after_commit 的实测形状说明这一类的
+	// 尾巴远不止一分钟——11/12 发 output_tokens=0、总时长 130~320 秒，上游挂在那里靠零星帧
+	// 吊着命，几分钟后零产出地 EOF。最坏一发 duration_ms=319412（usage_logs id=14745，账号 13）。
+	// 360000 覆盖它并留约 13% 余量。样本：
+	//   id 14745 dur=319412 / 12028 dur=307339 / 11192 dur=265286 / 14744 dur=246687 /
+	//   15404 dur=240799 / 14762 dur=214423 / 15015 dur=192898
+	//
+	// 为什么可以配到分钟级：三条线里最先到点的是死气预算（从首帧合法 SSE 起算，锚点最早），
+	// 而 gateway.stream_data_interval_timeout（180s）量的是**帧间间隔**，这些吊命流一直有帧，
+	// 它压根不会开火；http.Server 那边刻意没设 WriteTimeout（见 internal/server/http.go 的注释
+	// 「流式响应可能持续十几分钟」）。所以 180s 不是这条线的上界，真正的上界是客户端自己的
+	// 超时，而客户端断开时 clientDisconnected 会被检测到、持流随之终止。
+	//
+	// 取这个值的**代价是显式接受的**（用户 2026-08-28 决定）：不让连续坏掉的账号退出轮换，
+	// 宁可加大攥的时长，不在乎慢回合的首字节延迟。零正文入口不再要求 thinkingRunes > 0 之后，
+	// 「还没写出正文」的回合一律攥到这个下限，慢启动的健康回合也会被攥住——首字节延迟因此
+	// 可能达到分钟级。缓冲是 []string 无上界，但这一类回合产出近乎为零，实际占用很小。
+	// 超过这个下限的回合退化成放行 + 给下一发解绑，也就是这个放宽存在之前的行为，不会更差。
 	AnthropicHoldbackLongThinkingHoldMs int `mapstructure:"anthropic_holdback_long_thinking_hold_ms"`
 
 	// 是否记录上游错误响应体摘要（避免输出请求内容）
@@ -2654,7 +2669,7 @@ func setDefaults() {
 	// 同上，靠 GATEWAY_ANTHROPIC_HOLDBACK_DEAD_AIR_BUDGET_MS 免重新构建地改。
 	viper.SetDefault("gateway.anthropic_holdback_dead_air_budget_ms", 25000)
 	// 同上，靠 GATEWAY_ANTHROPIC_HOLDBACK_LONG_THINKING_HOLD_MS 免重新构建地改。
-	viper.SetDefault("gateway.anthropic_holdback_long_thinking_hold_ms", 60000)
+	viper.SetDefault("gateway.anthropic_holdback_long_thinking_hold_ms", 360000)
 	viper.SetDefault("gateway.scheduling.sticky_session_max_waiting", 3)
 	viper.SetDefault("gateway.scheduling.sticky_session_wait_timeout", 120*time.Second)
 	viper.SetDefault("gateway.scheduling.fallback_wait_timeout", 30*time.Second)
@@ -3567,10 +3582,17 @@ func (c *Config) Validate() error {
 		return fmt.Errorf("gateway.anthropic_holdback_long_thinking_hold_ms must be non-negative")
 	}
 	// 下界 10000：这一条是给长思考回合放宽用的**下限**，配得比默认的单次总时长上限（10s）
-	// 还小就一点作用都没有，那种意图应该显式配 0。上界与死气预算同为 300000。
+	// 还小就一点作用都没有，那种意图应该显式配 0。
+	//
+	// 上界 420000（2026-08-28 从 300000 抬上来）：这一类回合的实测尾巴到 319412ms
+	// （usage_logs id=14745），300000 盖不住，而默认值已经取到 360000。420000 给默认值留约 17%
+	// 的上调余量。它比死气预算自己的上界（300000）大是对的：那条是**基线**预算，这条是长思考
+	// 未决时把三条线一起顶上去的**下限**，两者量的不是同一件事。
+	// 上界不受 gateway.stream_data_interval_timeout（30-300s）约束——那条量帧间间隔，对一直有
+	// 帧的吊命流不会开火，详见 AnthropicHoldbackLongThinkingHoldMs 的注释。
 	if c.Gateway.AnthropicHoldbackLongThinkingHoldMs != 0 &&
-		(c.Gateway.AnthropicHoldbackLongThinkingHoldMs < 10000 || c.Gateway.AnthropicHoldbackLongThinkingHoldMs > 300000) {
-		return fmt.Errorf("gateway.anthropic_holdback_long_thinking_hold_ms must be 0 or between 10000-300000 milliseconds")
+		(c.Gateway.AnthropicHoldbackLongThinkingHoldMs < 10000 || c.Gateway.AnthropicHoldbackLongThinkingHoldMs > 420000) {
+		return fmt.Errorf("gateway.anthropic_holdback_long_thinking_hold_ms must be 0 or between 10000-420000 milliseconds")
 	}
 	if c.Gateway.ImageStreamDataIntervalTimeout < 0 {
 		return fmt.Errorf("gateway.image_stream_data_interval_timeout must be non-negative")

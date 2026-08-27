@@ -894,8 +894,8 @@ type anthropicHoldbackObserver struct {
 //   - thinkingRunes 已越过 anthropicShortTurnThinkingRuneFloor：到了这个量级，
 //     anthropicVisibleOutputTokens 的折算才会把 output_tokens 显著拉低，也就是说带正文的
 //     回合**有可能**被判可疑，攥着才有收益。
-//   - 思考已经开始、正文仍是零（thinkingRunes > 0 && proseRunes == 0）：这一档的可判性压根
-//     不经过折算。anthropicTurnLooksSuspiciouslyShort 的「空回合」分支明确不受
+//   - 正文仍是零（proseRunes == 0）：这一档的可判性压根不经过折算。
+//     anthropicTurnLooksSuspiciouslyShort 的「空回合」分支明确不受
 //     anthropicShortTurnOutputTokenLimit 约束，anthropicTurnIsEmptyAnswer 调它时也刻意传
 //     thinkingRunes=0，所以零正文回合只要 stop_reason 一到就一定判得动，思考攒了多少 rune
 //     都不影响结论。既然可判性是结构性保证的，那道 200 rune 的闸门对这一档只有副作用。
@@ -909,6 +909,19 @@ type anthropicHoldbackObserver struct {
 // after commit, no failover possible」。这一发全程零正文、stop_reason 始终为空，放行的结果
 // 必然是客户端吃到一个没有答案的 200，攥着才有换号的可能。
 //
+// **不再附加 thinkingRunes > 0**（2026-08-28 06:55:07 那一发，usage_logs id=15404，账号 9
+// 100xlabs-anthropic，in=79733 out=0，放行 158286ms、EOF 240799ms）：那个附加条件曾让这一档
+// 漏掉「提交帧本身不贡献 rune」的形态。anthropicSSEPayloadCommitsResponse 对带非空 thinking 的
+// content_block_start 返回 true，而 anthropicThinkingRunes 只数 content_block_delta 的
+// thinking_delta —— 于是首个提交帧落地那一刻 thinkingRunes 仍是 0，两个入口双双不成立，
+// maxHold 按未放宽的原值放行。text 块与 tool_use 块的起始帧同理。
+// 判据只有两件事：stop_reason 未到（还判不了）、正文为零（判得动且必然判成空回合）。
+// thinkingRunes > 0 不增加任何判定力，只制造这个洞，所以去掉。
+//
+// 代价是所有「还没写出正文」的回合都会攥到下限，包括慢启动的健康回合 —— 首字节延迟因此变长。
+// 这是显式接受的取舍（用户 2026-08-28 决定：不让坏账号退出轮换，宁可加大攥的时长、不在乎慢
+// 回合的首字节延迟）。自限性没变：正文一出现这一档立刻蒸发，短答案回合照旧按原值放行。
+//
 // 刻意不看正文长度上限：正文越过 anthropicShortTurnProseRuneLimit 时 verdict 自己那条提前
 // 放行出口会先生效，在这里重复一遍只会让两处口径有分叉的机会。
 func (o *anthropicHoldbackObserver) longThinkingJudgementPending() bool {
@@ -918,7 +931,7 @@ func (o *anthropicHoldbackObserver) longThinkingJudgementPending() bool {
 	if o.thinkingRunes >= anthropicShortTurnThinkingRuneFloor {
 		return true
 	}
-	return o.thinkingRunes > 0 && o.proseRunes == 0
+	return o.proseRunes == 0
 }
 
 // effectiveHoldCap 把一条放行截止线按长思考形态放宽到下限。

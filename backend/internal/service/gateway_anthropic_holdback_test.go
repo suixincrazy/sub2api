@@ -2170,3 +2170,77 @@ func TestAnthropicPassthrough_HoldbackZeroProseThinkingExposedWhenExtensionDisab
 	require.Contains(t, rec.Body.String(), "我得先想清楚这里的因果链条。",
 		"这就是要治的暴露：150ms 上限到点把思考段写给了客户端")
 }
+
+// 2026-08-28 06:55:07 那一发暴露的洞（usage_logs id=15404，账号 9 100xlabs-anthropic，
+// in=79733 out=0 first_token_ms=158286 duration_ms=240799）。
+//
+// 洞在「零正文」那个入口原本附加的 thinkingRunes > 0 上：能提交响应的帧本身**不一定贡献
+// rune**。anthropicSSEPayloadCommitsResponse 对带非空 thinking 的 content_block_start 返回
+// true，而 anthropicThinkingRunes 只数 content_block_delta 的 thinking_delta，于是首个提交帧
+// 落地那一刻 thinkingRunes 还是 0、proseRunes 也是 0，两个入口双双不成立，三条线全按未放宽的
+// 原值走，maxHold 在 firstCommitPointAt+10s 就把缓冲放了出去。text 块、tool_use 块的起始帧
+// 同理，redacted_thinking 带 data 时也一样。
+//
+// 判据只有两件事：stop_reason 未到、正文为零。这一条钉的就是「提交了但一个 rune 都没有」
+// 这个中间态必须已经在放宽状态里。
+func TestAnthropicHoldbackObserverZeroRuneCommitFrameStillRelaxes(t *testing.T) {
+	const window = 15 * time.Second
+	const maxHold = 10 * time.Second
+	const deadAir = 25 * time.Second
+	const floor = 360 * time.Second
+
+	base := time.Date(2026, 8, 27, 22, 55, 7, 0, time.UTC)
+
+	// 三种「提交但零 rune」的起始帧，逐个确认放宽都成立。
+	for _, tc := range []struct {
+		name  string
+		frame string
+	}{
+		{"thinking块起始帧带非空thinking", `{"type":"content_block_start","index":0,"content_block":{"type":"thinking","thinking":"嗯"}}`},
+		{"redacted_thinking块起始帧带data", `{"type":"content_block_start","index":0,"content_block":{"type":"redacted_thinking","data":"AAAA"}}`},
+		{"text块起始帧", `{"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			o := &anthropicHoldbackObserver{longThinkingHoldFloor: floor}
+			o.observe(gjson.Parse(`{"type":"message_start","message":{"usage":{"input_tokens":79733,"output_tokens":1}}}`), false, base)
+
+			parsed := gjson.Parse(tc.frame)
+			require.True(t, anthropicSSEPayloadCommitsResponse([]byte(tc.frame)),
+				"构造前提：这一帧在旧行为下会提交响应")
+			o.observe(parsed, true, base)
+
+			require.False(t, o.firstCommitPointAt.IsZero(), "构造前提：提交点已经就位")
+			require.Zero(t, o.thinkingRunes, "构造前提：提交帧本身不贡献 thinking rune")
+			require.Zero(t, o.proseRunes, "构造前提：正文仍是零")
+			require.True(t, o.longThinkingJudgementPending(),
+				"提交了但零 rune 时放宽必须成立——这正是 06:55:07 漏掉的中间态")
+
+			// 三条线都被推到下限，原值到点时一条都不该放行。
+			require.False(t, o.maxHoldElapsed(base.Add(maxHold), maxHold))
+			require.False(t, o.windowElapsed(base.Add(window), window))
+			require.False(t, o.deadAirElapsed(base.Add(deadAir), deadAir))
+			require.Equal(t, base.Add(floor), o.holdbackMaxHoldDeadline(maxHold))
+			require.Equal(t, base.Add(floor), o.holdbackSilenceDeadline(window))
+
+			// 到了下限才放行。
+			require.True(t, o.maxHoldElapsed(base.Add(floor), maxHold))
+		})
+	}
+
+	// 自限性没变：stop_reason 一落地，放宽当帧蒸发。
+	done := &anthropicHoldbackObserver{longThinkingHoldFloor: floor}
+	done.observe(gjson.Parse(`{"type":"content_block_start","index":0,"content_block":{"type":"thinking","thinking":"嗯"}}`), true, base)
+	require.True(t, done.longThinkingJudgementPending(), "构造前提：先处在放宽状态")
+	done.observe(gjson.Parse(`{"type":"message_delta","delta":{"stop_reason":"end_turn"}}`), false, base.Add(time.Second))
+	require.False(t, done.longThinkingJudgementPending(), "stop_reason 到了就不该再放宽")
+	require.True(t, done.maxHoldElapsed(base.Add(maxHold), maxHold), "蒸发后原值立刻生效")
+
+	// 正文一出现也蒸发：短答案回合不该被这个下限拖住。
+	prose := &anthropicHoldbackObserver{longThinkingHoldFloor: floor}
+	prose.observe(gjson.Parse(`{"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}`), true, base)
+	require.True(t, prose.longThinkingJudgementPending(), "构造前提：先处在放宽状态")
+	prose.observe(gjson.Parse(`{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"好的，按这个来。"}}`), true, base.Add(time.Second))
+	require.Positive(t, prose.proseRunes)
+	require.False(t, prose.longThinkingJudgementPending(), "正文一出现零正文入口就不成立")
+	require.True(t, prose.maxHoldElapsed(base.Add(maxHold), maxHold), "短答案回合照旧按原值放行")
+}
