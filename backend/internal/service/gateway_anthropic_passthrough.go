@@ -291,7 +291,7 @@ func (s *GatewayService) forwardAnthropicAPIKeyPassthroughWithInput(
 		firstTokenMs = streamResult.firstTokenMs
 		clientDisconnect = streamResult.clientDisconnect
 	} else {
-		usage, err = s.handleNonStreamingResponseAnthropicAPIKeyPassthrough(ctx, resp, c, account)
+		usage, err = s.handleNonStreamingResponseAnthropicAPIKeyPassthrough(ctx, resp, c, account, input.RequestModel)
 		if err != nil {
 			return nil, err
 		}
@@ -880,6 +880,46 @@ type anthropicHoldbackObserver struct {
 	// holdbackElapsedBefore 是本次客户端请求在此前 failover 尝试中实际扣住可提交帧的累计时长。
 	// 上游首帧到达前的 TTFB 不属于持流开销，不能消耗这条预算。
 	holdbackElapsedBefore time.Duration
+	// longThinkingHoldFloor 是长思考回合下两条总时长类截止线的下限，0 表示不放宽。
+	// 由 GatewayConfig.AnthropicHoldbackLongThinkingHoldMs 注入，见 effectiveHoldCap。
+	longThinkingHoldFloor time.Duration
+}
+
+// longThinkingJudgementPending 判断这一回合是否处于「还在长思考、判据尚未成形」的状态。
+//
+// 两个条件缺一不可：
+//   - thinkingRunes 已越过 anthropicShortTurnThinkingRuneFloor：只有到了这个量级，
+//     anthropicVisibleOutputTokens 的折算才会把 output_tokens 显著拉低，也就是说这一回合
+//     **有可能**被判可疑，攥着才有收益。低于这个量级的长回合仍旧结构性不可判，那是
+//     AnthropicHoldbackMaxHoldMs 那条上限存在的理由，不能一起放宽。
+//   - stop_reason 还没来：判据一到齐，anthropicHoldbackVerdict 当帧就出结论，再放宽没有意义。
+//     反过来说这个状态是自限的，不会把已经能判定的回合继续攥着。
+//
+// 刻意不看正文长度：正文越过 anthropicShortTurnProseRuneLimit 时 verdict 自己那条提前放行
+// 出口会先生效，在这里重复一遍只会让两处口径有分叉的机会。
+func (o *anthropicHoldbackObserver) longThinkingJudgementPending() bool {
+	if o.thinkingRunes < anthropicShortTurnThinkingRuneFloor {
+		return false
+	}
+	return strings.TrimSpace(o.stopReason) == ""
+}
+
+// effectiveHoldCap 把一条**总时长**类截止线按长思考形态放宽到下限。
+//
+// 只有这一个函数持有放宽口径，maxHoldElapsed / holdbackMaxHoldDeadline / deadAirElapsed /
+// holdbackDeadAirDeadline 四个读者全部经过它，所以定时器（走 holdbackReleaseDeadline）与
+// 判定（走 releaseDeadlineElapsed）不可能各算一套。
+//
+// base<=0 表示这条线本来就关着，放宽不能把它重新打开——否则「显式关掉某条截止线」的意图会
+// 被这个下限悄悄推翻。
+func (o *anthropicHoldbackObserver) effectiveHoldCap(base time.Duration) time.Duration {
+	if base <= 0 || o.longThinkingHoldFloor <= base {
+		return base
+	}
+	if !o.longThinkingJudgementPending() {
+		return base
+	}
+	return o.longThinkingHoldFloor
 }
 
 // observe 吃下一帧已解析的 SSE data。commits 是这一帧在旧行为下会不会提交响应，
@@ -995,7 +1035,12 @@ func (o *anthropicHoldbackObserver) holdbackSilenceDeadline(window time.Duration
 // 83423，客户端全程零字节。分 band 量下来死气全压在 output_tokens>430 这一批上（p90 首字节
 // 42s→113s），而这一批在判据上结构性不可能被判可疑，攥着纯亏。完整标定见
 // GatewayConfig.AnthropicHoldbackMaxHoldMs。
+// 长思考回合是这条上限唯一的例外，见 effectiveHoldCap 与
+// GatewayConfig.AnthropicHoldbackLongThinkingHoldMs：那一类会被
+// anthropicVisibleOutputTokens 折算回闸门之内，也就是说它**能**被判可疑，10 秒到点放行等于
+// 在判据成形之前关掉窗口（2026-08-27 14:12:03 实证）。
 func (o *anthropicHoldbackObserver) maxHoldElapsed(now time.Time, maxHold time.Duration) bool {
+	maxHold = o.effectiveHoldCap(maxHold)
 	if maxHold <= 0 {
 		return false
 	}
@@ -1007,6 +1052,7 @@ func (o *anthropicHoldbackObserver) maxHoldElapsed(now time.Time, maxHold time.D
 
 // holdbackMaxHoldDeadline 给出持流总时长到顶的时刻。返回零值表示还没起算或没配上限。
 func (o *anthropicHoldbackObserver) holdbackMaxHoldDeadline(maxHold time.Duration) time.Time {
+	maxHold = o.effectiveHoldCap(maxHold)
 	if maxHold <= 0 {
 		return time.Time{}
 	}
@@ -1033,7 +1079,11 @@ func (o *anthropicHoldbackObserver) holdbackElapsed(now time.Time) time.Duration
 }
 
 // deadAirElapsed 判断实际持流时间是否已经吃满预算。
+//
+// 与 maxHoldElapsed 同样受长思考放宽影响：两条线同为「总时长」口径，只放宽一条等于没放宽
+// ——14:12:03 那一发若只抬 maxHold，25 秒的死气预算照样会先到点放行。
 func (o *anthropicHoldbackObserver) deadAirElapsed(now time.Time, budget time.Duration) bool {
+	budget = o.effectiveHoldCap(budget)
 	if budget <= 0 || o.holdbackStartedAt.IsZero() {
 		return false
 	}
@@ -1042,6 +1092,7 @@ func (o *anthropicHoldbackObserver) deadAirElapsed(now time.Time, budget time.Du
 
 // holdbackDeadAirDeadline 给出实际持流预算耗尽的时刻。返回零值表示还没有 SSE 帧或没配预算。
 func (o *anthropicHoldbackObserver) holdbackDeadAirDeadline(budget time.Duration) time.Time {
+	budget = o.effectiveHoldCap(budget)
 	if budget <= 0 || o.holdbackStartedAt.IsZero() {
 		return time.Time{}
 	}
@@ -2108,8 +2159,15 @@ func (s *GatewayService) handleStreamingResponseAnthropicAPIKeyPassthrough(
 	if holdbackActive && s.cfg != nil && s.cfg.Gateway.AnthropicHoldbackDeadAirBudgetMs > 0 {
 		holdbackDeadAir = time.Duration(s.cfg.Gateway.AnthropicHoldbackDeadAirBudgetMs) * time.Millisecond
 	}
+	// 长思考回合的持流下限，只放宽上面两条总时长类截止线、不动静默窗口。窗口配 0（整个机制
+	// 关掉）时同样不参与。见 effectiveHoldCap 与 GatewayConfig.AnthropicHoldbackLongThinkingHoldMs。
+	holdbackLongThinkingFloor := time.Duration(0)
+	if holdbackActive && s.cfg != nil && s.cfg.Gateway.AnthropicHoldbackLongThinkingHoldMs > 0 {
+		holdbackLongThinkingFloor = time.Duration(s.cfg.Gateway.AnthropicHoldbackLongThinkingHoldMs) * time.Millisecond
+	}
 	holdback := &anthropicHoldbackObserver{
 		holdbackElapsedBefore: anthropicHoldbackElapsedBefore(c),
+		longThinkingHoldFloor: holdbackLongThinkingFloor,
 	}
 	// 独立定时器，不复用 keepalive：窗口是毫秒级而 keepalive 默认 10 秒，靠它兜底会让
 	// 「上游吐了两句就长时间静默」的流白等十秒。
@@ -2678,6 +2736,124 @@ func normalizeAnthropicCompatiblePromptUsage(usageNode gjson.Result, usage *Clau
 	return true
 }
 
+// anthropicNonStreamTurnShape 是从一条**非流式** Anthropic 响应体里提出来的判定量，
+// 与流式路径逐帧累加出来的那几个量一一对应。
+type anthropicNonStreamTurnShape struct {
+	stopReason      string
+	proseRunes      int
+	thinkingRunes   int
+	outputTokens    int
+	sawToolUseBlock bool
+	blockOrder      anthropicContentBlockOrderTracker
+}
+
+// anthropicNonStreamTurnShapeFromBody 从非流式响应体里提取短回合判据。
+//
+// 为什么必须单独有这一份：整套判定原先只挂在 SSE 路径上，非流式请求走
+// handleNonStreamingResponseAnthropicAPIKeyPassthrough，一行判定都不过。2026-08-27
+// 13:46:46 那一发实证（usage_logs id=14515，账号 9，stream=f、output_tokens=102、
+// stop_reason=end_turn、无 tool_use、正文 79 rune）：判据在流式口径下必然判可疑，但因为
+// 走的是非流式分支，既没有 holdback_failover 也没有 sticky_short_turn_unbound，两个归因
+// 日志一条都不产出，粘性照旧把下一发送回同一个号。24 小时窗口里非流式回合 189 发、
+// output_tokens<=430 的占 99.5%，全部零覆盖。
+//
+// 口径必须与流式侧逐位对齐，否则同一条回合在两条链路上会得出不同结论：
+//   - proseRunes 只数 type=="text" 块的 text，按 rune（见 anthropicVisibleProseRunes）；
+//   - thinkingRunes 只数 thinking 块，redacted_thinking 的载荷在 data 字段；
+//   - blockOrder 按 content 数组的下标顺序喂，等价于流式的 content_block_start 到达顺序。
+//
+// 非流式天然比流式好办：判据在 c.Data() 之前就全在手里，不需要持流、不需要截止线，
+// 也不存在「攥太久客户端全黑」的取舍——丢弃就是纯零暴露。
+func anthropicNonStreamTurnShapeFromBody(body []byte) anthropicNonStreamTurnShape {
+	shape := anthropicNonStreamTurnShape{}
+	if len(body) == 0 {
+		return shape
+	}
+	parsed := gjson.ParseBytes(body)
+	shape.stopReason = strings.TrimSpace(parsed.Get("stop_reason").String())
+	shape.outputTokens = int(parsed.Get("usage.output_tokens").Int())
+	parsed.Get("content").ForEach(func(_, block gjson.Result) bool {
+		blockType := strings.ToLower(strings.TrimSpace(block.Get("type").String()))
+		shape.blockOrder.note(blockType)
+		switch blockType {
+		case "text":
+			shape.proseRunes += utf8.RuneCountInString(block.Get("text").String())
+		case "thinking":
+			shape.thinkingRunes += utf8.RuneCountInString(block.Get("thinking").String())
+		case "redacted_thinking":
+			shape.thinkingRunes += utf8.RuneCountInString(block.Get("data").String())
+		case "tool_use", "server_tool_use":
+			shape.sawToolUseBlock = true
+		}
+		return true
+	})
+	return shape
+}
+
+// discardNonStreamTurnIfSuspicious 在把非流式响应体写给客户端之前做一次形态判定，
+// 判可疑就返回 failover 错误，让这一发在客户端看到任何字节之前换号重试。
+//
+// 与流式侧的关系：判据完全复用 anthropicHoldbackVerdict，不另写一套阈值。三条截止线在这里
+// 全部不适用——非流式响应体到手时 stop_reason 就在里面，不存在「等不等得起」的取舍，所以
+// releaseDeadlineElapsed 固定传 true（即便判据不足也不该继续攥着，直接放行）、
+// deadAirExhausted 固定传 false（那是「stop_reason 一直不来」的等待上限，此处无意义；
+// 传 true 会让缺 stop_reason 的畸形体被无条件放行）。
+//
+// 门条件与流式侧同一个开关：AnthropicHoldbackWindowMs<=0 时整套机制关闭，这里也一行不判。
+// 复用同一个开关而不新增配置项，是为了「关掉持流」在两条链路上含义一致。
+//
+// 判据不足以定罪的回合（tool_use 中间回合、长正文）由 verdict 自己放行，这里不重复判断。
+func (s *GatewayService) discardNonStreamTurnIfSuspicious(
+	ctx context.Context,
+	c *gin.Context,
+	resp *http.Response,
+	account *Account,
+	model string,
+	body []byte,
+) error {
+	if s.cfg == nil || s.cfg.Gateway.AnthropicHoldbackWindowMs <= 0 {
+		return nil
+	}
+	// 客户端自己走了就别判：此时残缺与上游无关，换号只会白烧一次调用。
+	if c == nil || c.Request == nil || c.Request.Context().Err() != nil {
+		return nil
+	}
+	shape := anthropicNonStreamTurnShapeFromBody(body)
+	verdict := anthropicHoldbackVerdict(
+		true, false,
+		shape.stopReason, shape.proseRunes, shape.outputTokens,
+		shape.sawToolUseBlock,
+		anthropicHoldbackDiscardsUsed(c), anthropicBlockOrderDiscardsUsed(c),
+		shape.thinkingRunes, shape.blockOrder.violation(),
+	)
+	if verdict != anthropicHoldbackDiscard {
+		return nil
+	}
+	// 块序违规单独一条出口，理由与流式侧一致：判据是确定性的，解绑不走连击阈值，
+	// 归因也不能混进短回合那两档。
+	if shape.blockOrder.violation() && anthropicBlockOrderDiscardsUsed(c) < anthropicBlockOrderDiscardBudget {
+		s.unbindStickySessionNow(ctx, account, model, "content block order violation")
+		s.reportAnthropicBlockOrderViolation(ctx, c, resp, account, model,
+			shape.proseRunes, shape.outputTokens, shape.stopReason, "discarded")
+		return s.newAnthropicBlockOrderFailoverError(
+			c, resp, account, model,
+			shape.proseRunes, shape.outputTokens, shape.stopReason)
+	}
+	// 丢弃只治这一发；粘性绑定还指着这个坏号，所以照样要主动解绑 + 冷却。
+	unbound := s.noteAnthropicShortTurnStreak(ctx, account, model, shape.proseRunes, shape.outputTokens)
+	switch {
+	case anthropicTurnIsEmptyAnswer(shape.stopReason, shape.proseRunes, shape.outputTokens, shape.sawToolUseBlock):
+		s.reportAnthropicEmptyAnswerTurn(ctx, c, resp, account, model,
+			shape.outputTokens, shape.stopReason, "discarded")
+	case unbound:
+		s.reportAnthropicShortTurnUnbind(ctx, c, resp, account, model,
+			shape.proseRunes, shape.outputTokens, shape.stopReason, "discarded")
+	}
+	return s.newAnthropicShortTurnFailoverError(
+		c, resp, account, model,
+		shape.proseRunes, shape.outputTokens, shape.stopReason)
+}
+
 func parseClaudeUsageFromResponseBody(body []byte) *ClaudeUsage {
 	usage := &ClaudeUsage{}
 	if len(body) == 0 {
@@ -2767,6 +2943,7 @@ func (s *GatewayService) handleNonStreamingResponseAnthropicAPIKeyPassthrough(
 	resp *http.Response,
 	c *gin.Context,
 	account *Account,
+	model string,
 ) (*ClaudeUsage, error) {
 	if s.rateLimitService != nil {
 		s.rateLimitService.UpdateSessionWindow(ctx, account, resp.Header)
@@ -2789,6 +2966,9 @@ func (s *GatewayService) handleNonStreamingResponseAnthropicAPIKeyPassthrough(
 		}
 		if isAnthropicSafetyRefusalResponse(resp.StatusCode, body) {
 			return nil, s.newAnthropicSafetyFailoverError(c, resp, account, body)
+		}
+		if err := s.discardNonStreamTurnIfSuspicious(ctx, c, resp, account, model, body); err != nil {
+			return nil, err
 		}
 	}
 

@@ -2208,7 +2208,7 @@ func TestGatewayService_AnthropicAPIKeyPassthrough_NonStreamingNormalizesJSONCon
 	}
 	svc := &GatewayService{cfg: &config.Config{}, rateLimitService: &RateLimitService{}}
 
-	usage, err := svc.handleNonStreamingResponseAnthropicAPIKeyPassthrough(context.Background(), resp, c, &Account{ID: 1})
+	usage, err := svc.handleNonStreamingResponseAnthropicAPIKeyPassthrough(context.Background(), resp, c, &Account{ID: 1}, "")
 	require.NoError(t, err)
 	require.NotNil(t, usage)
 
@@ -2232,7 +2232,7 @@ func TestGatewayService_AnthropicAPIKeyPassthrough_NonStreamingKeepsUpstreamJSON
 	}
 	svc := &GatewayService{cfg: &config.Config{}, rateLimitService: &RateLimitService{}}
 
-	_, err := svc.handleNonStreamingResponseAnthropicAPIKeyPassthrough(context.Background(), resp, c, &Account{ID: 1})
+	_, err := svc.handleNonStreamingResponseAnthropicAPIKeyPassthrough(context.Background(), resp, c, &Account{ID: 1}, "")
 	require.NoError(t, err)
 	require.Equal(t, "application/json; charset=utf-8", rec.Header().Get("Content-Type"))
 }

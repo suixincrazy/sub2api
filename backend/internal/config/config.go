@@ -1149,6 +1149,40 @@ type GatewayConfig struct {
 	// anthropicHoldbackVerdict 的 deadAirExhausted）。
 	AnthropicHoldbackDeadAirBudgetMs int `mapstructure:"anthropic_holdback_dead_air_budget_ms"`
 
+	// AnthropicHoldbackLongThinkingHoldMs: 长思考回合的持流下限（毫秒），0 表示不放宽。
+	//
+	// 放宽的对象只有两条**总时长**类截止线（AnthropicHoldbackMaxHoldMs 与
+	// AnthropicHoldbackDeadAirBudgetMs）：长思考回合里它们量的那段时间正是模型在思考，
+	// 到点放行等于在判据成形之前就把窗口关掉。静默窗口（AnthropicHoldbackWindowMs）刻意
+	// 不放宽——它量的是上游**不说话**，那才是真的等不起。
+	//
+	// 2026-08-27 14:12:03 实证（usage_logs id=14596，账号 9，stream=t）：
+	// out=851、prose=481 rune、first_token_ms=18174、duration_ms=54785。持流上线后
+	// first_token_ms 等于放行时刻，所以 firstCommitPointAt ≈ 8174ms、10s 上限在 18174ms
+	// 到点放行，而 stop_reason 直到 54785ms 才来——判定迟到 36.6 秒，日志里那条
+	// anthropic_short_turn_streak_unbind 的 disposition 只能是 delivered，解绑只赶得上
+	// 给下一发用，这一发的截断照样交到客户端手里。
+	//
+	// 为什么这一类必须放宽，而 AnthropicHoldbackMaxHoldMs 那条注释里的长回合不必：那条上限
+	// 的立论是「output_tokens>430 的回合结构性不可能被判可疑，攥着纯亏」。长思考回合恰恰是
+	// 这个立论的例外——anthropicVisibleOutputTokens 会把 output_tokens 按
+	// prose/(prose+thinking) 折算，14:12:03 那一发 851 折算成 851×481/(481+thinking)，
+	// thinking≥509 rune 时就落回 430 闸门之内，所以它**能**被判可疑，攥着有收益。
+	// 判别信号在持流期就拿得到：thinkingRunes 已经累到
+	// anthropicShortTurnThinkingRuneFloor(200) 以上、而 stop_reason 还没来。
+	//
+	// 代价与上界：放宽期间客户端零字节，但三条提前放行的出口全都还在——正文越过
+	// anthropicShortTurnProseRuneLimit(1300)、出现 tool_use 块、或上游静默满一个窗口，
+	// 任何一条成立立刻放行。也就是说健康的长思考长回答一旦开始写正文就会在 1300 rune 处放行，
+	// 真正攥满这个下限的只有「想了很久却几乎没说话」——正是要治的形态。
+	//
+	// 60000ms 的取值：覆盖 14:12:03 那一发所需的 46.6s（firstCommitPointAt 到 stop_reason）
+	// 并留 29% 余量，同时远低于 gateway.stream_data_interval_timeout（180s）那一级，也低于
+	// 改静默口径时实测的长回合 p90 首字节 113s。超过这个下限的回合退化成放行 + 给下一发解绑，
+	// 也就是这个放宽存在之前的行为，不会更差——所以这个值只决定覆盖多少尾巴，调错方向不会
+	// 引入新的失败模式。
+	AnthropicHoldbackLongThinkingHoldMs int `mapstructure:"anthropic_holdback_long_thinking_hold_ms"`
+
 	// 是否记录上游错误响应体摘要（避免输出请求内容）
 	LogUpstreamErrorBody bool `mapstructure:"log_upstream_error_body"`
 	// 上游错误响应体记录最大字节数（超过会截断）
@@ -2600,6 +2634,8 @@ func setDefaults() {
 	viper.SetDefault("gateway.anthropic_holdback_max_hold_ms", 10000)
 	// 同上，靠 GATEWAY_ANTHROPIC_HOLDBACK_DEAD_AIR_BUDGET_MS 免重新构建地改。
 	viper.SetDefault("gateway.anthropic_holdback_dead_air_budget_ms", 25000)
+	// 同上，靠 GATEWAY_ANTHROPIC_HOLDBACK_LONG_THINKING_HOLD_MS 免重新构建地改。
+	viper.SetDefault("gateway.anthropic_holdback_long_thinking_hold_ms", 60000)
 	viper.SetDefault("gateway.scheduling.sticky_session_max_waiting", 3)
 	viper.SetDefault("gateway.scheduling.sticky_session_wait_timeout", 120*time.Second)
 	viper.SetDefault("gateway.scheduling.fallback_wait_timeout", 30*time.Second)
@@ -3507,6 +3543,15 @@ func (c *Config) Validate() error {
 	if c.Gateway.AnthropicHoldbackDeadAirBudgetMs != 0 &&
 		(c.Gateway.AnthropicHoldbackDeadAirBudgetMs < 5000 || c.Gateway.AnthropicHoldbackDeadAirBudgetMs > 300000) {
 		return fmt.Errorf("gateway.anthropic_holdback_dead_air_budget_ms must be 0 or between 5000-300000 milliseconds")
+	}
+	if c.Gateway.AnthropicHoldbackLongThinkingHoldMs < 0 {
+		return fmt.Errorf("gateway.anthropic_holdback_long_thinking_hold_ms must be non-negative")
+	}
+	// 下界 10000：这一条是给长思考回合放宽用的**下限**，配得比默认的单次总时长上限（10s）
+	// 还小就一点作用都没有，那种意图应该显式配 0。上界与死气预算同为 300000。
+	if c.Gateway.AnthropicHoldbackLongThinkingHoldMs != 0 &&
+		(c.Gateway.AnthropicHoldbackLongThinkingHoldMs < 10000 || c.Gateway.AnthropicHoldbackLongThinkingHoldMs > 300000) {
+		return fmt.Errorf("gateway.anthropic_holdback_long_thinking_hold_ms must be 0 or between 10000-300000 milliseconds")
 	}
 	if c.Gateway.ImageStreamDataIntervalTimeout < 0 {
 		return fmt.Errorf("gateway.image_stream_data_interval_timeout must be non-negative")

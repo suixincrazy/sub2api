@@ -1336,3 +1336,609 @@ func TestAnthropicPassthrough_HoldbackDiscardsZeroUsageWithProseWithoutExposure(
 	// 这一档由正文长度归入短回合；达到解绑阈值后仍需冷却当前账号。
 	require.Equal(t, 1, repo.tempCalls, "达到解绑阈值后必须冷却账号")
 }
+
+// ---------------------------------------------------------------------------
+// 非流式链路
+//
+// 2026-08-27 13:46:46 的精确回归。整套判定原先只挂在 SSE 路径上，`stream: false` 的请求走
+// handleNonStreamingResponseAnthropicAPIKeyPassthrough，一行判定都不过：那一发
+// （usage_logs id=14515，账号 9，output_tokens=102、stop_reason=end_turn、无 tool_use、
+// 正文 79 rune）在流式口径下必然判可疑，却既没有 holdback_failover 也没有
+// sticky_short_turn_unbound，粘性照旧把下一发送回同一个号。24 小时窗口里非流式回合 189 发、
+// output_tokens<=430 的占 99.5%，全部零覆盖。
+//
+// 非流式没有持流、没有截止线——响应体到手时判据就全在里面，丢弃是纯零暴露。所以这一组用例
+// 的断言重点与流式侧一致：`errors.As(err, &failoverErr)` **并且** rec.Body 一个字节都没有。
+// ---------------------------------------------------------------------------
+
+// nonStreamMessageBody 拼一条协议完全合法的非流式 Anthropic 响应：给定的 content 块 +
+// stop_reason + usage。contentBlocks 传原始 JSON 片段，方便逐个用例摆出不同块序。
+func nonStreamMessageBody(stopReason string, outputTokens int, contentBlocks ...string) []byte {
+	return []byte(fmt.Sprintf(
+		`{"id":"msg_nonstream","type":"message","role":"assistant","model":"claude-opus-5",`+
+			`"content":[%s],"stop_reason":%q,"stop_sequence":null,`+
+			`"usage":{"input_tokens":32944,"cache_read_input_tokens":83103,"output_tokens":%d}}`,
+		strings.Join(contentBlocks, ","), stopReason, outputTokens))
+}
+
+func nonStreamTextBlock(text string) string {
+	return fmt.Sprintf(`{"type":"text","text":%q}`, text)
+}
+
+func nonStreamResponse(body []byte) *http.Response {
+	return &http.Response{
+		StatusCode: http.StatusOK,
+		Header: http.Header{
+			"Content-Type": []string{"application/json"},
+			"x-request-id": []string{"rid-nonstream"},
+		},
+		Body: io.NopCloser(strings.NewReader(string(body))),
+	}
+}
+
+// runNonStreamPassthrough 与 runHoldbackPassthrough 一一对应，只是走非流式那条函数。
+func runNonStreamPassthrough(
+	t *testing.T, svc *GatewayService, groupID int64, sessionKey string,
+	accountID int64, body []byte, prepare func(*gin.Context),
+) (*httptest.ResponseRecorder, *gin.Context, error) {
+	t.Helper()
+	c, rec := newRefusalTestContext(t)
+	if prepare != nil {
+		prepare(c)
+	}
+	ctx := WithStickySessionScope(context.Background(), groupID, sessionKey, false)
+	_, err := svc.handleNonStreamingResponseAnthropicAPIKeyPassthrough(
+		ctx, nonStreamResponse(body), c,
+		&Account{ID: accountID, Name: "primary", Platform: PlatformAnthropic},
+		"claude-opus-5")
+	return rec, c, err
+}
+
+// 13:46:46 那一发的原形：out=102、end_turn、79 rune 正文。必须在写出任何字节之前换号。
+func TestAnthropicPassthrough_NonStreamDiscardsShortTurnWithoutExposure(t *testing.T) {
+	const sessionKey = "nonstream-short-turn"
+	const groupID = int64(1)
+	cache := newShortTurnStreakCache(sessionKey, 9)
+	svc, repo := newHoldbackTestGatewayService(t, cache, 3000)
+
+	rec, c, err := runNonStreamPassthrough(t, svc, groupID, sessionKey, 9,
+		nonStreamMessageBody("end_turn", 102, nonStreamTextBlock(
+			"我看一下这个文件。临时文件都已清理删除，现在只剩部署目录。接下来我去读一下日志，确认那几条归因事件有没有落盘。")),
+		nil)
+
+	var failoverErr *UpstreamFailoverError
+	require.True(t, errors.As(err, &failoverErr),
+		"非流式短回合必须也能换号，否则 99.5% 的非流式回合零覆盖")
+	require.Equal(t, GatewayFailureReason("anthropic_short_turn_holdback"), failoverErr.Reason)
+	require.Equal(t, http.StatusBadGateway, failoverErr.StatusCode)
+	require.True(t, failoverErr.ShouldRetryNextAccount())
+	require.False(t, failoverErr.RetryableOnSameAccount)
+	require.Equal(t, GatewayFailureScopeRequest, failoverErr.Scope)
+	require.True(t, failoverErr.RequestScopedTransient)
+
+	// 零暴露：非流式在 c.Data() 之前就拿到了全部判据，这两行必须成立。
+	require.Empty(t, rec.Body.String(), "截断内容一个字节都不能写给客户端")
+	require.False(t, c.Writer.Written())
+
+	require.Equal(t, 1, anthropicHoldbackDiscardsUsed(c))
+	require.Equal(t, 1, cache.deletedSessions[sessionKey], "丢弃必须同时解绑，否则下一发还是这个号")
+	require.NotContains(t, cache.sessionBindings, sessionKey)
+	require.Equal(t, 1, repo.tempCalls, "达到解绑阈值后必须冷却账号")
+}
+
+// 长正文由 verdict 自己放行：判据只有下界闸门，越过上限就不该再攥。
+func TestAnthropicPassthrough_NonStreamDeliversLongTurn(t *testing.T) {
+	const sessionKey = "nonstream-long-turn"
+	cache := newShortTurnStreakCache(sessionKey, 9)
+	svc, repo := newHoldbackTestGatewayService(t, cache, 3000)
+
+	body := nonStreamMessageBody("end_turn", 1200, nonStreamTextBlock(
+		strings.Repeat("长", anthropicShortTurnProseRuneLimit+1)))
+	rec, c, err := runNonStreamPassthrough(t, svc, 1, sessionKey, 9, body, nil)
+
+	require.NoError(t, err)
+	require.JSONEq(t, string(body), rec.Body.String(), "正常回合必须逐字节原样交付")
+	require.Equal(t, 0, anthropicHoldbackDiscardsUsed(c))
+	require.Equal(t, 0, repo.tempCalls)
+	require.Equal(t, int64(9), cache.sessionBindings[sessionKey], "正常回合不得动粘性绑定")
+}
+
+// tool_use 中间回合天生短，绝不能判可疑——否则每一次工具调用都要白烧一次换号。
+func TestAnthropicPassthrough_NonStreamDeliversToolUseTurn(t *testing.T) {
+	const sessionKey = "nonstream-tool-use"
+	cache := newShortTurnStreakCache(sessionKey, 9)
+	svc, repo := newHoldbackTestGatewayService(t, cache, 3000)
+
+	body := nonStreamMessageBody("tool_use", 61,
+		nonStreamTextBlock("我读一下这个文件。"),
+		`{"type":"tool_use","id":"toolu_1","name":"Read","input":{"file_path":"/tmp/a"}}`)
+	rec, c, err := runNonStreamPassthrough(t, svc, 1, sessionKey, 9, body, nil)
+
+	require.NoError(t, err)
+	require.JSONEq(t, string(body), rec.Body.String())
+	require.Equal(t, 0, anthropicHoldbackDiscardsUsed(c))
+	require.Equal(t, 0, repo.tempCalls)
+	require.Equal(t, int64(9), cache.sessionBindings[sessionKey])
+}
+
+// 丢弃额度必须一票否决：用户的问题本来就只有一句话答案时，不设上限会一路换号到调度耗尽，
+// 把一个完好的短回答变成 502。
+func TestAnthropicPassthrough_NonStreamShortTurnBudgetCapsRetries(t *testing.T) {
+	const sessionKey = "nonstream-budget"
+	cache := newShortTurnStreakCache(sessionKey, 9)
+	svc, _ := newHoldbackTestGatewayService(t, cache, 3000)
+
+	body := nonStreamMessageBody("end_turn", 70, nonStreamTextBlock("好的，已经改完了。"))
+	rec, c, err := runNonStreamPassthrough(t, svc, 1, sessionKey, 9, body, func(c *gin.Context) {
+		c.Set(anthropicHoldbackDiscardsKey, anthropicEmptyAnswerDiscardBudget)
+	})
+
+	require.NoError(t, err, "额度耗尽后必须退化成放行，而不是把真短答案重试成 502")
+	require.JSONEq(t, string(body), rec.Body.String())
+	require.Equal(t, anthropicEmptyAnswerDiscardBudget, anthropicHoldbackDiscardsUsed(c),
+		"放行不得再吃额度")
+}
+
+// 块序违规在非流式侧同样是确定性判据，走独立额度、独立归因。
+func TestAnthropicPassthrough_NonStreamDiscardsBlockOrderViolation(t *testing.T) {
+	const sessionKey = "nonstream-block-order"
+	cache := newShortTurnStreakCache(sessionKey, 9)
+	svc, repo := newHoldbackTestGatewayService(t, cache, 3000)
+
+	// text 之后又冒出 thinking：扩展思考协议里不存在这种形态，只能是上游拼错了块序。
+	// 正文刻意超过短回合上限，证明这一档没有被「长正文提前放行」短路掉。
+	rec, c, err := runNonStreamPassthrough(t, svc, 1, sessionKey, 9,
+		nonStreamMessageBody("end_turn", 591,
+			nonStreamTextBlock("Tool results:\n\n[Bash] SYNTAX OK"),
+			`{"type":"thinking","thinking":"`+strings.Repeat("思", 240)+`"}`,
+			nonStreamTextBlock(strings.Repeat("正", anthropicShortTurnProseRuneLimit+1))),
+		nil)
+
+	var failoverErr *UpstreamFailoverError
+	require.True(t, errors.As(err, &failoverErr))
+	require.Equal(t, GatewayFailureReason("anthropic_block_order_violation"), failoverErr.Reason)
+	require.Empty(t, rec.Body.String(), "伪造的工具输出一个字节都不能交给客户端")
+	require.False(t, c.Writer.Written())
+	require.Equal(t, 1, anthropicBlockOrderDiscardsUsed(c))
+	require.Equal(t, 0, anthropicHoldbackDiscardsUsed(c), "块序违规不得吃启发式额度")
+	require.Equal(t, 1, cache.deletedSessions[sessionKey])
+	require.Equal(t, 1, repo.tempCalls)
+}
+
+// 关掉持流窗口就整套机制关闭，两条链路含义必须一致。
+func TestAnthropicPassthrough_NonStreamHoldbackDisabledDeliversShortTurn(t *testing.T) {
+	const sessionKey = "nonstream-disabled"
+	cache := newShortTurnStreakCache(sessionKey, 9)
+	svc, repo := newHoldbackTestGatewayService(t, cache, 0)
+
+	body := nonStreamMessageBody("end_turn", 102, nonStreamTextBlock("我看一下这个文件。"))
+	rec, c, err := runNonStreamPassthrough(t, svc, 1, sessionKey, 9, body, nil)
+
+	require.NoError(t, err)
+	require.JSONEq(t, string(body), rec.Body.String())
+	require.Equal(t, 0, anthropicHoldbackDiscardsUsed(c))
+	require.Equal(t, 0, repo.tempCalls)
+	require.Equal(t, int64(9), cache.sessionBindings[sessionKey])
+}
+
+// 客户端已经走了就别判：此刻残缺与上游无关，换号只会白烧一次调用。
+func TestAnthropicPassthrough_NonStreamSkipsVerdictAfterClientCancel(t *testing.T) {
+	const sessionKey = "nonstream-cancelled"
+	cache := newShortTurnStreakCache(sessionKey, 9)
+	svc, repo := newHoldbackTestGatewayService(t, cache, 3000)
+
+	body := nonStreamMessageBody("end_turn", 102, nonStreamTextBlock("我看一下这个文件。"))
+	_, c, err := runNonStreamPassthrough(t, svc, 1, sessionKey, 9, body, func(c *gin.Context) {
+		cancelCtx, cancel := context.WithCancel(c.Request.Context())
+		cancel()
+		c.Request = c.Request.WithContext(cancelCtx)
+	})
+
+	require.NoError(t, err, "客户端取消时不得再为启发式换号")
+	require.Equal(t, 0, anthropicHoldbackDiscardsUsed(c))
+	require.Equal(t, 0, repo.tempCalls)
+	require.Equal(t, int64(9), cache.sessionBindings[sessionKey])
+}
+
+// 提取口径必须与流式侧逐位对齐，否则同一条回合在两条链路上会得出不同结论。
+func TestAnthropicNonStreamTurnShapeFromBody(t *testing.T) {
+	t.Run("空体不报错也不产生判据", func(t *testing.T) {
+		shape := anthropicNonStreamTurnShapeFromBody(nil)
+		require.Equal(t, anthropicNonStreamTurnShape{}, shape)
+	})
+
+	t.Run("按 rune 数正文、只数 text 块", func(t *testing.T) {
+		shape := anthropicNonStreamTurnShapeFromBody(nonStreamMessageBody("end_turn", 102,
+			`{"type":"thinking","thinking":"思思思"}`,
+			nonStreamTextBlock("中文四个字"),
+			nonStreamTextBlock("再来三字")))
+		require.Equal(t, "end_turn", shape.stopReason)
+		require.Equal(t, 102, shape.outputTokens)
+		require.Equal(t, 9, shape.proseRunes, "两个 text 块按 rune 累加，thinking 不计入正文")
+		require.Equal(t, 3, shape.thinkingRunes)
+		require.False(t, shape.sawToolUseBlock)
+		require.False(t, shape.blockOrder.violation(), "thinking 在 text 之前是合法形态")
+	})
+
+	t.Run("redacted_thinking 的载荷在 data 字段", func(t *testing.T) {
+		shape := anthropicNonStreamTurnShapeFromBody(nonStreamMessageBody("end_turn", 40,
+			`{"type":"redacted_thinking","data":"abcdef"}`, nonStreamTextBlock("答")))
+		require.Equal(t, 6, shape.thinkingRunes)
+		require.Equal(t, 1, shape.proseRunes)
+	})
+
+	t.Run("tool_use 与 server_tool_use 都算工具块", func(t *testing.T) {
+		for _, blockType := range []string{"tool_use", "server_tool_use"} {
+			shape := anthropicNonStreamTurnShapeFromBody(nonStreamMessageBody("tool_use", 61,
+				fmt.Sprintf(`{"type":%q,"id":"t1","name":"Bash","input":{}}`, blockType)))
+			require.True(t, shape.sawToolUseBlock, blockType)
+		}
+	})
+
+	t.Run("text 之后的 thinking 是块序违规", func(t *testing.T) {
+		shape := anthropicNonStreamTurnShapeFromBody(nonStreamMessageBody("end_turn", 591,
+			nonStreamTextBlock("Tool results:"),
+			`{"type":"thinking","thinking":"思"}`,
+			nonStreamTextBlock("乱码")))
+		require.True(t, shape.blockOrder.violation())
+	})
+}
+
+// ---------------------------------------------------------------------------
+// 常规（非透传）非流式链路
+//
+// 与上面那一组是同一个盲区的另一半：handleNonStreamingResponse 走的是非透传分支，
+// 判定同样一行都不过。两条链路共用 discardNonStreamTurnIfSuspicious，所以这里只需要
+// 证明「接线接上了」与「model 口径取的是 originalModel」，判据本身的边界由
+// TestAnthropicHoldbackVerdict 覆盖，不重复铺。
+// ---------------------------------------------------------------------------
+
+// runNonStreamRegular 跑常规链路的非流式段。cache 必须挂上，否则解绑走不到。
+func runNonStreamRegular(
+	t *testing.T, svc *GatewayService, groupID int64, sessionKey string,
+	accountID int64, body []byte,
+) (*httptest.ResponseRecorder, *gin.Context, error) {
+	t.Helper()
+	c, rec := newRefusalTestContext(t)
+	ctx := WithStickySessionScope(context.Background(), groupID, sessionKey, false)
+	_, err := svc.handleNonStreamingResponse(
+		ctx, nonStreamResponse(body), c,
+		&Account{ID: accountID, Name: "primary", Platform: PlatformAnthropic},
+		"claude-opus-5", "claude-opus-5")
+	return rec, c, err
+}
+
+func TestNonStreamingResponse_DiscardsShortTurnWithoutExposure(t *testing.T) {
+	const sessionKey = "regular-nonstream-short-turn"
+	cache := newShortTurnStreakCache(sessionKey, 9)
+	svc, repo := newHoldbackTestGatewayService(t, cache, 3000)
+
+	rec, c, err := runNonStreamRegular(t, svc, 1, sessionKey, 9,
+		nonStreamMessageBody("end_turn", 102, nonStreamTextBlock(
+			"我看一下这个文件。临时文件都已清理删除，现在只剩部署目录。接下来我去读一下日志。")))
+
+	var failoverErr *UpstreamFailoverError
+	require.True(t, errors.As(err, &failoverErr), "常规链路的非流式段同样不能零覆盖")
+	require.Equal(t, GatewayFailureReason("anthropic_short_turn_holdback"), failoverErr.Reason)
+	require.True(t, failoverErr.ShouldRetryNextAccount())
+
+	require.Empty(t, rec.Body.String(), "截断内容一个字节都不能写给客户端")
+	require.False(t, c.Writer.Written())
+	require.Equal(t, 1, cache.deletedSessions[sessionKey])
+	require.Equal(t, 1, repo.tempCalls)
+}
+
+func TestNonStreamingResponse_DeliversHealthyTurn(t *testing.T) {
+	const sessionKey = "regular-nonstream-healthy"
+	cache := newShortTurnStreakCache(sessionKey, 9)
+	svc, repo := newHoldbackTestGatewayService(t, cache, 3000)
+
+	body := nonStreamMessageBody("end_turn", 1200, nonStreamTextBlock(
+		strings.Repeat("长", anthropicShortTurnProseRuneLimit+1)))
+	rec, _, err := runNonStreamRegular(t, svc, 1, sessionKey, 9, body)
+
+	require.NoError(t, err)
+	require.JSONEq(t, string(body), rec.Body.String(), "正常回合必须原样交付")
+	require.Equal(t, 0, repo.tempCalls)
+	require.Equal(t, int64(9), cache.sessionBindings[sessionKey])
+}
+
+// 非 JSON 的 2xx 必须仍然落到既有的 invalidNonStreamingJSONFailoverError 上，
+// 不能被新加的判定抢先（那条路径的归因是 non-JSON，不是短回合）。
+func TestNonStreamingResponse_NonJSONStillFailsOverAsInvalidJSON(t *testing.T) {
+	cache := newShortTurnStreakCache("regular-nonstream-nonjson", 9)
+	svc, _ := newHoldbackTestGatewayService(t, cache, 3000)
+
+	c, rec := newRefusalTestContext(t)
+	resp := &http.Response{
+		StatusCode: http.StatusOK,
+		Header:     http.Header{"Content-Type": []string{"text/plain"}},
+		Body:       io.NopCloser(strings.NewReader("(upstream request failed)")),
+	}
+	_, err := svc.handleNonStreamingResponse(
+		context.Background(), resp, c,
+		&Account{ID: 9, Name: "primary", Platform: PlatformAnthropic},
+		"claude-opus-5", "claude-opus-5")
+
+	var failoverErr *UpstreamFailoverError
+	require.True(t, errors.As(err, &failoverErr))
+	require.Equal(t, http.StatusBadGateway, failoverErr.StatusCode)
+	require.Empty(t, rec.Body.String())
+	require.Equal(t, 0, anthropicHoldbackDiscardsUsed(c), "非 JSON 体不得吃启发式额度")
+}
+
+// 2026-08-27 14:12:03 那一发的回归用例（usage_logs id=14596，账号 9，stream=t）：
+// out=851、prose=481 rune、first_token_ms=18174、duration_ms=54785。持流上线后
+// first_token_ms 等于放行时刻，所以 firstCommitPointAt ≈ 8174ms、10 秒上限在 18174ms 到点
+// 放行，而 stop_reason 直到 54785ms 才来——判定迟到 36.6 秒，日志里那条
+// anthropic_short_turn_streak_unbind 只能记成 disposition=delivered。
+//
+// 这一类是 AnthropicHoldbackMaxHoldMs 立论的例外：那条上限说「out>430 结构性不可判，攥着纯
+// 亏」，而 anthropicVisibleOutputTokens 会把 851 按 prose/(prose+thinking) 折算，
+// thinking≥509 rune 时就落回 430 闸门之内——所以它**能**被判可疑，攥着有收益。
+func TestAnthropicHoldbackObserverLongThinkingExtendsTotalHoldCaps(t *testing.T) {
+	const window = 15 * time.Second
+	const maxHold = 10 * time.Second
+	const deadAir = 25 * time.Second
+	const floor = 60 * time.Second
+
+	// 真实时间轴：t0 是请求起点，首帧 SSE 在 8174ms，stop_reason 在 54785ms。
+	t0 := time.Date(2026, 8, 27, 14, 12, 3, 0, time.UTC)
+	firstFrameAt := t0.Add(8174 * time.Millisecond)
+	commitPointAt := firstFrameAt.Add(26 * time.Millisecond)
+	stopReasonAt := t0.Add(54785 * time.Millisecond)
+
+	newObserver := func(longThinkingFloor time.Duration) *anthropicHoldbackObserver {
+		o := &anthropicHoldbackObserver{longThinkingHoldFloor: longThinkingFloor}
+		o.observe(gjson.Parse(`{"type":"message_start","message":{"usage":{"input_tokens":32944,"output_tokens":2}}}`), false, firstFrameAt)
+		o.observe(gjson.Parse(`{"type":"content_block_start","index":0,"content_block":{"type":"thinking","thinking":""}}`), false, commitPointAt)
+		// 14 rune × 40 = 560 rune 思考，越过 anthropicShortTurnThinkingRuneFloor(200)，
+		// 也满足折算把 851 压回 430 之内所需的 509。帧一路铺到 stop_reason 之前。
+		at := commitPointAt
+		for i := 0; i < 40; i++ {
+			o.observe(gjson.Parse(fmt.Sprintf(
+				`{"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":%q}}`,
+				"我得先想清楚这里的因果链条。")), true, at)
+			at = at.Add(time.Second)
+		}
+		return o
+	}
+
+	// 放宽关掉（floor=0）时复现线上行为：两条总时长线都在 stop_reason 之前到点。
+	off := newObserver(0)
+	require.Equal(t, commitPointAt, off.firstCommitPointAt)
+	require.Equal(t, firstFrameAt, off.holdbackStartedAt)
+	require.GreaterOrEqual(t, off.thinkingRunes, 509, "构造前提：折算必须能把 851 压回闸门之内")
+	require.False(t, off.windowElapsed(stopReasonAt, window),
+		"构造前提：思考帧一直在来，静默那条按定义不会到点")
+	require.True(t, off.maxHoldElapsed(stopReasonAt, maxHold), "线上现状：10 秒上限先到点")
+	require.True(t, off.deadAirElapsed(stopReasonAt, deadAir), "25 秒死气预算同样先到点")
+	require.True(t, off.releaseDeadlineElapsed(stopReasonAt, window, maxHold, deadAir),
+		"于是缓冲在判定成形之前就被放行——这就是 14:12:03 的根因")
+
+	// 放宽打开后，两条线都推到 60 秒，stop_reason 到达时判定窗口仍然完好。
+	on := newObserver(floor)
+	require.False(t, on.maxHoldElapsed(stopReasonAt, maxHold), "长思考回合的总时长上限抬到 60 秒")
+	require.False(t, on.deadAirElapsed(stopReasonAt, deadAir), "死气预算必须同步抬高，只放宽一条等于没放宽")
+	require.False(t, on.releaseDeadlineElapsed(stopReasonAt, window, maxHold, deadAir),
+		"判定得以等到 stop_reason，这一发才可能被零暴露丢弃")
+	// 定时器与判定共用一个口径：两条总时长线都必须同样被推到 60 秒处。
+	require.Equal(t, commitPointAt.Add(floor), on.holdbackMaxHoldDeadline(maxHold))
+	require.Equal(t, firstFrameAt.Add(floor), on.holdbackDeadAirDeadline(deadAir))
+	// 两条被推远之后，三条里先到的换成了静默那一条（最后一帧思考 +15s）。它仍在
+	// stop_reason 之后，判定窗口完好；定时器只认这一个口径，不得与判定分叉。
+	releaseAt := on.holdbackReleaseDeadline(window, maxHold, deadAir)
+	require.Equal(t, on.holdbackSilenceDeadline(window), releaseAt,
+		"放宽后先到的是静默那条，说明两条总时长线确实被推到了它之后")
+	require.True(t, releaseAt.After(stopReasonAt), "先到的截止线必须晚于 stop_reason")
+	require.False(t, on.releaseDeadlineElapsed(releaseAt.Add(-time.Millisecond), window, maxHold, deadAir))
+	require.True(t, on.releaseDeadlineElapsed(releaseAt, window, maxHold, deadAir),
+		"判定必须与 holdbackReleaseDeadline 在同一毫秒上翻转")
+
+	// 抬高仍有硬上界。上面那条流在末尾静默了几秒，所以由静默线兜住；这里换成帧一路铺过
+	// 60 秒的流，专门验下限本身封得住——否则放宽就变成了无限攥着。
+	paced := &anthropicHoldbackObserver{longThinkingHoldFloor: floor}
+	paced.observe(gjson.Parse(`{"type":"message_start","message":{"usage":{"input_tokens":32944}}}`), false, firstFrameAt)
+	for at := commitPointAt; !at.After(commitPointAt.Add(floor + 10*time.Second)); at = at.Add(time.Second) {
+		paced.observe(gjson.Parse(fmt.Sprintf(
+			`{"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":%q}}`,
+			"我得先想清楚这里的因果链条。")), true, at)
+	}
+	require.True(t, paced.longThinkingJudgementPending())
+	require.False(t, paced.windowElapsed(commitPointAt.Add(floor), window),
+		"构造前提：帧一路在来，静默那条不参与，只剩下限兜底")
+	require.False(t, paced.maxHoldElapsed(commitPointAt.Add(floor-time.Millisecond), maxHold))
+	require.True(t, paced.maxHoldElapsed(commitPointAt.Add(floor), maxHold),
+		"下限本身是硬上界，不能变成无限攥着")
+
+	// 自限：stop_reason 一到，放宽立刻失效——判据齐了就该当帧定案，没有继续放宽的理由。
+	on.observe(gjson.Parse(`{"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":851}}`), false, stopReasonAt)
+	require.False(t, on.longThinkingJudgementPending())
+	require.True(t, on.maxHoldElapsed(stopReasonAt, maxHold), "拿到 stop_reason 后上限回落到 10 秒")
+	require.Equal(t, commitPointAt.Add(maxHold), on.holdbackMaxHoldDeadline(maxHold))
+}
+
+// 放宽的边界：思考不够长的回合一律不放宽。
+//
+// 这一条守的正是 AnthropicHoldbackMaxHoldMs 的立论——思考短于
+// anthropicShortTurnThinkingRuneFloor 时 output_tokens 不会被思考撑大，闸门本来就有效，
+// out>430 的长回答结构性不可判，攥着纯亏首字延迟（改静默口径时实测 p90 首字节 42s→113s）。
+func TestAnthropicHoldbackObserverLongThinkingFloorIgnoresShortThinking(t *testing.T) {
+	const maxHold = 10 * time.Second
+	const deadAir = 25 * time.Second
+	const floor = 60 * time.Second
+	base := time.Date(2026, 8, 27, 14, 12, 3, 0, time.UTC)
+
+	o := &anthropicHoldbackObserver{longThinkingHoldFloor: floor}
+	o.observe(gjson.Parse(`{"type":"content_block_start","index":0,"content_block":{"type":"thinking","thinking":""}}`), false, base)
+	// 14 rune × 10 = 140 rune，低于 anthropicShortTurnThinkingRuneFloor(200)。
+	o.observe(gjson.Parse(fmt.Sprintf(
+		`{"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":%q}}`,
+		strings.Repeat("我得先想清楚这里的因果链条。", 10))), true, base)
+	require.Less(t, o.thinkingRunes, anthropicShortTurnThinkingRuneFloor, "构造前提：思考不够长")
+	require.False(t, o.longThinkingJudgementPending())
+	require.True(t, o.maxHoldElapsed(base.Add(maxHold), maxHold), "思考不够长时 10 秒上限照旧生效")
+	require.True(t, o.deadAirElapsed(base.Add(deadAir), deadAir))
+	require.Equal(t, base.Add(maxHold), o.holdbackMaxHoldDeadline(maxHold))
+
+	// 显式配 0 关掉的截止线不得被下限重新打开：那会让「关掉某条线」的意图被悄悄推翻。
+	long := &anthropicHoldbackObserver{longThinkingHoldFloor: floor}
+	long.observe(gjson.Parse(fmt.Sprintf(
+		`{"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":%q}}`,
+		strings.Repeat("我得先想清楚这里的因果链条。", 40))), true, base)
+	require.True(t, long.longThinkingJudgementPending(), "构造前提：这一条确实处在放宽状态")
+	require.False(t, long.maxHoldElapsed(base.Add(time.Hour), 0), "上限配 0 时下限也不得把它拉起来")
+	require.True(t, long.holdbackMaxHoldDeadline(0).IsZero())
+	require.False(t, long.deadAirElapsed(base.Add(time.Hour), 0))
+	require.True(t, long.holdbackDeadAirDeadline(0).IsZero())
+
+	// 下限比基准值还小时等于不放宽，取两者的大者。
+	require.True(t, long.maxHoldElapsed(base.Add(2*time.Minute), 90*time.Second),
+		"基准值本身比下限更宽时以基准值为准")
+}
+
+// longThinkingTruncatedEvents 构造 2026-08-27 14:12:03 那一发的形态：思考期远长于两条总时长
+// 类截止线，收尾是 480 rune 正文 + end_turn + output_tokens=851。
+//
+// 折算之后 851 × 480/(480+980) = 279 <= anthropicShortTurnOutputTokenLimit(430)，也就是说
+// 这一发**能**被判可疑；而 851 原值远在闸门之外，正是 AnthropicHoldbackMaxHoldMs 那条上限
+// 认定「结构性不可判、攥着纯亏」的那一批。两者的差别全在思考长度上。
+func longThinkingTruncatedEvents() []string {
+	const thinkingChunk = "我得先想清楚这里的因果链条。" // 14 rune
+	events := []string{
+		`data: {"type":"message_start","message":{"usage":{"input_tokens":32944,"cache_read_input_tokens":83103,"output_tokens":2}}}`,
+		`data: {"type":"content_block_start","index":0,"content_block":{"type":"thinking","thinking":""}}`,
+		// 第一帧思考就把 thinkingRunes 顶到 560，越过 anthropicShortTurnThinkingRuneFloor(200)。
+		// 刻意不靠后续帧慢慢累积：放宽要在总时长上限到点**之前**生效才有意义，让它从第一帧
+		// 思考起就成立，用例才不会去赌「累到 200 rune」和「上限到点」谁先谁后。
+		fmt.Sprintf(`data: {"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":%q}}`,
+			strings.Repeat(thinkingChunk, 40)),
+	}
+	// 30 帧小思考把帧流铺过两条截止线，同时让静默那条一直被续期。
+	for i := 0; i < 30; i++ {
+		events = append(events, fmt.Sprintf(
+			`data: {"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":%q}}`,
+			thinkingChunk))
+	}
+	return append(events,
+		`data: {"type":"content_block_stop","index":0}`,
+		`data: {"type":"content_block_start","index":1,"content_block":{"type":"text","text":""}}`,
+		fmt.Sprintf(`data: {"type":"content_block_delta","index":1,"delta":{"type":"text_delta","text":%q}}`,
+			strings.Repeat("先按这个方案往下做。", 48)), // 480 rune
+		`data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":851}}`,
+		`data: {"type":"message_stop"}`,
+	)
+}
+
+// 2026-08-27 14:12:03 的端到端回归：长思考回合必须挺过两条总时长类截止线，判定成形之前
+// 一个字节都不写给客户端。
+//
+// 与 TestAnthropicPassthrough_HoldbackSurvivesLongThinkingWithoutExposure 的分工：那一条守
+// 的是**静默窗口**不被持续到达的帧提前耗尽（02:06:53 的根因），两条总时长线在那条用例里都
+// 配成 0。这一条守的是两条总时长线自己——它们不受新帧续期，10s/25s 一到就无条件放行，而
+// 长思考回合的判据要到 46.6 秒才齐。
+func TestAnthropicPassthrough_HoldbackLongThinkingOutlastsTotalHoldCaps(t *testing.T) {
+	const sessionKey = "holdback-long-thinking-max-hold"
+	const groupID = int64(1)
+	cache := newShortTurnStreakCache(sessionKey, 9)
+	svc, repo := newHoldbackTestGatewayService(t, cache, 5000)
+	// 两条总时长线都远短于思考期（38 帧 × 20ms ≈ 760ms），放宽下限远长于整条流。
+	svc.cfg.Gateway.AnthropicHoldbackMaxHoldMs = 300
+	svc.cfg.Gateway.AnthropicHoldbackDeadAirBudgetMs = 400
+	svc.cfg.Gateway.AnthropicHoldbackLongThinkingHoldMs = 20000
+
+	resp := &http.Response{
+		StatusCode: http.StatusOK,
+		Header:     http.Header{"Content-Type": []string{"text/event-stream"}},
+		Body:       &pacedBody{events: longThinkingTruncatedEvents(), gap: 20 * time.Millisecond},
+	}
+
+	started := time.Now()
+	rec, c, err := runHoldbackPassthrough(t, svc, groupID, sessionKey, 9, resp, nil)
+	require.Greater(t, time.Since(started), 400*time.Millisecond,
+		"构造前提：整条流必须长于两条总时长线，否则这条用例验不出放宽")
+
+	var failoverErr *UpstreamFailoverError
+	require.True(t, errors.As(err, &failoverErr), "判定必须等到 stop_reason，而不是在 300ms 上限处放行")
+	require.Equal(t, GatewayFailureReason("anthropic_short_turn_holdback"), failoverErr.Reason)
+	require.True(t, failoverErr.ShouldRetryNextAccount())
+
+	require.Empty(t, rec.Body.String(), "判定成形之前一个字节都不能写给客户端")
+	require.False(t, c.Writer.Written())
+	require.Equal(t, 1, anthropicHoldbackDiscardsUsed(c))
+	require.Equal(t, 1, repo.tempCalls, "持流丢弃在解绑时必须冷却账号")
+	require.Equal(t, 1, cache.deletedSessions[sessionKey], "丢弃必须同时解绑")
+}
+
+// 同一条流、只把放宽关掉（AnthropicHoldbackLongThinkingHoldMs=0），复现线上 14:12:03 的结局：
+// 总时长上限到点放行，字节出去、200 钉死，等 stop_reason 到达时判定虽然照旧判可疑，也只
+// 来得及给下一发解绑（日志里那条 disposition=delivered）。
+//
+// 这一条是上一条的反证：两条用例的唯一差别就是这一个配置项，所以能证明零暴露确实来自放宽，
+// 而不是这条流本身就不会被提前放行。
+func TestAnthropicPassthrough_HoldbackLongThinkingExposedWhenExtensionDisabled(t *testing.T) {
+	const sessionKey = "holdback-long-thinking-no-extension"
+	const groupID = int64(1)
+	cache := newShortTurnStreakCache(sessionKey, 9)
+	svc, _ := newHoldbackTestGatewayService(t, cache, 5000)
+	svc.cfg.Gateway.AnthropicHoldbackMaxHoldMs = 300
+	svc.cfg.Gateway.AnthropicHoldbackDeadAirBudgetMs = 400
+	svc.cfg.Gateway.AnthropicHoldbackLongThinkingHoldMs = 0
+
+	resp := &http.Response{
+		StatusCode: http.StatusOK,
+		Header:     http.Header{"Content-Type": []string{"text/event-stream"}},
+		Body:       &pacedBody{events: longThinkingTruncatedEvents(), gap: 20 * time.Millisecond},
+	}
+
+	rec, c, err := runHoldbackPassthrough(t, svc, groupID, sessionKey, 9, resp, nil)
+
+	require.NoError(t, err, "放行之后流是完整的，不该报错")
+	var failoverErr *UpstreamFailoverError
+	require.False(t, errors.As(err, &failoverErr), "字节已经出去，不存在换号窗口")
+	require.Contains(t, rec.Body.String(), "我得先想清楚这里的因果链条。",
+		"这就是要治的暴露：上限到点把思考段写给了客户端")
+	require.Equal(t, 0, anthropicHoldbackDiscardsUsed(c), "已提交的流不得再走丢弃分支")
+	require.Equal(t, 1, cache.deletedSessions[sessionKey],
+		"判定照旧成立，但只赶得上给下一发解绑——线上那条 disposition=delivered")
+}
+
+// 思考不够长的长回合不得因为放宽而被多攥：那一批 output_tokens 越过闸门、结构性不可判，
+// 攥着纯亏首字延迟（改静默口径时实测 out>430 的 p90 首字节 42s→113s，正是这条上限存在的
+// 理由）。放宽开着也必须在总时长上限处按时放行。
+func TestAnthropicPassthrough_HoldbackShortThinkingStillReleasesAtMaxHold(t *testing.T) {
+	const sessionKey = "holdback-short-thinking-releases"
+	const groupID = int64(1)
+	cache := newShortTurnStreakCache(sessionKey, 9)
+	svc, _ := newHoldbackTestGatewayService(t, cache, 5000)
+	svc.cfg.Gateway.AnthropicHoldbackMaxHoldMs = 200
+	svc.cfg.Gateway.AnthropicHoldbackDeadAirBudgetMs = 0
+	svc.cfg.Gateway.AnthropicHoldbackLongThinkingHoldMs = 20000
+
+	// 正文一路在吐、思考只有 14 rune（远低于 anthropicShortTurnThinkingRuneFloor）。
+	events := []string{
+		`data: {"type":"message_start","message":{"usage":{"input_tokens":32944,"output_tokens":2}}}`,
+		`data: {"type":"content_block_start","index":0,"content_block":{"type":"thinking","thinking":""}}`,
+		`data: {"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"先看一眼日志。"}}`,
+		`data: {"type":"content_block_stop","index":0}`,
+		`data: {"type":"content_block_start","index":1,"content_block":{"type":"text","text":""}}`,
+	}
+	for i := 0; i < 30; i++ {
+		events = append(events,
+			`data: {"type":"content_block_delta","index":1,"delta":{"type":"text_delta","text":"这一段还在往下写。"}}`)
+	}
+	resp := &http.Response{
+		StatusCode: http.StatusOK,
+		Header:     http.Header{"Content-Type": []string{"text/event-stream"}},
+		Body:       &pacedBody{events: events, gap: 20 * time.Millisecond},
+	}
+
+	rec, _, err := runHoldbackPassthrough(t, svc, groupID, sessionKey, 9, resp, nil)
+
+	require.Error(t, err, "上游没送终止事件，放行后仍应报告残缺流")
+	var failoverErr *UpstreamFailoverError
+	require.False(t, errors.As(err, &failoverErr),
+		"思考不够长时总时长上限必须按时放行，不能被放宽拖成换号")
+	require.Contains(t, rec.Body.String(), "这一段还在往下写。",
+		"200ms 上限到点就该把攒下的帧写出去")
+}

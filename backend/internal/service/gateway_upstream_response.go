@@ -1491,6 +1491,16 @@ func (s *GatewayService) handleNonStreamingResponse(ctx context.Context, resp *h
 		isAnthropicSafetyRefusalResponse(resp.StatusCode, body) {
 		return nil, s.newAnthropicSafetyFailoverError(c, resp, account, body)
 	}
+	// 短回合 / 空回合 / 块序违规判定：与透传分支同一份判据（见
+	// discardNonStreamTurnIfSuspicious）。常规链路的非流式段原先同样一行判定都不过，
+	// 而 model 参数这里用 originalModel——与本文件流式段那处调用（reportAnthropicShortTurnUnbind
+	// 等）保持同一个口径，否则解绑键和归因维度会与流式侧对不上。
+	if resp.StatusCode >= http.StatusOK && resp.StatusCode < http.StatusMultipleChoices &&
+		json.Valid(body) {
+		if err := s.discardNonStreamTurnIfSuspicious(ctx, c, resp, account, originalModel, body); err != nil {
+			return nil, err
+		}
+	}
 	// 解析usage
 	var response struct {
 		Usage ClaudeUsage `json:"usage"`

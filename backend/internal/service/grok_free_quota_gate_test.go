@@ -81,17 +81,26 @@ func TestFilterGrokFreeQuotaAccountsOnlyBlocksExplicitFreeOAuth(t *testing.T) {
 	filtered := scheduler.filterGrokFreeQuotaAccounts(context.Background(), accounts)
 	require.Equal(t, []int64{1, 2, 3, 4}, accountIDs(filtered), "miss fails open on hot path")
 
+	// Wait on the effect, not on repo.calls: the stub increments calls on entry to
+	// GetAccountWindowStatsBatch, but the refresh goroutine only writes the cache
+	// entry after that call returns. Under load the goroutine can be descheduled in
+	// that gap, so a calls-based wait lets the second pass observe a miss and
+	// fail open. Polling the filter itself is call-safe: while the refresh is in
+	// flight the in-flight marker coalesces away duplicate queries, and once the
+	// entry lands it is fresh for cacheTTL, so exactly one query is ever issued.
 	require.Eventually(t, func() bool {
-		repo.mu.Lock()
-		defer repo.mu.Unlock()
-		return repo.calls >= 1
+		return len(scheduler.filterGrokFreeQuotaAccounts(context.Background(), accounts)) == 3
 	}, 2*time.Second, 10*time.Millisecond)
 
 	// Second pass: uses refreshed cache and blocks over-gate free OAuth.
 	filtered = scheduler.filterGrokFreeQuotaAccounts(context.Background(), accounts)
 	require.Equal(t, []int64{2, 3, 4}, accountIDs(filtered), "paid and unknown fail-open; API-key free marker is not gated")
-	require.Equal(t, []int64{1}, repo.lastIDs, "paid, unknown, and API-key accounts must not enter the local free-tier query")
-	require.WithinDuration(t, time.Now().UTC().Add(-24*time.Hour), repo.start, time.Second)
+	repo.mu.Lock()
+	lastIDs, start, calls := append([]int64(nil), repo.lastIDs...), repo.start, repo.calls
+	repo.mu.Unlock()
+	require.Equal(t, []int64{1}, lastIDs, "paid, unknown, and API-key accounts must not enter the local free-tier query")
+	require.Equal(t, 1, calls, "in-flight coalescing must keep the fail-open polls from re-querying")
+	require.WithinDuration(t, time.Now().UTC().Add(-24*time.Hour), start, time.Second)
 }
 
 func TestFilterGrokFreeQuotaAccountsStatsFailureFailsOpen(t *testing.T) {
