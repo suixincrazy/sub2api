@@ -1795,16 +1795,19 @@ func TestAnthropicHoldbackObserverLongThinkingExtendsTotalHoldCaps(t *testing.T)
 	require.Equal(t, commitPointAt.Add(maxHold), on.holdbackMaxHoldDeadline(maxHold))
 }
 
-// 放宽的边界：思考不够长**且已经在写正文**的回合一律不放宽。
+// 放宽的边界：正文已经越过 anthropicShortTurnProseRuneLimit 的回合一律不放宽。
 //
-// 这一条守的正是 AnthropicHoldbackMaxHoldMs 的立论——思考短于
-// anthropicShortTurnThinkingRuneFloor 时 output_tokens 不会被思考撑大，闸门本来就有效，
-// out>430 的长回答结构性不可判，攥着纯亏首字延迟（改静默口径时实测 p90 首字节 42s→113s）。
+// 2026-08-28 重钉。这一条原先守的是「思考不够长 + 已经在写正文就不放宽」，立论是
+// out>430 的长回答结构性不可判、攥着纯亏首字延迟（改静默口径时实测 p90 首字节 42s→113s）。
+// 那条立论在持流期站不住：outputTokens 的终值与 stop_reason 同帧到达，持流全程只能看到
+// message_start 里的初值（实测 1~2），所以「这一发最终会不会越过 430」在放行时刻是不可知的。
+// 分不开的两类里，攥住是唯一能保住换号窗口的做法；这一档的首字节延迟由用户 2026-08-28
+// 明确让出（「愿意专门为 out>430 这一档让出首字节延迟」）。
 //
-// 「已经在写正文」是必要条件：正文仍是零的思考回合走
-// longThinkingJudgementPending 的第二个入口，那一档的可判性不经过折算，与思考长短无关，
-// 见 TestAnthropicHoldbackObserverZeroProseThinkingExtendsAllThreeCaps。
-func TestAnthropicHoldbackObserverLongThinkingFloorIgnoresShortThinking(t *testing.T) {
+// 换上来的边界是持流期唯一单调可用的判据：正文长度。正文一旦越过上限，
+// anthropicTurnLooksSuspiciouslyShort 就再也不可能判可疑，同一刻 anthropicHoldbackVerdict
+// 自己那条 proseRunes > 上限的提前放行出口也同帧生效，两处口径严格对齐。
+func TestAnthropicHoldbackObserverLongProseStopsRelaxing(t *testing.T) {
 	const maxHold = 10 * time.Second
 	const deadAir = 25 * time.Second
 	const floor = 60 * time.Second
@@ -1812,20 +1815,35 @@ func TestAnthropicHoldbackObserverLongThinkingFloorIgnoresShortThinking(t *testi
 
 	o := &anthropicHoldbackObserver{longThinkingHoldFloor: floor}
 	o.observe(gjson.Parse(`{"type":"content_block_start","index":0,"content_block":{"type":"thinking","thinking":""}}`), false, base)
-	// 14 rune × 10 = 140 rune，低于 anthropicShortTurnThinkingRuneFloor(200)。
+	// 14 rune × 10 = 140 rune，低于 anthropicShortTurnThinkingRuneFloor(200)：
+	// 第一个入口拿不到，这一条测的就是第三个入口自己的边界。
 	o.observe(gjson.Parse(fmt.Sprintf(
 		`{"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":%q}}`,
 		strings.Repeat("我得先想清楚这里的因果链条。", 10))), true, base)
-	// 正文已经开始，于是零正文那个入口不成立，只剩 200 rune 那道闸门说话。
-	o.observe(gjson.Parse(`{"type":"content_block_delta","index":1,"delta":{"type":"text_delta","text":"先按这个方案往下做。"}}`), true, base)
-	require.Less(t, o.thinkingRunes, anthropicShortTurnThinkingRuneFloor, "构造前提：思考不够长")
-	require.Positive(t, o.proseRunes, "构造前提：正文已经在写，零正文入口不该成立")
+	// 正文越过上限：这一发再也不可能被判可疑，攥着拿不到任何收益。
+	o.observe(gjson.Parse(fmt.Sprintf(
+		`{"type":"content_block_delta","index":1,"delta":{"type":"text_delta","text":%q}}`,
+		strings.Repeat("这", anthropicShortTurnProseRuneLimit+1))), true, base)
+	require.Less(t, o.thinkingRunes, anthropicShortTurnThinkingRuneFloor, "构造前提：思考不够长，第一个入口不成立")
+	require.Greater(t, o.proseRunes, anthropicShortTurnProseRuneLimit, "构造前提：正文已越过上限")
 	require.False(t, o.longThinkingJudgementPending())
-	require.True(t, o.maxHoldElapsed(base.Add(maxHold), maxHold), "思考不够长时 10 秒上限照旧生效")
+	require.True(t, o.maxHoldElapsed(base.Add(maxHold), maxHold), "正文越过上限时 10 秒上限照旧生效")
 	require.True(t, o.deadAirElapsed(base.Add(deadAir), deadAir))
 	require.Equal(t, base.Add(maxHold), o.holdbackMaxHoldDeadline(maxHold))
 	require.Equal(t, base.Add(15*time.Second), o.holdbackSilenceDeadline(15*time.Second),
 		"不放宽时静默窗口保持基准值")
+
+	// 对照：同样是思考不够长，正文卡在上限上（还没越过）就必须仍在放宽状态——判定还可能
+	// 落在 Discard 上，这一档正是 18:14:29（prose=849 out=399 disposition=delivered）要治的。
+	atLimit := &anthropicHoldbackObserver{longThinkingHoldFloor: floor}
+	atLimit.observe(gjson.Parse(`{"type":"content_block_start","index":1,"content_block":{"type":"text","text":""}}`), true, base)
+	atLimit.observe(gjson.Parse(fmt.Sprintf(
+		`{"type":"content_block_delta","index":1,"delta":{"type":"text_delta","text":%q}}`,
+		strings.Repeat("这", anthropicShortTurnProseRuneLimit))), true, base)
+	require.Equal(t, anthropicShortTurnProseRuneLimit, atLimit.proseRunes, "构造前提：正好卡在上限上")
+	require.True(t, atLimit.longThinkingJudgementPending(), "卡在上限上仍可能判可疑，必须继续攥")
+	require.False(t, atLimit.maxHoldElapsed(base.Add(maxHold), maxHold))
+	require.Equal(t, base.Add(floor), atLimit.holdbackMaxHoldDeadline(maxHold))
 
 	// 显式配 0 关掉的截止线不得被下限重新打开：那会让「关掉某条线」的意图被悄悄推翻。
 	long := &anthropicHoldbackObserver{longThinkingHoldFloor: floor}
@@ -2056,11 +2074,22 @@ func TestAnthropicPassthrough_HoldbackLongThinkingExposedWhenExtensionDisabled(t
 		"判定照旧成立，但只赶得上给下一发解绑——线上那条 disposition=delivered")
 }
 
-// 思考不够长的长回合不得因为放宽而被多攥：那一批 output_tokens 越过闸门、结构性不可判，
-// 攥着纯亏首字延迟（改静默口径时实测 out>430 的 p90 首字节 42s→113s，正是这条上限存在的
-// 理由）。放宽开着也必须在总时长上限处按时放行。
-func TestAnthropicPassthrough_HoldbackShortThinkingStillReleasesAtMaxHold(t *testing.T) {
-	const sessionKey = "holdback-short-thinking-releases"
+// 长正文回合必须照旧放行、绝不能被持流拖成换号。
+//
+// 判据是单调性：正文越过 anthropicShortTurnProseRuneLimit 之后
+// anthropicTurnLooksSuspiciouslyShort 再也不可能判它可疑（那是判可疑的必要条件），所以继续攥
+// 不会改变结论，只会白亏首字节延迟。
+//
+// 2026-08-28 把 longThinkingJudgementPending 的第三个入口放宽到「正文尚未越过上限」之后，
+// 这一档的放行出口换了人：正文还在 (0,1300] 区间内时放宽成立、两条总时长线都被抬到放宽下限，
+// 于是 AnthropicHoldbackMaxHoldMs 那条定时器压根轮不到开火，真正生效的是 verdict 里
+// `proseRunes > anthropicShortTurnProseRuneLimit` 那条提前放行出口。两处共用同一个常量，
+// 所以放宽的边界与放行的边界在同一个数上翻转，不存在缝。
+//
+// 因此这一条钉的是**结果**——长正文回合零 failover、攒下的字节照旧写给客户端——而不是哪条
+// 出口先生效。刻意不再断言「200ms 上限到点放行」：那个断言在新口径下描述的是一条不可达路径。
+func TestAnthropicPassthrough_HoldbackLongProseReleasesWithoutFailover(t *testing.T) {
+	const sessionKey = "holdback-long-prose-releases"
 	const groupID = int64(1)
 	cache := newShortTurnStreakCache(sessionKey, 9)
 	svc, _ := newHoldbackTestGatewayService(t, cache, 5000)
@@ -2068,7 +2097,7 @@ func TestAnthropicPassthrough_HoldbackShortThinkingStillReleasesAtMaxHold(t *tes
 	svc.cfg.Gateway.AnthropicHoldbackDeadAirBudgetMs = 0
 	svc.cfg.Gateway.AnthropicHoldbackLongThinkingHoldMs = 20000
 
-	// 正文一路在吐、思考只有 14 rune（远低于 anthropicShortTurnThinkingRuneFloor）。
+	// 思考只有 7 rune（远低于 anthropicShortTurnThinkingRuneFloor），正文一路铺过上限。
 	events := []string{
 		`data: {"type":"message_start","message":{"usage":{"input_tokens":32944,"output_tokens":2}}}`,
 		`data: {"type":"content_block_start","index":0,"content_block":{"type":"thinking","thinking":""}}`,
@@ -2076,14 +2105,17 @@ func TestAnthropicPassthrough_HoldbackShortThinkingStillReleasesAtMaxHold(t *tes
 		`data: {"type":"content_block_stop","index":0}`,
 		`data: {"type":"content_block_start","index":1,"content_block":{"type":"text","text":""}}`,
 	}
-	for i := 0; i < 30; i++ {
+	// 9 rune × 150 = 1350 rune，越过 anthropicShortTurnProseRuneLimit(1300)。
+	for i := 0; i < 150; i++ {
 		events = append(events,
 			`data: {"type":"content_block_delta","index":1,"delta":{"type":"text_delta","text":"这一段还在往下写。"}}`)
 	}
+	// 整条流约 155ms，短于 200ms 的总时长上限：这样一来放行只可能来自正文上限那条出口，
+	// 不会被定时器抢先，否则这条用例证不出想证的东西。
 	resp := &http.Response{
 		StatusCode: http.StatusOK,
 		Header:     http.Header{"Content-Type": []string{"text/event-stream"}},
-		Body:       &pacedBody{events: events, gap: 20 * time.Millisecond},
+		Body:       &pacedBody{events: events, gap: time.Millisecond},
 	}
 
 	rec, _, err := runHoldbackPassthrough(t, svc, groupID, sessionKey, 9, resp, nil)
@@ -2091,9 +2123,75 @@ func TestAnthropicPassthrough_HoldbackShortThinkingStillReleasesAtMaxHold(t *tes
 	require.Error(t, err, "上游没送终止事件，放行后仍应报告残缺流")
 	var failoverErr *UpstreamFailoverError
 	require.False(t, errors.As(err, &failoverErr),
-		"思考不够长时总时长上限必须按时放行，不能被放宽拖成换号")
+		"正文越过上限的回合结构性不可判，必须放行而不是换号")
 	require.Contains(t, rec.Body.String(), "这一段还在往下写。",
-		"200ms 上限到点就该把攒下的帧写出去")
+		"越过上限那一刻就该把攒下的帧写给客户端")
+}
+
+// 2026-08-28 18:14:29 那一发的端到端回归（usage_logs id=17451，账号 10，stream=t）：
+// prose_runes=849 output_tokens=399 stop_reason=end_turn，first_token_ms=20587、
+// duration_ms=21421 —— 判据只比放行晚 834ms 到齐，而 disposition=delivered：字节已经出去，
+// 判定虽然照旧判可疑，也只赶得上给下一发解绑，这一发的换号窗口彻底关掉。
+// 同形态还有 14:43:23（usage_logs id=16807）：+12091ms 放行、stop_reason 在 +13956ms 到，
+// 差 1865ms，当时短回合丢弃额度还剩 1 次没用。
+//
+// 这一发的思考只有 14 rune，所以两个旧入口都不成立（思考没到 200、正文也不是零），
+// AnthropicHoldbackMaxHoldMs 那条 10 秒上限按原值把缓冲放了出去。第三个入口改成
+// 「正文尚未越过 anthropicShortTurnProseRuneLimit」之后，849 rune 仍在上限之内、
+// 判定仍有可能落在 Discard 上，于是三条线一起抬到下限，判据得以等到 stop_reason。
+//
+// 终值 output_tokens=399 在闸门（430）之内，所以 stop_reason 一到判定就是可疑 —— 这一发
+// 因此可以被零暴露丢弃。持流期看不到这个终值（它与 stop_reason 同帧到达），正是为什么
+// 范围只能用正文长度限定、不能用 token 闸门限定。
+func TestAnthropicPassthrough_HoldbackShortThinkingLongProseStillJudged(t *testing.T) {
+	const sessionKey = "holdback-short-thinking-long-prose"
+	const groupID = int64(1)
+	cache := newShortTurnStreakCache(sessionKey, 10)
+	svc, repo := newHoldbackTestGatewayService(t, cache, 5000)
+	// 两条总时长线都远短于整条流，放宽下限远长于它 —— 复现线上「上限先到点」的相对关系。
+	svc.cfg.Gateway.AnthropicHoldbackMaxHoldMs = 300
+	svc.cfg.Gateway.AnthropicHoldbackDeadAirBudgetMs = 400
+	svc.cfg.Gateway.AnthropicHoldbackLongThinkingHoldMs = 20000
+
+	// 思考 14 rune（远低于 anthropicShortTurnThinkingRuneFloor），正文 849 rune
+	// （= 283 帧 × 3 rune，落在 (0, anthropicShortTurnProseRuneLimit] 之内）。
+	events := []string{
+		`data: {"type":"message_start","message":{"usage":{"input_tokens":64512,"output_tokens":2}}}`,
+		`data: {"type":"content_block_start","index":0,"content_block":{"type":"thinking","thinking":""}}`,
+		`data: {"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"先看一眼日志。"}}`,
+		`data: {"type":"content_block_stop","index":0}`,
+		`data: {"type":"content_block_start","index":1,"content_block":{"type":"text","text":""}}`,
+	}
+	for i := 0; i < 283; i++ {
+		events = append(events,
+			`data: {"type":"content_block_delta","index":1,"delta":{"type":"text_delta","text":"往下写"}}`)
+	}
+	events = append(events,
+		`data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":399}}`,
+		`data: {"type":"message_stop"}`)
+
+	resp := &http.Response{
+		StatusCode: http.StatusOK,
+		Header:     http.Header{"Content-Type": []string{"text/event-stream"}},
+		Body:       &pacedBody{events: events, gap: 2 * time.Millisecond},
+	}
+
+	started := time.Now()
+	rec, c, err := runHoldbackPassthrough(t, svc, groupID, sessionKey, 10, resp, nil)
+	require.Greater(t, time.Since(started), 400*time.Millisecond,
+		"构造前提：整条流必须长于两条总时长线，否则这条用例验不出放宽")
+
+	var failoverErr *UpstreamFailoverError
+	require.True(t, errors.As(err, &failoverErr),
+		"正文没越过上限时判定必须等到 stop_reason，而不是在 300ms 上限处放行")
+	require.Equal(t, GatewayFailureReason("anthropic_short_turn_holdback"), failoverErr.Reason)
+	require.True(t, failoverErr.ShouldRetryNextAccount())
+
+	require.Empty(t, rec.Body.String(), "零暴露：判定成形之前一个字节都不能写给客户端")
+	require.False(t, c.Writer.Written())
+	require.Equal(t, 1, anthropicHoldbackDiscardsUsed(c))
+	require.Equal(t, 1, repo.tempCalls, "持流丢弃在解绑时必须冷却账号")
+	require.Equal(t, 1, cache.deletedSessions[sessionKey], "丢弃必须同时解绑")
 }
 
 // 2026-08-27 23:24:24 的端到端回归（usage_logs id=15219，账号 11 justwoker-anthropic，
@@ -2235,12 +2333,31 @@ func TestAnthropicHoldbackObserverZeroRuneCommitFrameStillRelaxes(t *testing.T) 
 	require.False(t, done.longThinkingJudgementPending(), "stop_reason 到了就不该再放宽")
 	require.True(t, done.maxHoldElapsed(base.Add(maxHold), maxHold), "蒸发后原值立刻生效")
 
-	// 正文一出现也蒸发：短答案回合不该被这个下限拖住。
+	// 短正文不蒸发：判定仍有可能落在 Discard 上（正文没越过
+	// anthropicShortTurnProseRuneLimit），所以必须继续攥着，否则换号窗口就是在这里丢掉的。
+	// 2026-08-28 之前这里断言的是「正文一出现就蒸发」，那正是 18:14:29 那一发
+	// （prose_runes=849 output_tokens=399 disposition=delivered）漏掉换号窗口的根因。
 	prose := &anthropicHoldbackObserver{longThinkingHoldFloor: floor}
 	prose.observe(gjson.Parse(`{"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}`), true, base)
 	require.True(t, prose.longThinkingJudgementPending(), "构造前提：先处在放宽状态")
 	prose.observe(gjson.Parse(`{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"好的，按这个来。"}}`), true, base.Add(time.Second))
 	require.Positive(t, prose.proseRunes)
-	require.False(t, prose.longThinkingJudgementPending(), "正文一出现零正文入口就不成立")
-	require.True(t, prose.maxHoldElapsed(base.Add(maxHold), maxHold), "短答案回合照旧按原值放行")
+	require.LessOrEqual(t, prose.proseRunes, anthropicShortTurnProseRuneLimit, "构造前提：正文还在上限之内")
+	require.True(t, prose.longThinkingJudgementPending(),
+		"正文尚未越过上限时判定仍可能是 Discard，放宽必须继续成立")
+	require.False(t, prose.maxHoldElapsed(base.Add(maxHold), maxHold), "原值不得在这一档放行")
+	require.True(t, prose.maxHoldElapsed(base.Add(floor), maxHold), "上界仍由下限封住")
+
+	// 正文越过上限才蒸发：那一刻 anthropicTurnLooksSuspiciouslyShort 再也不可能判可疑，
+	// verdict 自己那条 `proseRunes > anthropicShortTurnProseRuneLimit` 提前放行出口同帧生效，
+	// 两处口径严格对齐，继续攥着纯亏首字延迟。
+	long := &anthropicHoldbackObserver{longThinkingHoldFloor: floor}
+	long.observe(gjson.Parse(`{"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}`), true, base)
+	require.True(t, long.longThinkingJudgementPending(), "构造前提：先处在放宽状态")
+	long.observe(gjson.Parse(fmt.Sprintf(
+		`{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":%q}}`,
+		strings.Repeat("长", anthropicShortTurnProseRuneLimit+1))), true, base.Add(time.Second))
+	require.Greater(t, long.proseRunes, anthropicShortTurnProseRuneLimit, "构造前提：正文已越过上限")
+	require.False(t, long.longThinkingJudgementPending(), "越过上限后不再可判，放宽必须蒸发")
+	require.True(t, long.maxHoldElapsed(base.Add(maxHold), maxHold), "蒸发后原值立刻生效")
 }

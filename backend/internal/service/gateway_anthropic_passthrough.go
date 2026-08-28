@@ -922,8 +922,35 @@ type anthropicHoldbackObserver struct {
 // 这是显式接受的取舍（用户 2026-08-28 决定：不让坏账号退出轮换，宁可加大攥的时长、不在乎慢
 // 回合的首字节延迟）。自限性没变：正文一出现这一档立刻蒸发，短答案回合照旧按原值放行。
 //
-// 刻意不看正文长度上限：正文越过 anthropicShortTurnProseRuneLimit 时 verdict 自己那条提前
-// 放行出口会先生效，在这里重复一遍只会让两处口径有分叉的机会。
+// 2026-08-28 把第三个入口从「正文为零」放宽到「正文尚未越过 anthropicShortTurnProseRuneLimit」，
+// 也就是覆盖**判定仍有可能落在 Discard 上**的全部形态。判据是单调性：
+//   - proseRunes 与 outputTokens 在一条流里只增不减；
+//   - anthropicTurnLooksSuspiciouslyShort 判可疑的必要条件是 proseRunes <= 上限，
+//     所以正文一旦越过上限，这一回合就再也不可能被判可疑 —— 那一刻 verdict 自己那条
+//     `proseRunes > anthropicShortTurnProseRuneLimit` 提前放行出口同帧生效，两处口径由此
+//     严格对齐（前提也对齐：本函数第一件事就是要求 stop_reason 未到，而 stop_reason 一到
+//     verdict 当帧定案，caps 放不放宽都不再影响结果）。
+//
+// 为什么不能改用 token 闸门限定范围（这是这一版之前设想过、实测走不通的那条路）：
+// outputTokens 的**终值与 stop_reason 同在 message_delta 那一帧到达**，持流全程能看到的只有
+// message_start 里的初值（实测 1~2）。于是 anthropicVisibleOutputTokens 在持流期恒远小于
+// anthropicShortTurnOutputTokenLimit，拿它当闸门等于恒真、零分辨力，既不缩小范围也不提供
+// 任何信息。持流期真正单调可用的判据只有正文长度一个。
+//
+// 这一版治的是「判定成形得比放行晚一步」这个缺口，两发实证：
+//   - 2026-08-28 14:43:23（usage_logs id=16807）：在 +12091ms 放行，stop_reason 在 +13956ms
+//     才到，只差 1865ms，而当时短回合丢弃额度还剩 1 次没用。
+//   - 2026-08-28 18:14:29（usage_logs id=17451，账号 10）：prose_runes=849 output_tokens=399
+//     stop_reason=end_turn，判定照旧判可疑，但 first_token_ms=20587（TTFB≈10.5s 之后
+//     AnthropicHoldbackMaxHoldMs 那 10 秒到点放行）而 duration_ms=21421 —— 判据在 834ms 后
+//     才到齐，字节已经出去，disposition=delivered，换号窗口彻底关掉。
+//
+// 增量代价只落在一处：thinkingRunes < 200、正文在 (0,1300] 之间、而终值 outputTokens 越过
+// 闸门的那一批健康回合 —— 它们本轮会被攥到 stop_reason 而不是 AnthropicHoldbackMaxHoldMs。
+// 思考够长的回合早就走第一个入口，正文越过上限的回合走 verdict 的提前放行出口，两头都不受影响。
+// 这一档的首字节延迟由用户 2026-08-28 明确让出（「愿意专门为 out>430 这一档让出首字节延迟」），
+// 所以原先「out>430 结构性不可判、攥着纯亏延迟」那条立论不再成立：持流期分不开这两类，而
+// 分不开时攥住是唯一能保住换号窗口的做法。上界仍由 AnthropicHoldbackLongThinkingHoldMs 单点封住。
 func (o *anthropicHoldbackObserver) longThinkingJudgementPending() bool {
 	if strings.TrimSpace(o.stopReason) != "" {
 		return false
@@ -931,7 +958,7 @@ func (o *anthropicHoldbackObserver) longThinkingJudgementPending() bool {
 	if o.thinkingRunes >= anthropicShortTurnThinkingRuneFloor {
 		return true
 	}
-	return o.proseRunes == 0
+	return o.proseRunes <= anthropicShortTurnProseRuneLimit
 }
 
 // effectiveHoldCap 把一条放行截止线按长思考形态放宽到下限。
