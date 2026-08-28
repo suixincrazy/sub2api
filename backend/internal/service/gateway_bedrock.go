@@ -201,29 +201,15 @@ func (s *GatewayService) executeBedrockUpstream(
 			if resp != nil && resp.Body != nil {
 				_ = resp.Body.Close()
 			}
-			safeErr := sanitizeUpstreamErrorMessage(err.Error())
-			setOpsUpstreamError(c, 0, safeErr, "")
-			appendOpsUpstreamError(c, OpsUpstreamErrorEvent{
-				Platform:           account.Platform,
-				AccountID:          account.ID,
-				AccountName:        account.Name,
-				UpstreamStatusCode: 0,
-				UpstreamURL:        safeUpstreamURL(upstreamReq.URL.String()),
-				Kind:               "request_error",
-				Message:            safeErr,
-			})
-			// 客户端主动断开：上游没有表现出任何故障，不换号也不写响应。
-			if errors.Is(err, context.Canceled) {
-				return nil, err
-			}
-			// 传输层失败与账号可用性无关，必须包成 UpstreamFailoverError 交给 handler
-			// 换号；同时不写响应，否则 handler 会把这一发当终态返回。详见
+			// 传输层失败与账号可用性无关，交给公共处理函数包成 UpstreamFailoverError
+			// 让 handler 换号；同时不写响应，否则 handler 会把这一发当终态返回。详见
 			// gateway_forward.go 中 anthropicTransportFailoverBody 的注释。
-			return nil, &UpstreamFailoverError{
-				StatusCode:   http.StatusBadGateway,
-				ResponseBody: anthropicTransportFailoverBody,
+			return nil, s.handleUpstreamTransportError(ctx, c, account, err, OpsUpstreamErrorEvent{
+				UpstreamURL: safeUpstreamURL(upstreamReq.URL.String()),
+			}, transportFailoverSpec{
 				Reason:       GatewayFailureReason("bedrock_transport"),
-			}
+				ResponseBody: anthropicTransportFailoverBody,
+			})
 		}
 
 		if resp.StatusCode >= 400 && resp.StatusCode != 400 && s.shouldRetryUpstreamError(account, resp.StatusCode) {

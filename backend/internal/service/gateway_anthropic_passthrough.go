@@ -114,26 +114,15 @@ func (s *GatewayService) forwardAnthropicAPIKeyPassthroughWithInput(
 			if resp != nil && resp.Body != nil {
 				_ = resp.Body.Close()
 			}
-			safeErr := sanitizeUpstreamErrorMessage(err.Error())
-			setOpsUpstreamError(c, 0, safeErr, "")
-			appendOpsUpstreamError(c, OpsUpstreamErrorEvent{
-				Platform:           account.Platform,
-				AccountID:          account.ID,
-				AccountName:        account.Name,
-				UpstreamStatusCode: 0,
-				UpstreamURL:        safeUpstreamURL(upstreamReq.URL.String()),
-				Passthrough:        true,
-				Kind:               "request_error",
-				Message:            safeErr,
+			// 传输层失败与账号可用性无关，交给公共处理函数包成 UpstreamFailoverError
+			// 让 handler 换号；同时不写响应。详见 gateway_forward.go 同类分支注释。
+			return nil, s.handleUpstreamTransportError(ctx, c, account, err, OpsUpstreamErrorEvent{
+				UpstreamURL: safeUpstreamURL(upstreamReq.URL.String()),
+				Passthrough: true,
+			}, transportFailoverSpec{
+				Reason:       GatewayFailureReason("anthropic_passthrough_transport"),
+				ResponseBody: anthropicTransportFailoverBody,
 			})
-			if errors.Is(err, context.Canceled) {
-				return nil, err
-			}
-			scheduleOllamaCloudUsageActivity(s.deferredService, account)
-			return nil, &UpstreamFailoverError{
-				StatusCode: http.StatusBadGateway,
-				Reason:     GatewayFailureReason("anthropic_passthrough_transport"),
-			}
 		}
 
 		// Anthropic safeguards and the provider WAF can report a request-level

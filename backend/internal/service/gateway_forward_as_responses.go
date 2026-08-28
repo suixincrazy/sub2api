@@ -144,29 +144,15 @@ func (s *GatewayService) ForwardAsResponses(
 		if resp != nil && resp.Body != nil {
 			_ = resp.Body.Close()
 		}
-		safeErr := sanitizeUpstreamErrorMessage(err.Error())
-		setOpsUpstreamError(c, 0, safeErr, "")
-		appendOpsUpstreamError(c, OpsUpstreamErrorEvent{
-			Platform:           account.Platform,
-			AccountID:          account.ID,
-			AccountName:        account.Name,
-			UpstreamStatusCode: 0,
-			Kind:               "request_error",
-			Message:            safeErr,
-		})
-		// 客户端主动断开：上游没有表现出任何故障，不换号也不写响应。
-		if errors.Is(err, context.Canceled) {
-			return nil, err
-		}
 		// 传输层失败必须走 failover（详见 gateway_forward.go 同类分支注释）。
 		// 本链路对客户端输出 OpenAI Responses 格式，错误透传规则可能原样吐出
 		// ResponseBody，故用 OpenAI 格式的错误体而非 Anthropic 的。
-		scheduleOllamaCloudUsageActivity(s.deferredService, account)
-		return nil, &UpstreamFailoverError{
-			StatusCode:   http.StatusBadGateway,
-			ResponseBody: openAITransportFailoverBody,
+		return nil, s.handleUpstreamTransportError(ctx, c, account, err, OpsUpstreamErrorEvent{
+			UpstreamURL: safeUpstreamURL(upstreamReq.URL.String()),
+		}, transportFailoverSpec{
 			Reason:       GatewayFailureReason("anthropic_forward_responses_transport"),
-		}
+			ResponseBody: openAITransportFailoverBody,
+		})
 	}
 	defer func() { _ = resp.Body.Close() }()
 

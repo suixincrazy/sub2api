@@ -397,34 +397,18 @@ func (s *GatewayService) Forward(ctx context.Context, c *gin.Context, account *A
 			if resp != nil && resp.Body != nil {
 				_ = resp.Body.Close()
 			}
-			safeErr := sanitizeUpstreamErrorMessage(err.Error())
-			setOpsUpstreamError(c, 0, safeErr, "")
-			appendOpsUpstreamError(c, OpsUpstreamErrorEvent{
-				Platform:           account.Platform,
-				AccountID:          account.ID,
-				AccountName:        account.Name,
-				UpstreamStatusCode: 0,
-				UpstreamURL:        safeUpstreamURL(upstreamReq.URL.String()),
-				Kind:               "request_error",
-				Message:            safeErr,
-			})
-			// 客户端主动断开：上游没有表现出任何故障，不换号也不写响应。
-			if errors.Is(err, context.Canceled) {
-				return nil, err
-			}
-			// Transport attempt left local validation; count Ollama Cloud activity.
-			scheduleOllamaCloudUsageActivity(s.deferredService, account)
 			// 传输层失败（代理/DNS/TCP/TLS，没拿到任何 HTTP 状态码）与账号本身的
-			// 可用性无关：同一分组里换个走别的代理的账号往往立刻就能成。这里必须
-			// 包成 UpstreamFailoverError 并且**不写响应体**，否则 handler 的
+			// 可用性无关：同一分组里换个走别的代理的账号往往立刻就能成。公共处理函数
+			// 会包成 UpstreamFailoverError 并且**不写响应体**，否则 handler 的
 			// errors.As 匹配不到 failover 错误，会把这一发直接当终态返回给客户端
 			// ——即「代理被 reset 就 502，一个号都不换」。响应由 handler 在
 			// failover 耗尽后统一写出。
-			return nil, &UpstreamFailoverError{
-				StatusCode:   http.StatusBadGateway,
-				ResponseBody: anthropicTransportFailoverBody,
+			return nil, s.handleUpstreamTransportError(ctx, c, account, err, OpsUpstreamErrorEvent{
+				UpstreamURL: safeUpstreamURL(upstreamReq.URL.String()),
+			}, transportFailoverSpec{
 				Reason:       GatewayFailureReason("anthropic_forward_transport"),
-			}
+				ResponseBody: anthropicTransportFailoverBody,
+			})
 		}
 
 		// 优先检测thinking block签名错误（400）并重试一次

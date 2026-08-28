@@ -54,34 +54,31 @@ func (u *failingOpenAIHTTPUpstream) DoWithTLS(_ *http.Request, _ string, _ int64
 	return nil, u.err
 }
 
-// A durable proxy/credential failure must (a) temporarily unschedule the account
-// so it stops being hammered, and (b) return a failover error so the handler
-// switches to a healthy account instead of writing a hard 502 itself.
-func TestHandleOpenAIUpstreamTransportError_PersistentEvictsAndFailsOver(t *testing.T) {
+// A durable proxy/credential failure must return a failover error so the handler
+// switches to a healthy account instead of writing a hard 502 itself — and must
+// NOT touch account scheduling state.
+//
+// 传输层故障（代理凭证过期、DNS 不通、TCP 被拒）说明的是这条出网路径坏了，不是账号
+// 本身没额度。摘账号只留给额度耗尽这类确实指向账号自身的信号，否则一次代理抖动会连带
+// 把一个健康账号关在池外 10 分钟，而 failover 本身已经把这一发救回来了。
+func TestHandleOpenAIUpstreamTransportError_PersistentFailsOverWithoutEviction(t *testing.T) {
 	repo := &openaiTransportAccountRepoStub{}
 	svc := &OpenAIGatewayService{accountRepo: repo}
 	account := &Account{ID: 4627, Name: "proxy-expired", Platform: PlatformOpenAI}
 	c, rec := newOpenAITransportErrTestContext()
 
-	before := time.Now()
 	retErr := svc.handleOpenAIUpstreamTransportError(context.Background(), c, account,
 		errors.New(`Post "https://chatgpt.com/backend-api/codex/responses": socks connect tcp 85.255.176.68:12324->chatgpt.com:443: username/password authentication failed`), false)
-	after := time.Now()
 
 	// Failover error (handler will switch accounts), not a direct response.
 	var fo *UpstreamFailoverError
 	require.True(t, errors.As(retErr, &fo), "persistent error must return *UpstreamFailoverError")
 	require.Equal(t, http.StatusBadGateway, fo.StatusCode)
+	require.True(t, fo.ShouldRetryNextAccount())
 
-	// Persistent → account temporarily unscheduled for ~10min, reason carries cause.
-	require.Len(t, repo.tempUnschedCalls, 1)
-	require.Equal(t, int64(4627), repo.tempUnschedCalls[0].accountID)
-	require.Contains(t, repo.tempUnschedCalls[0].reason, "authentication failed")
-	require.True(t, repo.tempUnschedCalls[0].until.After(before.Add(openAITransportErrorTempUnschedDuration-time.Second)))
-	require.True(t, repo.tempUnschedCalls[0].until.Before(after.Add(openAITransportErrorTempUnschedDuration+time.Second)))
-
-	// Immediate in-memory effect so subsequent requests skip it before DB/cache catches up.
-	require.True(t, svc.isOpenAIAccountRuntimeBlocked(account))
+	// Persistent transport fault → still no eviction, neither persisted nor in-memory.
+	require.Empty(t, repo.tempUnschedCalls, "transport fault must not unschedule the account")
+	require.False(t, svc.isOpenAIAccountRuntimeBlocked(account), "transport fault must not block the account in memory")
 
 	// Must NOT write a response body — the handler owns the (failover) response.
 	require.Equal(t, 0, rec.Body.Len())
@@ -147,20 +144,21 @@ func TestHandleOpenAIUpstreamTransportError_WrappedContextCanceled_NoFailover(t 
 	require.False(t, svc.isOpenAIAccountRuntimeBlocked(account))
 }
 
-// When accountRepo is nil (no DB), in-memory block must still happen but the
-// success log "openai.account_temp_unscheduled_transport" must NOT fire (it
-// would be misleading: the account is only blocked in memory, not persisted).
-// We verify the in-memory block occurs and no DB call is made.
-func TestTempUnscheduleOpenAITransportError_NilAccountRepo_InMemoryBlockOnly(t *testing.T) {
-	// nil accountRepo → no DB write.
+// With no DB configured the transport path must still degrade to a plain
+// failover and leave scheduling state alone — a nil accountRepo must not panic
+// and must not produce an in-memory block either.
+func TestHandleOpenAIUpstreamTransportError_NilAccountRepo_NoEviction(t *testing.T) {
 	svc := &OpenAIGatewayService{accountRepo: nil}
 	account := &Account{ID: 55, Name: "no-db", Platform: PlatformOpenAI}
+	c, _ := newOpenAITransportErrTestContext()
 
-	svc.tempUnscheduleOpenAITransportError(context.Background(), account, "proxy refused")
+	err := svc.handleOpenAIUpstreamTransportError(context.Background(), c, account,
+		errors.New(`dial tcp 1.2.3.4:443: connect: connection refused`), false)
 
-	// In-memory block must still happen.
-	require.True(t, svc.isOpenAIAccountRuntimeBlocked(account),
-		"in-memory block must apply even when accountRepo is nil")
+	var fo *UpstreamFailoverError
+	require.True(t, errors.As(err, &fo), "must still fail over without a DB")
+	require.False(t, svc.isOpenAIAccountRuntimeBlocked(account),
+		"transport fault must not block the account in memory")
 }
 
 // context.DeadlineExceeded is NOT special-cased — a slow upstream is worth failing over.
