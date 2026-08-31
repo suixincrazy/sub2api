@@ -1217,6 +1217,56 @@ type GatewayConfig struct {
 	// 超过这个下限的回合退化成放行 + 给下一发解绑，也就是这个放宽存在之前的行为，不会更差。
 	AnthropicHoldbackLongThinkingHoldMs int `mapstructure:"anthropic_holdback_long_thinking_hold_ms"`
 
+	// AnthropicHoldbackDiscardBudgetMs: 一次客户端请求允许花在丢弃重试上的累计墙钟（毫秒），
+	// 0 表示不封顶。预算吃满后即便次数额度还有余额也不再丢弃，直接放行手上这一发。
+	//
+	// 为什么次数额度不够：anthropicShortTurnDiscardBudget 数的是**丢了几次**，而客户端痛的是
+	// **等了多久**。这两个量之间隔着上游 TTFB，而 TTFB 的尾巴极长（3 天 13023 发流式回合：
+	// p50=11984ms p90=34664ms p99=126966ms max=420167ms）。所以同样丢 2 次，TTFB 好的时候
+	// 客户端等 25 秒，坏的时候等 220 秒——次数额度对后者完全无感。
+	//
+	// 2026-08-31 12:56:10 实证（client_request_id 2341b0a2，session_hash 7d8db8f1）：
+	//
+	//	12:52:30.152  请求进入，粘性命中账号 7
+	//	12:54:02.783  账号 7 判可疑（prose 1053 / out 2335）-> discarded，换号 1
+	//	12:54:54.461  账号 8 判可疑（prose  477 / out 1007）-> discarded，换号 2
+	//	12:56:10.365  账号 14 判可疑（prose  606 / out 1875）-> 额度耗尽，强制放行
+	//	12:56:10.368  200 返回，latency_ms=220299
+	//
+	// 三次尝试各自 92.6s / 51.7s / 75.9s，全程客户端零字节。次数额度（2）严格按设计工作，
+	// 代价却是 220 秒——这一条就是为了给这个代价装个闸。注意 usage_logs 那一行
+	// first_token_ms=75827 / duration_ms=75899 只覆盖**最后一次**尝试，不能拿它验证这条线。
+	//
+	// 与另外三条持流线的分工：那三条都在**一次尝试内部**度量（静默窗口量上游不说话多久，
+	// 总时长上限量持流攥了多久，死气预算量首帧后的累计持流），任何一条到点的结果是**放行**。
+	// 这一条量的是**跨尝试的累计等待**，到点的结果是**不再丢弃**。所以它既不参与
+	// effectiveHoldCap 的放宽（放宽的是「攥多久才判定」，这一条不改判定时机），也不能用
+	// AnthropicHoldbackDeadAirBudgetMs 代替——那条刻意不计首帧前的 TTFB，而 TTFB 恰恰是这里
+	// 220 秒的主要成分。
+	//
+	// 45000ms 的标定：取近 3 天 /v1/messages 的 http request completed，按请求区间内发生的
+	// anthropic_short_turn_holdback_failover 条数分档，量客户端总延迟：
+	//
+	//	丢弃次数    n_req      p50      p90      p99
+	//	     0       7192   10634ms  39954ms  160514ms
+	//	     1       1274   21008ms  70002ms  194001ms
+	//	     2       1466   24596ms  70000ms  188029ms
+	//	     3        388   43171ms 161713ms  299991ms
+	//	     4        234   48025ms 181523ms  364071ms
+	//
+	// 一次丢弃的边际代价约 10~14 秒（p50 10.6→21.0→24.6），到第 3 次 p90 从 70s 跳到 162s。
+	// 45000 落在 n_disc=2 的 p50（24596ms）之上并留一次 TTFB p50（约 12s）的余量，也就是
+	// TTFB 正常时两次丢弃照旧跑满；同时把 3 次以上那 622 发（p50 43~48s）截在门口。
+	//
+	// 退化行为是放行 + 给下一发解绑，也就是持流机制存在之前的行为，不会更差：这条线只在
+	// 「已经等了很久」时才生效，而那种情形下继续丢弃的期望收益本来就低——上游慢的时候换号
+	// 大概率还是慢。丢弃计数额度保持不变，两条判据取先到者。
+	//
+	// 块序违规（anthropicBlockOrderDiscardBudget）刻意**不**受这条线约束，理由与它不受
+	// deadAirExhausted 否决相同：那是协议层的确定性矛盾，交付等于把伪造的工具输出交给客户端，
+	// 换号不存在误伤成本。详见 anthropicHoldbackVerdict 的说明。
+	AnthropicHoldbackDiscardBudgetMs int `mapstructure:"anthropic_holdback_discard_budget_ms"`
+
 	// 是否记录上游错误响应体摘要（避免输出请求内容）
 	LogUpstreamErrorBody bool `mapstructure:"log_upstream_error_body"`
 	// 上游错误响应体记录最大字节数（超过会截断）
@@ -2670,6 +2720,7 @@ func setDefaults() {
 	viper.SetDefault("gateway.anthropic_holdback_dead_air_budget_ms", 25000)
 	// 同上，靠 GATEWAY_ANTHROPIC_HOLDBACK_LONG_THINKING_HOLD_MS 免重新构建地改。
 	viper.SetDefault("gateway.anthropic_holdback_long_thinking_hold_ms", 360000)
+	viper.SetDefault("gateway.anthropic_holdback_discard_budget_ms", 45000)
 	viper.SetDefault("gateway.scheduling.sticky_session_max_waiting", 3)
 	viper.SetDefault("gateway.scheduling.sticky_session_wait_timeout", 120*time.Second)
 	viper.SetDefault("gateway.scheduling.fallback_wait_timeout", 30*time.Second)
@@ -3593,6 +3644,21 @@ func (c *Config) Validate() error {
 	if c.Gateway.AnthropicHoldbackLongThinkingHoldMs != 0 &&
 		(c.Gateway.AnthropicHoldbackLongThinkingHoldMs < 10000 || c.Gateway.AnthropicHoldbackLongThinkingHoldMs > 420000) {
 		return fmt.Errorf("gateway.anthropic_holdback_long_thinking_hold_ms must be 0 or between 10000-420000 milliseconds")
+	}
+	if c.Gateway.AnthropicHoldbackDiscardBudgetMs < 0 {
+		return fmt.Errorf("gateway.anthropic_holdback_discard_budget_ms must be non-negative")
+	}
+	// 下界 10000：这一条量的是**跨尝试的累计等待**（含上游 TTFB），而 TTFB 自己的 p50 就有
+	// 11984ms。配到 10 秒以下等于第一次丢弃基本上就被这条线否掉，零暴露持流形同关闭，那种
+	// 意图应该显式配 0。
+	//
+	// 上界 600000：这一条不是等待上限，而是**丢弃权的截止线**——到点之后正常放行，不会让请求
+	// 继续挂着，所以配大只是让它更少生效、退回纯次数额度的旧行为，没有失控风险。600000 给
+	// 默认值（45000）留了充足上调余量，也盖得住长思考放宽（420000 上界）之后一次尝试的最坏
+	// 时长——配得比那条还小会让长思考回合刚放宽完就撞上这条线，两条设计意图互相抵消。
+	if c.Gateway.AnthropicHoldbackDiscardBudgetMs != 0 &&
+		(c.Gateway.AnthropicHoldbackDiscardBudgetMs < 10000 || c.Gateway.AnthropicHoldbackDiscardBudgetMs > 600000) {
+		return fmt.Errorf("gateway.anthropic_holdback_discard_budget_ms must be 0 or between 10000-600000 milliseconds")
 	}
 	if c.Gateway.ImageStreamDataIntervalTimeout < 0 {
 		return fmt.Errorf("gateway.image_stream_data_interval_timeout must be non-negative")

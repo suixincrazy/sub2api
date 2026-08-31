@@ -84,6 +84,7 @@ func TestAnthropicHoldbackVerdict(t *testing.T) {
 		blockOrderDiscards int
 		thinking           int
 		blockOrder         bool
+		budgetGone         bool
 		want               anthropicHoldbackDecision
 	}{
 		{
@@ -340,12 +341,62 @@ func TestAnthropicHoldbackVerdict(t *testing.T) {
 			stopReason: "end_turn", proseRunes: anthropicShortTurnProseRuneLimit + 1, outputTokens: 591,
 			want: anthropicHoldbackRelease,
 		},
+
+		// ---- 丢弃代价预算（2026-08-31 12:56:10 那条 220 秒链要治的）----
+		//
+		// 次数额度还有余额，但累计墙钟已经吃满，不能再换号：这一档正是 12:56:10 的形态，
+		// 三次尝试各 92.6s / 51.7s / 75.9s，次数额度（2）严格按设计工作，代价却是 220 秒。
+		{
+			name:       "预算吃满：次数还有余额也不再丢弃",
+			budgetGone: true,
+			stopReason: "end_turn", proseRunes: 131, outputTokens: 70,
+			want: anthropicHoldbackRelease,
+		},
+		// 反面：预算没吃满时判定一字不改，免得这条线悄悄改掉既有行为。
+		{
+			name:       "预算未吃满：短回合照旧丢弃",
+			budgetGone: false,
+			stopReason: "end_turn", proseRunes: 131, outputTokens: 70,
+			want: anthropicHoldbackDiscard,
+		},
+		// 预算是**丢弃权**的截止线，不是放行截止线：判据没齐时它不得把回合提前放出去，
+		// 否则一条本该攥住的流会因为「等太久了」而交付一个 stop_reason 为空的残缺回合。
+		{
+			name:       "预算吃满但判据没齐：照旧攥着",
+			budgetGone: true,
+			proseRunes: 12, outputTokens: 4,
+			want: anthropicHoldbackKeep,
+		},
+		// 块序违规刻意不受这条线约束：协议层的确定性矛盾，交付等于把伪造的工具输出交给客户端，
+		// 换号不存在误伤成本。理由与它不受 deadAirExhausted 否决相同。
+		{
+			name:       "预算吃满不影响块序违规",
+			budgetGone: true, blockOrder: true,
+			stopReason: "end_turn", proseRunes: 872, outputTokens: 591,
+			want: anthropicHoldbackDiscard,
+		},
+		// 与死气那条互不干涉：死气管「stop_reason 一直不来」，预算管「还要不要再换号」。
+		// stop_reason 已到时死气不参与，此时放行权由预算独占。
+		{
+			name:       "预算吃满与死气吃满同时成立：放行",
+			budgetGone: true, deadAir: true, windowGone: true,
+			stopReason: "end_turn", proseRunes: 131, outputTokens: 70,
+			want: anthropicHoldbackRelease,
+		},
+		// 预算不得让「本来就该放行」的健康回合改变结局。
+		{
+			name:       "预算吃满的健康长正文回合照旧放行",
+			budgetGone: true,
+			stopReason: "end_turn", proseRunes: anthropicShortTurnProseRuneLimit + 1, outputTokens: 2335,
+			want: anthropicHoldbackRelease,
+		},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			got := anthropicHoldbackVerdict(
 				tc.windowGone, tc.deadAir, tc.stopReason, tc.proseRunes, tc.outputTokens,
-				tc.toolUse, tc.heuristicDiscards, tc.blockOrderDiscards, tc.thinking, tc.blockOrder)
+				tc.toolUse, tc.heuristicDiscards, tc.blockOrderDiscards, tc.thinking, tc.blockOrder,
+				tc.budgetGone)
 			require.Equal(t, tc.want, got)
 		})
 	}
@@ -641,6 +692,49 @@ func TestAnthropicHoldbackReleaseDeadlineTakesEarlierOfThree(t *testing.T) {
 		"上限那条不受新帧影响，仍然是先到的那个")
 	require.Equal(t, base.Add(20*time.Second), o.holdbackDeadAirDeadline(25*time.Second),
 		"累计预算同样不受新帧影响")
+}
+
+// 2026-08-31 12:56:10 那条 220 秒链的回归用例：丢弃代价预算的锚点必须 write-once。
+//
+// 为什么锚点不能每次尝试重置：本函数所在的透传入口每次账号尝试调用一次，如果锚点跟着重置，
+// 预算量的就变成「单次尝试耗时」，跨 failover 的累计封顶整体失效——而 12:56:10 那一发恰恰是
+// 三次尝试各自都不算久（92.6s / 51.7s / 75.9s）、累计却到 220 秒。
+//
+// 与 anthropicHoldbackElapsedKey 的口径差异也在这里体现：那一条从第一帧合法 SSE 起算、刻意
+// 不含上游 TTFB，这一条从进入透传起算、TTFB 全程计入。12:56:10 三次尝试的 TTFB 分别是
+// 92.6s 里的大头，用那条口径量不出来。
+func TestAnthropicDiscardBudgetAnchorIsWriteOnce(t *testing.T) {
+	c, _ := newRefusalTestContext(t)
+	base := time.Date(2026, 8, 31, 12, 52, 30, 0, time.UTC)
+
+	// 锚点未钉时返回 0，让预算判据整体退化成「不限制」，也就是改动前的行为。
+	require.Zero(t, anthropicDiscardBudgetElapsed(c, base), "没有锚点时不得凭空产生已用时长")
+	require.Zero(t, anthropicDiscardBudgetElapsed(nil, base), "nil Context 不得 panic")
+
+	// 第一次尝试钉下锚点。
+	noteAnthropicDiscardBudgetStart(c, base)
+	require.Equal(t, 92*time.Second+600*time.Millisecond,
+		anthropicDiscardBudgetElapsed(c, base.Add(92*time.Second+600*time.Millisecond)),
+		"第一次尝试判定时已经烧掉 92.6 秒")
+
+	// 换号重试试图改写锚点——必须无效，否则累计口径塌成单次口径。
+	secondAttemptAt := base.Add(92*time.Second + 631*time.Millisecond)
+	noteAnthropicDiscardBudgetStart(c, secondAttemptAt)
+	require.Equal(t, 144*time.Second+309*time.Millisecond,
+		anthropicDiscardBudgetElapsed(c, base.Add(144*time.Second+309*time.Millisecond)),
+		"第二次尝试判定时是从请求起点算的 144.3 秒，不是本次尝试的 51.7 秒")
+
+	// 第三次尝试同理；到这里 220.2 秒，45 秒预算早已吃满，判据会放行手上这一发。
+	noteAnthropicDiscardBudgetStart(c, base.Add(144*time.Second+465*time.Millisecond))
+	elapsed := anthropicDiscardBudgetElapsed(c, base.Add(220*time.Second+213*time.Millisecond))
+	require.Equal(t, 220*time.Second+213*time.Millisecond, elapsed)
+	require.Greater(t, elapsed, 45*time.Second, "默认预算 45s，这条链在第二次尝试前就该被截住")
+
+	// 零值与时钟回拨不得产生负值或错误的已用时长。
+	require.Zero(t, anthropicDiscardBudgetElapsed(c, base.Add(-time.Second)), "时钟回拨时按 0 算")
+	fresh, _ := newRefusalTestContext(t)
+	noteAnthropicDiscardBudgetStart(fresh, time.Time{})
+	require.Zero(t, anthropicDiscardBudgetElapsed(fresh, base), "零值锚点不得被钉上")
 }
 
 // 2026-08-25 14:26:26 / 14:33:58 两发的回归用例：实际持流时间必须跨 failover 尝试累加。

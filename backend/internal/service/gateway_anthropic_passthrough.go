@@ -94,6 +94,10 @@ func (s *GatewayService) forwardAnthropicAPIKeyPassthroughWithInput(
 
 	var resp *http.Response
 	retryStart := time.Now()
+	// 丢弃代价预算的锚点。这里是本次客户端请求第一次进入透传的时刻：本函数每次账号尝试调用
+	// 一次，而 noteAnthropicDiscardBudgetStart 是 write-once，所以换号重试改不动它，累计口径
+	// 因此跨 failover 成立。见 GatewayConfig.AnthropicHoldbackDiscardBudgetMs。
+	noteAnthropicDiscardBudgetStart(c, retryStart)
 	for attempt := 1; attempt <= maxRetryAttempts; attempt++ {
 		upstreamCtx, releaseUpstreamCtx := detachStreamUpstreamContext(ctx, input.RequestStream)
 		upstreamReq, wireBody, err := s.buildUpstreamRequestAnthropicAPIKeyPassthrough(upstreamCtx, c, account, input.Body, token)
@@ -734,8 +738,15 @@ const (
 // 的终止证据。拿到 stop_reason 后必须先判断这一回合是否可疑，否则慢 TTFB 恰好跨过预算时，
 // 后续的短回合会被错误放行。
 //
+// discardBudgetExhausted 是丢弃代价的封顶：本次客户端请求已经在丢弃重试上烧掉的累计墙钟
+// 超过 GatewayConfig.AnthropicHoldbackDiscardBudgetMs。它与 heuristicDiscardsUsed 那道次数
+// 闸门取先到者——次数数的是丢了几次，这一条量的是客户端等了多久，两者之间隔着上游 TTFB，
+// 而 TTFB 的尾巴极长（p99 127s），所以同样丢 2 次可能是 25 秒也可能是 220 秒。到点之后
+// 即便次数还有余额也放行手上这一发，退化成「放行 + 给下一发解绑」，也就是持流存在之前的
+// 行为，不会更差。标定见 GatewayConfig.AnthropicHoldbackDiscardBudgetMs。
+//
 // blockOrderViolation 是唯一一条**排在所有提前放行出口之前**的判据，而且刻意不受
-// deadAirExhausted 否决。理由是这一条与其余判据的性质不同：
+// deadAirExhausted 与 discardBudgetExhausted 否决。理由是这一条与其余判据的性质不同：
 //   - 其余判据是启发式，量的是「这一回合看起来是不是没说完」，误判就会误伤健康账号，
 //     所以要让位给延迟；块序违规是协议层的确定性矛盾，为它换号不存在误伤成本。
 //   - 交付一条块序违规的响应不是「答案短了点」，而是把伪造的工具输出交给客户端。Claude Code
@@ -756,6 +767,7 @@ func anthropicHoldbackVerdict(
 	blockOrderDiscardsUsed int,
 	thinkingRunes int,
 	blockOrderViolation bool,
+	discardBudgetExhausted bool,
 ) anthropicHoldbackDecision {
 	if blockOrderViolation && blockOrderDiscardsUsed < anthropicBlockOrderDiscardBudget {
 		return anthropicHoldbackDiscard
@@ -772,7 +784,8 @@ func anthropicHoldbackVerdict(
 	// stop_reason 已知时判定是确定的，优先于窗口：窗口只是「等不起了」的兜底，
 	// 而这里已经拿到了全部判据。
 	if strings.TrimSpace(stopReason) != "" {
-		if anthropicTurnLooksSuspiciouslyShort(stopReason, proseRunes, outputTokens, sawToolUseBlock, thinkingRunes) &&
+		if !discardBudgetExhausted &&
+			anthropicTurnLooksSuspiciouslyShort(stopReason, proseRunes, outputTokens, sawToolUseBlock, thinkingRunes) &&
 			heuristicDiscardsUsed < anthropicHoldbackDiscardBudget(stopReason, proseRunes, outputTokens, sawToolUseBlock) {
 			return anthropicHoldbackDiscard
 		}
@@ -1860,6 +1873,44 @@ func noteAnthropicHoldbackElapsed(c *gin.Context, elapsed time.Duration) {
 	}
 }
 
+// anthropicDiscardBudgetStartKey 记录本次客户端请求第一次进入透传分支的时刻。
+//
+// 与 anthropicHoldbackElapsedKey 的口径**相反**，两者不能互相替代：那一条刻意排除上游
+// TTFB，因为它服务的是「扣住可提交帧多久」这个问题，慢 TTFB 不该消耗持流预算；这一条量的
+// 是「客户端从发出请求到现在一个字节都没拿到多久」，TTFB 是这段等待里最大的一块，必须计入。
+//
+// 放在 gin.Context 上，跨账号重试共享同一个值，作用域与丢弃计数一致。
+const anthropicDiscardBudgetStartKey = "anthropic_discard_budget_start"
+
+// anthropicDiscardBudgetElapsed 给出本次客户端请求已经等了多久。锚点缺失时返回 0，
+// 让预算判据整体退化成「不限制」，也就是改动前的行为。
+func anthropicDiscardBudgetElapsed(c *gin.Context, now time.Time) time.Duration {
+	if c == nil {
+		return 0
+	}
+	v, ok := c.Get(anthropicDiscardBudgetStartKey)
+	if !ok {
+		return 0
+	}
+	start, ok := v.(time.Time)
+	if !ok || start.IsZero() || !now.After(start) {
+		return 0
+	}
+	return now.Sub(start)
+}
+
+// noteAnthropicDiscardBudgetStart 在第一次尝试时钉下锚点，之后的重试不得改写它 ——
+// 每次尝试都重置就等于把预算变成「单次尝试耗时」，跨 failover 的累计封顶会整体失效。
+func noteAnthropicDiscardBudgetStart(c *gin.Context, at time.Time) {
+	if c == nil || at.IsZero() {
+		return
+	}
+	if _, ok := c.Get(anthropicDiscardBudgetStartKey); ok {
+		return
+	}
+	c.Set(anthropicDiscardBudgetStartKey, at)
+}
+
 const anthropicShortTurnHoldbackMessage = "Anthropic upstream ended the turn after an unusually short reply"
 
 func anthropicShortTurnHoldbackErrorBody() []byte {
@@ -2225,6 +2276,15 @@ func (s *GatewayService) handleStreamingResponseAnthropicAPIKeyPassthrough(
 	if holdbackActive && s.cfg != nil && s.cfg.Gateway.AnthropicHoldbackLongThinkingHoldMs > 0 {
 		holdbackLongThinkingFloor = time.Duration(s.cfg.Gateway.AnthropicHoldbackLongThinkingHoldMs) * time.Millisecond
 	}
+	// 丢弃代价预算：跨尝试累计的墙钟上限，到点后不再丢弃、直接放行手上这一发。它与上面三条
+	// 的性质不同——那三条到点的结果是**放行**（管的是攥多久才判定），这一条到点的结果是
+	// **不再丢弃**（管的是还要不要为这次判定换号重来），所以它刻意不进 effectiveHoldCap 的
+	// 放宽。窗口配 0（整个机制关掉）时同样不参与。
+	// 见 GatewayConfig.AnthropicHoldbackDiscardBudgetMs。
+	holdbackDiscardBudget := time.Duration(0)
+	if holdbackActive && s.cfg != nil && s.cfg.Gateway.AnthropicHoldbackDiscardBudgetMs > 0 {
+		holdbackDiscardBudget = time.Duration(s.cfg.Gateway.AnthropicHoldbackDiscardBudgetMs) * time.Millisecond
+	}
 	holdback := &anthropicHoldbackObserver{
 		holdbackElapsedBefore: anthropicHoldbackElapsedBefore(c),
 		longThinkingHoldFloor: holdbackLongThinkingFloor,
@@ -2521,6 +2581,7 @@ func (s *GatewayService) handleStreamingResponseAnthropicAPIKeyPassthrough(
 						holdback.stopReason, holdback.proseRunes, holdback.outputTokens,
 						holdback.sawToolUseBlock, holdbackDiscardsUsed, blockOrderDiscardsUsed, holdback.thinkingRunes,
 						holdback.blockOrder.violation(),
+						holdbackDiscardBudget > 0 && anthropicDiscardBudgetElapsed(c, now) >= holdbackDiscardBudget,
 					) {
 					case anthropicHoldbackKeep:
 						commitPrelude = false
@@ -2878,6 +2939,14 @@ func (s *GatewayService) discardNonStreamTurnIfSuspicious(
 	if c == nil || c.Request == nil || c.Request.Context().Err() != nil {
 		return nil
 	}
+	// 丢弃代价预算在这里**适用**，与三条截止线相反：那三条量的是「攥多久才判定」，非流式
+	// 到手即可判定所以全不适用；而这一条量的是「跨尝试累计等了多久，还要不要再换号重来」，
+	// 非流式的换号代价与流式完全相同——一次白烧的上游调用加一次新的 TTFB。
+	discardBudgetExhausted := false
+	if s.cfg.Gateway.AnthropicHoldbackDiscardBudgetMs > 0 {
+		budget := time.Duration(s.cfg.Gateway.AnthropicHoldbackDiscardBudgetMs) * time.Millisecond
+		discardBudgetExhausted = anthropicDiscardBudgetElapsed(c, time.Now()) >= budget
+	}
 	shape := anthropicNonStreamTurnShapeFromBody(body)
 	verdict := anthropicHoldbackVerdict(
 		true, false,
@@ -2885,6 +2954,7 @@ func (s *GatewayService) discardNonStreamTurnIfSuspicious(
 		shape.sawToolUseBlock,
 		anthropicHoldbackDiscardsUsed(c), anthropicBlockOrderDiscardsUsed(c),
 		shape.thinkingRunes, shape.blockOrder.violation(),
+		discardBudgetExhausted,
 	)
 	if verdict != anthropicHoldbackDiscard {
 		return nil
