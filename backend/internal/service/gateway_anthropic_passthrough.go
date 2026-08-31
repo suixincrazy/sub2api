@@ -680,9 +680,22 @@ const (
 	// 所以放行」的签名。一次性额度的隐含假设是「第二个号大概率是好的」，而实测同时坏掉两个
 	// 号是常态，所以这个假设不成立。
 	//
-	// 上限仍然远小于池子（当前 8 个可调度透传账号）：最坏情况用掉 3 个号就放行，
+	// 2026-08-31 重标到 4（原值 2）。上面那条「同时坏掉两个号是常态」的标定被同一天的
+	// 16:50-16:51 链推翻：client_request_id 0c1c7217 里三个号连着给出同一形态，
+	// 16:50:45 账号 14（prose 128 / out 59）丢弃、16:51:08 账号 8（prose 87 / out 39）
+	// 丢弃、16:51:49 账号 7（prose 98 / out 41）就因为额度耗尽而 disposition=delivered，
+	// latency_ms=79826。同一天 16:03:20（lat=183747）、16:32:17（out=12）同签名。
+	//
+	// 原注释给的上限理由——「用户问的问题本来就只有一句话的答案」——在带工具的 agent 流量
+	// 里不成立：这类回合几乎必然要发 tool_use，一个 41 token 的 end_turn 没有合法解释，
+	// 它的实际形态是上游把 tool_use 块丢了、回合合法地收尾在一句话上。所以真短答案这个
+	// 保护对象在这里根本不出现，额度可以按「连续坏号能有多长」来定。
+	//
+	// 上限仍然远小于池子（当前 8 个可调度透传账号）：最坏情况用掉 5 个号就放行，
 	// FailedAccountIDs 不会被掏空，因此额度耗尽退化成放行而不是 502。
-	anthropicShortTurnDiscardBudget = 2
+	// 放宽次数带来的墙钟代价由 GatewayConfig.AnthropicHoldbackDiscardBudgetMs 那条
+	// 累计墙钟封顶接住：次数管「换几次号」，墙钟管「总共烧多久」，两条独立。
+	anthropicShortTurnDiscardBudget = 4
 	// anthropicEmptyAnswerDiscardBudget 一次客户端请求里，「零正文」回合最多丢弃几次。
 	//
 	// 刻意比 anthropicShortTurnDiscardBudget 宽：那条上限的全部理由是保护「真的只有一句话
@@ -695,11 +708,19 @@ const (
 	// 第一个坏号把额度吃光，第二个坏号的空响应就必然放行，窗口调到多大都没用。
 	//
 	// 仍然留上限而不是无限重试：空回合这一档会走 HandleStreamTruncated 把账号冷却一分钟，
-	// 每丢弃一次池子就小一圈，3 次足以跨过连续两个坏号（实测最长连击是 2）。额度耗尽后是
-	// 退化成放行（等于今天的行为），不会新增 502；只有池子先被 FailedAccountIDs 掏空才会
-	// 走到 502（当前 8 个可调度透传账号，3 次远够不着），那时带明确错误体的 502 也比一个
-	// 空的 200 诚实。
-	anthropicEmptyAnswerDiscardBudget = 3
+	// 每丢弃一次池子就小一圈。额度耗尽后是退化成放行（等于今天的行为），不会新增 502；
+	// 只有池子先被 FailedAccountIDs 掏空才会走到 502（当前 8 个可调度透传账号，5 次仍够不着），
+	// 那时带明确错误体的 502 也比一个空的 200 诚实。
+	//
+	// 2026-08-31 从 3 重标到 5，两条理由：
+	//   - 原标定「3 次足以跨过连续两个坏号（实测最长连击是 2）」被同一天的 16:50-16:51 链
+	//     推翻，实测最长连击是 3（详见 anthropicShortTurnDiscardBudget 的实证）。
+	//   - 必须严格大于 anthropicShortTurnDiscardBudget，这是上面「刻意比它宽」那句话的
+	//     可执行形式。两档共用同一个计数器（anthropicHoldbackDiscardsKey），一旦空回合额度
+	//     小于短回合额度，「为空回合丢满之后短回合仍然继续丢」就会成立，短回合上限的保护被
+	//     空回合那一档悄悄绕过。TestAnthropicHoldbackVerdict/空回合丢满之后短回合不再丢
+	//     钉的就是这个不变量，改动其中任一档都必须同时复核另一档。
+	anthropicEmptyAnswerDiscardBudget = 5
 )
 
 // anthropicHoldbackDecision 是提交窗口内对「这一帧之后怎么办」的三态判定。
@@ -1402,10 +1423,20 @@ func (s *GatewayService) noteAnthropicShortTurnStreak(
 	if !ok {
 		return false
 	}
+	// 计数写失败按「已达阈值」降级，而不是放弃解绑。
+	//
+	// 2026-08-31 实证：三次 sticky_short_turn_incr_failed（16:03:51 / 16:13:43 / 16:32:48）
+	// 全都紧跟在一个断流点后面。原先这里 return false，调用方据此既不解绑也不冷却账号，
+	// 于是刚刚给出残缺回合的坏号被原样留给下一发，客户端连着撞同一个号。
+	//
+	// 降级不改变语义：anthropicShortTurnStreakThreshold = 1，正常路径本来也是一次观测就
+	// 解绑，计数只是为阈值 > 1 的将来留的余量。误判代价仅是丢一次 prompt cache，远小于
+	// 把坏号留在会话上。
 	streak, err := store.IncrStickyShortTurnStreak(ctx, groupID, sessionKey, stickySessionTTL)
 	if err != nil {
-		slog.Warn("sticky_short_turn_incr_failed", "account_id", account.ID, "error", err)
-		return false
+		slog.Warn("sticky_short_turn_incr_failed",
+			"account_id", account.ID, "error", err, "degraded", "treat_as_threshold_reached")
+		streak = anthropicShortTurnStreakThreshold
 	}
 	if streak < anthropicShortTurnStreakThreshold {
 		slog.Info("sticky_short_turn_observed",
