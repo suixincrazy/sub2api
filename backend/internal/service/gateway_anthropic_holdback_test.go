@@ -2187,7 +2187,7 @@ func TestAnthropicPassthrough_HoldbackLongProseReleasesWithoutFailover(t *testin
 	const groupID = int64(1)
 	cache := newShortTurnStreakCache(sessionKey, 9)
 	svc, _ := newHoldbackTestGatewayService(t, cache, 5000)
-	svc.cfg.Gateway.AnthropicHoldbackMaxHoldMs = 200
+	svc.cfg.Gateway.AnthropicHoldbackMaxHoldMs = 2000
 	svc.cfg.Gateway.AnthropicHoldbackDeadAirBudgetMs = 0
 	svc.cfg.Gateway.AnthropicHoldbackLongThinkingHoldMs = 20000
 
@@ -2199,13 +2199,17 @@ func TestAnthropicPassthrough_HoldbackLongProseReleasesWithoutFailover(t *testin
 		`data: {"type":"content_block_stop","index":0}`,
 		`data: {"type":"content_block_start","index":1,"content_block":{"type":"text","text":""}}`,
 	}
-	// 9 rune × 150 = 1350 rune，越过 anthropicShortTurnProseRuneLimit(1300)。
-	for i := 0; i < 150; i++ {
+	// 帧数由常量推导，不再硬编码：2026-08-31 把上限从 1300 抬到 2600 时，原先写死的
+	// 「150 帧 × 9 rune = 1350」已经落回上限之内，这条用例会在无人察觉的情况下失去前提
+	// （它要证的是「越过上限就放行」，正文没越过上限时证的是另一回事）。
+	const runesPerDelta = 9 // "这一段还在往下写。"
+	deltaCount := anthropicShortTurnProseRuneLimit/runesPerDelta + 2
+	for i := 0; i < deltaCount; i++ {
 		events = append(events,
 			`data: {"type":"content_block_delta","index":1,"delta":{"type":"text_delta","text":"这一段还在往下写。"}}`)
 	}
-	// 整条流约 155ms，短于 200ms 的总时长上限：这样一来放行只可能来自正文上限那条出口，
-	// 不会被定时器抢先，否则这条用例证不出想证的东西。
+	// 整条流约 (deltaCount+5)ms，远短于上面那条 2000ms 的总时长上限：这样一来放行只可能
+	// 来自正文上限那条出口，不会被定时器抢先，否则这条用例证不出想证的东西。
 	resp := &http.Response{
 		StatusCode: http.StatusOK,
 		Header:     http.Header{"Content-Type": []string{"text/event-stream"}},
