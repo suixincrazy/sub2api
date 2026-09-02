@@ -49,9 +49,21 @@ func (s *GatewayService) shouldRetryUpstreamError(account *Account, statusCode i
 }
 
 // shouldFailoverUpstreamError determines whether an upstream error should trigger account failover.
+//
+// 402/405 与 401/403 同类：都是「这个账号（或它背后的中转站）这条链路本身不通」，
+// 与请求内容无关，换一个账号往往立刻就能成，所以必须换号而不是把终态 502 甩给客户端。
+//   - 405：中转站的 nginx / 网关根本没把 POST /v1/messages 挂上去（实测第三方中转
+//     直接回 `405 Not Allowed` 的 nginx HTML 页）。这是端点级故障。
+//   - 402：中转站欠费 / 额度耗尽，纯账号级状态。
+//
+// 400/404 保持终态：它们由请求本身决定，换号只会把同一个错误重放 N 遍。
+// 这份名单必须与 OpenAIGatewayService.shouldFailoverUpstreamError 一致——两条链路
+// 各有一份独立白名单，历史上就是因为只补了 OpenAI 侧，Anthropic 侧的 405 一直落到
+// handleErrorResponse 返回裸 error，handler 的 errors.As 匹配不到 UpstreamFailoverError，
+// 账号既不进 FailedAccountIDs 也不推进 SwitchCount，于是低优先级档永远轮不到。
 func (s *GatewayService) shouldFailoverUpstreamError(statusCode int) bool {
 	switch statusCode {
-	case 401, 403, 429, 529:
+	case 401, 402, 403, 405, 429, 529:
 		return true
 	default:
 		return statusCode >= 500
