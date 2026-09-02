@@ -76,6 +76,23 @@ func TestProbeOpenAIAPIKeyResponsesSupport_InconclusiveResponseKeepsUnknown(t *t
 			name: "failed_status_on_http_200",
 			body: `{"status":"failed","error":{"code":"server_error","message":"upstream hiccup"},"output":[]}`,
 		},
+		{
+			// 阿里云 WAF 对被挑战的出口 IP 在所有路径上都回 200 + captcha HTML。
+			// 请求没到上游的 Responses 实现，落标 false 会把账号永久钉在 CC 上。
+			name: "waf_challenge_html_on_http_200",
+			body: `<!doctype html><meta charset="UTF-8">` +
+				`<meta name="aliyun_waf_aa" content="ff926c7f07e45e2e487a29a6197d3460">` +
+				`<title></title><script>!function(){}()</script>`,
+		},
+		{
+			// 响应体被 responsesProbeMaxBodyBytes 截断后不是完整 JSON，同样没有证据。
+			name: "truncated_json_on_http_200",
+			body: `{"status":"completed","output":[{"type":"function_ca`,
+		},
+		{
+			name: "empty_body_on_http_200",
+			body: ``,
+		},
 	}
 
 	for _, tc := range cases {
@@ -123,6 +140,14 @@ func TestProbeOpenAIAPIKeyResponsesSupport_ConclusiveResponsesStillPersist(t *te
 			want:   true,
 		},
 		{
+			// 端点在，但回的是 Chat Completions 形状而非 Responses 形状：这是有效的
+			// 「不支持 Responses」证据，是 JSON 对象就照样下结论，不能被非 JSON 放行规则捎带。
+			name:   "chat_completions_shaped_body",
+			status: http.StatusOK,
+			body:   `{"object":"chat.completion","choices":[{"message":{"content":"hi"}}]}`,
+			want:   false,
+		},
+		{
 			name:   "endpoint_absent_404",
 			status: http.StatusNotFound,
 			body:   `{"error":{"message":"Not Found"}}`,
@@ -161,8 +186,13 @@ func TestResponsesProbeVerdictIsConclusive(t *testing.T) {
 		{"200_incomplete_without_reason", 200, `{"status":"incomplete"}`, true},
 		{"200_failed", 200, `{"status":"failed"}`, false},
 		{"200_no_status_field", 200, `{"output":[]}`, true},
-		{"200_non_json", 200, `not-json`, true},
-		{"200_empty_body", 200, ``, true},
+		// 2xx 但响应体不是 JSON 对象：没到上游 Responses 实现，不下结论。
+		{"200_non_json", 200, `not-json`, false},
+		{"200_html_waf_page", 200, `<!doctype html><meta name="aliyun_waf_aa" content="x">`, false},
+		{"200_truncated_json", 200, `{"status":"completed","output":[{"type":"functio`, false},
+		{"200_json_array", 200, `[{"status":"completed"}]`, false},
+		{"200_json_string", 200, `"completed"`, false},
+		{"200_empty_body", 200, ``, false},
 		// 非 2xx 只看状态码，不读 body。
 		{"404_ignores_body_status", 404, `{"status":"failed"}`, true},
 		{"500_ignores_body_status", 500, `{"status":"incomplete","incomplete_details":{"reason":"max_output_tokens"}}`, true},

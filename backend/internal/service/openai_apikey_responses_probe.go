@@ -208,11 +208,20 @@ func (s *AccountTestService) ProbeOpenAIAPIKeyResponsesSupport(ctx context.Conte
 	// 改走 /v1/chat/completions —— 对 Codex 客户端意味着 prompt 缓存前缀被打散。
 	// 宁可不写，让请求继续走既有的 Responses 路径。
 	if !responsesProbeVerdictIsConclusive(resp.StatusCode, bodyBytes) {
+		// 响应体不是 JSON 对象时 response_status / reason 都是空串，日志里看不出发生了
+		// 什么。附上体长与开头片段——那种响应体是拦截页/错误页，不含模型输出，却是运维
+		// 唯一能据此定位问题（如 WAF 挑战页）的信息。
+		bodyPrefix := ""
+		bodyIsJSONObject := responsesProbeBodyIsJSONObject(bodyBytes)
+		if !bodyIsJSONObject {
+			bodyPrefix = responsesProbeBodyPrefix(bodyBytes)
+		}
 		logger.LegacyPrintf("service.openai_probe",
-			"probe_inconclusive_keep_unknown: account_id=%d base_url=%s probe_model=%s status=%d response_status=%s reason=%s",
+			"probe_inconclusive_keep_unknown: account_id=%d base_url=%s probe_model=%s status=%d response_status=%s reason=%s body_json_object=%v body_len=%d body_prefix=%q",
 			accountID, normalizedBaseURL, probeModel, resp.StatusCode,
 			gjson.GetBytes(bodyBytes, "status").String(),
 			gjson.GetBytes(bodyBytes, "incomplete_details.reason").String(),
+			bodyIsJSONObject, len(bodyBytes), bodyPrefix,
 		)
 		return
 	}
@@ -250,6 +259,11 @@ func (s *AccountTestService) ProbeOpenAIAPIKeyResponsesSupport(ctx context.Conte
 //
 // 2xx 分支靠「output 里有没有 function_call」下结论，但这只在响应真的跑完时成立：
 //
+//   - 响应体不是 JSON 对象：请求根本没到达上游的 Responses 实现。WAF / CDN 的拦截页、
+//     反爬挑战页、门户登录页，以及被 responsesProbeMaxBodyBytes 截断的超长响应，都会以
+//     HTTP 200 携带 HTML 或空体返回（实测：阿里云 WAF 对被挑战的出口 IP 在所有路径上
+//     一律回 200 + captcha HTML）。这类响应里当然找不到 function_call，据此落标 false
+//     会把账号永久钉死在 /v1/chat/completions 上，而端点本身可能完全正常。
 //   - status=incomplete 且 incomplete_details.reason=max_output_tokens：探测请求自己
 //     只给了 openaiResponsesProbeMaxOutputTokens 的预算，推理型模型可能把预算全烧在
 //     reasoning 上，还没轮到 function_call 就被截断。此时「没有 function_call」是探测
@@ -257,13 +271,17 @@ func (s *AccountTestService) ProbeOpenAIAPIKeyResponsesSupport(ctx context.Conte
 //   - status=failed：HTTP 200 携带的失败响应（上游瞬时故障）同样不构成能力证据。
 //
 // 其余 2xx 一律可下结论——尤其 status=completed 却只回 reasoning 的上游（火山方舟
-// coding/v3 × kimi-k2.6），仍按原逻辑判为不支持。
+// coding/v3 × kimi-k2.6），仍按原逻辑判为不支持；回 Chat Completions 形状（choices[]）
+// 而不是 Responses 形状的上游也是有效证据，它是 JSON 对象，照样下结论。
+// 缺少 status 字段的 JSON 对象（第三方兼容上游常见）同样按可下结论处理。
 //
 // 非 2xx 的结论只看状态码、不依赖响应内容，恒可下结论。
-// 缺少 status 字段的响应体（含非 JSON）也按可下结论处理，保持既有行为。
 func responsesProbeVerdictIsConclusive(status int, body []byte) bool {
 	if status < 200 || status >= 300 {
 		return true
+	}
+	if !responsesProbeBodyIsJSONObject(body) {
+		return false
 	}
 	switch strings.TrimSpace(gjson.GetBytes(body, "status").String()) {
 	case "failed":
@@ -273,6 +291,27 @@ func responsesProbeVerdictIsConclusive(status int, body []byte) bool {
 	default:
 		return true
 	}
+}
+
+// responsesProbeBodyIsJSONObject 判断探测响应体是否为可完整解析的 JSON 对象。
+// HTML 拦截页、纯文本、空体、被截断的 JSON 都返回 false——它们不承载任何关于上游
+// Responses 能力的信息。
+func responsesProbeBodyIsJSONObject(body []byte) bool {
+	if !gjson.ValidBytes(body) {
+		return false
+	}
+	return gjson.ParseBytes(body).IsObject()
+}
+
+// responsesProbeBodyPrefix 取响应体开头一段用于日志诊断，并剔除非法 UTF-8，
+// 避免把二进制字节直接灌进日志。
+func responsesProbeBodyPrefix(body []byte) string {
+	const maxPrefixBytes = 160
+	trimmed := bytes.TrimSpace(body)
+	if len(trimmed) > maxPrefixBytes {
+		trimmed = trimmed[:maxPrefixBytes]
+	}
+	return strings.ToValidUTF8(string(trimmed), "")
 }
 
 // isResponsesEndpointSupportedByStatus 根据探测响应的 HTTP 状态码判定上游
