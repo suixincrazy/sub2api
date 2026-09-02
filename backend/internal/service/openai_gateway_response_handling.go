@@ -1456,10 +1456,18 @@ func (s *OpenAIGatewayService) bindHTTPResponseAccount(ctx context.Context, c *g
 	}
 	groupID := getOpenAIGroupIDFromContext(c)
 	ttl := s.openAIWSResponseStickyTTL()
-	logOpenAIWSBindResponseAccountWarn(groupID, account.ID, responseID, store.BindResponseAccount(ctx, groupID, responseID, account.ID, ttl))
+	// 这两笔写入发生在响应体已经写完之后，是「下一轮带 previous_response_id 续链时怎么选号」
+	// 的事后记账，而不是本轮响应的一部分。请求 ctx 此刻常常已经取消（客户端拿到结果就断开、
+	// gin 收尾），继续沿用它会让 Redis 写入以 context canceled 失败、绑定静默丢失 —— 线上
+	// 已实测到过。因此在这里与请求生命周期脱钩，只保留一个短超时兜住 Redis 卡住的情况。
+	// 注意 store 内部每次 Redis 调用还会各自再叠一层同样长度的超时，这里的超时是给整个
+	// 绑定动作（两笔写入）封顶，两者取先到者。
+	bindCtx, cancelBind := context.WithTimeout(context.WithoutCancel(ctx), openAIWSStateStoreRedisTimeout)
+	defer cancelBind()
+	logOpenAIWSBindResponseAccountWarn(groupID, account.ID, responseID, store.BindResponseAccount(bindCtx, groupID, responseID, account.ID, ttl))
 	if rawOwner, ok := c.Get(openAIHTTPResponseOwnerContextKey); ok {
 		if owner, ok := rawOwner.(openAIHTTPResponseOwner); ok && owner.userID > 0 && owner.apiKeyID > 0 {
-			if err := s.BindOpenAIHTTPResponseOwner(ctx, groupID, responseID, owner.userID, owner.apiKeyID); err != nil {
+			if err := s.BindOpenAIHTTPResponseOwner(bindCtx, groupID, responseID, owner.userID, owner.apiKeyID); err != nil {
 				logger.L().Warn(
 					"openai.http_bind_response_owner_failed",
 					zap.Int64("group_id", groupID),
