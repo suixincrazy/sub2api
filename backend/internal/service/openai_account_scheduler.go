@@ -661,6 +661,9 @@ type openAIAccountCandidateScore struct {
 	errorRate float64
 	ttft      float64
 	hasTTFT   bool
+	// tieBreak 是「同分同负载同 LRU 桶」时的每请求随机名次，用来顶掉按账号 ID 升序的
+	// 固定偏好。0 表示未赋值（管理端分数快照、compact 重试等非调度路径），此时退回按 ID。
+	tieBreak uint64
 }
 
 type openAIAccountCandidateHeap []openAIAccountCandidateScore
@@ -694,6 +697,28 @@ func (h *openAIAccountCandidateHeap) Pop() any {
 	return last
 }
 
+// openAILastUsedRotationBucket 把账号的 LastUsedAt 量化成 lastUsedGroupTolerance 宽的桶，
+// 作为 LRU 排序键。
+//
+// 为什么是量化而不是像 Anthropic 侧那样「精确比较 + 事后按容差分组打散」：本函数的返回值
+// 直接进 comparator，而 comparator 同时被最小堆和 sort.Slice 使用，必须是严格弱序。成对的
+// 容差判定（|a-b| <= tol 即同组）不满足传递性，塞进 comparator 会破坏排序不变式；量化是
+// 等价关系，天然传递。桶宽复用 gateway.scheduling.rotate_last_used_bucket，与 Anthropic 侧
+// 同一个旋钮。
+//
+// LastUsedAt 为 nil 表示从未被调度过，排在最前（与 sortAccountsByPriorityAndLastUsed 同口径）。
+func openAILastUsedRotationBucket(account *Account) int64 {
+	if account == nil || account.LastUsedAt == nil {
+		return math.MinInt64
+	}
+	tolerance := lastUsedGroupTolerance
+	if tolerance <= 0 {
+		// 0 表示回到「同一秒」的旧行为。
+		return account.LastUsedAt.Unix()
+	}
+	return account.LastUsedAt.UnixNano() / int64(tolerance)
+}
+
 func isOpenAIAccountCandidateBetter(left openAIAccountCandidateScore, right openAIAccountCandidateScore) bool {
 	if left.score != right.score {
 		return left.score > right.score
@@ -706,6 +731,18 @@ func isOpenAIAccountCandidateBetter(left openAIAccountCandidateScore, right open
 	}
 	if left.loadInfo.WaitingCount != right.loadInfo.WaitingCount {
 		return left.loadInfo.WaitingCount < right.loadInfo.WaitingCount
+	}
+	// LRU：分数/优先级/负载全平时选最久未用的账号，这是「轮询」真正的来源。
+	// 缺这一档时比较链会一路落到按 ID 升序，于是同优先级同负载的账号里永远只有 ID
+	// 最小那个被选中 —— 而 lb_top_k=1 会把候选裁成一个，加权抽样（len<=1 直接返回）
+	// 也救不回来，表现就是「一直只请求账号 1，账号 6 从不被调用」。
+	if leftBucket, rightBucket := openAILastUsedRotationBucket(left.account), openAILastUsedRotationBucket(right.account); leftBucket != rightBucket {
+		return leftBucket < rightBucket
+	}
+	// 同一个 LRU 桶（「一样久没被用过」）内按每请求随机名次打散，避免并发请求读到同一
+	// 份快照时全部命中同一个账号。
+	if left.tieBreak != right.tieBreak {
+		return left.tieBreak < right.tieBreak
 	}
 	return left.account.ID < right.account.ID
 }
@@ -748,6 +785,9 @@ func selectTopKOpenAICandidates(candidates []openAIAccountCandidateScore, topK i
 type openAISelectionRNG struct {
 	state uint64
 }
+
+// openAILastUsedTieBreakSeedMix 让「LRU 同桶打散」的随机流与加权抽样的随机流从不同状态起步。
+const openAILastUsedTieBreakSeedMix uint64 = 0xa076_1d64_78bd_642f
 
 func newOpenAISelectionRNG(seed uint64) openAISelectionRNG {
 	if seed == 0 {
@@ -945,6 +985,8 @@ func (s *defaultOpenAIAccountScheduler) buildOpenAIAccountLoadPlan(
 
 	weights := s.service.openAIWSSchedulerWeightsForRequest(ctx)
 	now := time.Now()
+	// 与加权抽样同源但独立的随机流：混入一个常量，避免两处从同一状态开始而产生相关性。
+	tieRNG := newOpenAISelectionRNG(deriveOpenAISelectionSeed(req) ^ openAILastUsedTieBreakSeedMix)
 	upstreamCostFactors := map[int64]float64(nil)
 	if req.UseUpstreamTokenCost && weights.UpstreamCost > 0 {
 		accounts := make([]*Account, 0, len(candidates))
@@ -988,6 +1030,8 @@ func (s *defaultOpenAIAccountScheduler) buildOpenAIAccountLoadPlan(
 
 	for i := range candidates {
 		item := &candidates[i]
+		// tieBreak 必须非 0：0 是「未赋值」的哨兵，会让 comparator 退回按 ID 升序。
+		item.tieBreak = tieRNG.nextUint64() | 1
 		priorityFactor := 1.0
 		if maxPriority > minPriority {
 			priorityFactor = 1 - float64(item.priority-minPriority)/float64(maxPriority-minPriority)
