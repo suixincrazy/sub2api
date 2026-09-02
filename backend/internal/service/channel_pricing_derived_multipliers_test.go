@@ -104,6 +104,31 @@ func TestDerivedTokenPricesYieldToExplicitPrices(t *testing.T) {
 		"没配绝对价的那档照旧派生")
 }
 
+// 上游 0.2.0 把缓存写入拆成 5m/1h 两档，1h 有了独立的绝对价字段。派生倍率是覆盖链的
+// 最后一环，必须让位给它 —— 否则 1h 绝对价会被刚写进去又被冲掉，而且 SupportsCacheBreakdown
+// 已经打开，账单真的按 1h 价出。
+func TestDerivedCacheCreationYieldsToExplicit1hPrice(t *testing.T) {
+	config := derivedRatioPricing()
+	config.CacheWrite1hPrice = pricingMultiplier(9e-6)
+
+	pricing := &ModelPricing{}
+	applyChannelTokenPriceOverrides(pricing, config)
+
+	require.InDelta(t, 9e-6, pricing.CacheCreation1hPrice, 1e-18, "绝对 1h 缓存写入价优先于缓存创建倍率")
+	require.InDelta(t, derivedCacheWritePerToken, pricing.CacheCreation5mPrice, 1e-18, "5m 档没配绝对价，照旧派生")
+	require.InDelta(t, derivedCacheWritePerToken, pricing.CacheCreationPricePerToken, 1e-18)
+	require.True(t, pricing.SupportsCacheBreakdown, "两档价不同，必须走缓存分档计费")
+}
+
+// 没配 1h 绝对价时两档一起跟着倍率走（拆档前的历史行为）。
+func TestDerivedCacheCreationCoversBothTTLTiers(t *testing.T) {
+	pricing := &ModelPricing{}
+	applyChannelTokenPriceOverrides(pricing, derivedRatioPricing())
+
+	require.InDelta(t, derivedCacheWritePerToken, pricing.CacheCreation5mPrice, 1e-18)
+	require.InDelta(t, derivedCacheWritePerToken, pricing.CacheCreation1hPrice, 1e-18)
+}
+
 // 没有可乘的基数时不派生。否则一个缺目录价、又没填提示价的模型会被派生成 0，
 // 变成静默白送算力 —— 宁可保留目录价（这里目录价也没有，那就保持原样）。
 func TestDerivedTokenPricesRequirePromptPrice(t *testing.T) {

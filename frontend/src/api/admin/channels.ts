@@ -16,6 +16,7 @@ export interface PricingInterval {
   input_price: number | null
   output_price: number | null
   cache_write_price: number | null
+  cache_write_1h_price?: number | null
   cache_read_price: number | null
   input_multiplier: number | null
   output_multiplier: number | null
@@ -45,6 +46,7 @@ export interface ChannelModelPricing {
   input_price: number | null
   output_price: number | null
   cache_write_price: number | null
+  cache_write_1h_price?: number | null
   cache_read_price: number | null
   // 派生倍率：只填提示价 + 倍率，其余三档 = 提示价 × 倍率。
   // 对应档位填了绝对价时倍率被忽略；三个都为 null 即完全走绝对价（老行为）。
@@ -178,6 +180,7 @@ export interface ModelDefaultPricing {
   input_price?: number    // per-token price
   output_price?: number
   cache_write_price?: number
+  cache_write_1h_price?: number | null
   cache_read_price?: number
   image_input_price?: number
   image_output_price?: number

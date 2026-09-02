@@ -87,15 +87,16 @@ type AccountStatsPricingRule struct {
 
 // ChannelModelPricing 渠道模型定价条目
 type ChannelModelPricing struct {
-	ID              int64       `json:"id,omitempty"`
-	ChannelID       int64       `json:"channel_id,omitempty"`
-	Platform        string      `json:"platform"` // 所属平台（anthropic/openai/gemini/...）
-	Models          []string    `json:"models"`
-	BillingMode     BillingMode `json:"billing_mode"`
-	InputPrice      *float64    `json:"input_price"`
-	OutputPrice     *float64    `json:"output_price"`
-	CacheWritePrice *float64    `json:"cache_write_price"`
-	CacheReadPrice  *float64    `json:"cache_read_price"`
+	ID                int64       `json:"id,omitempty"`
+	ChannelID         int64       `json:"channel_id,omitempty"`
+	Platform          string      `json:"platform"` // 所属平台（anthropic/openai/gemini/...）
+	Models            []string    `json:"models"`
+	BillingMode       BillingMode `json:"billing_mode"`
+	InputPrice        *float64    `json:"input_price"`
+	OutputPrice       *float64    `json:"output_price"`
+	CacheWritePrice   *float64    `json:"cache_write_price"`
+	CacheWrite1hPrice *float64    `json:"cache_write_1h_price"`
+	CacheReadPrice    *float64    `json:"cache_read_price"`
 
 	// 派生倍率：只维护一个提示价，其余三档按倍率跟着走。
 	// 典型配置是 补全 5 / 缓存创建 1.25 / 缓存读取 0.2，于是提示价 $4/MTok
@@ -105,6 +106,9 @@ type ChannelModelPricing struct {
 	//   - 只在对应的绝对价**没有**配置时生效，绝对价永远优先；三个都 nil 时行为与引入前逐位相同
 	//   - 乘的是「应用完覆盖后的有效提示价」，不是各档自己的基础价 ——
 	//     这一点与 PricingInterval 上的同名倍率**相反**，那边 OutputMultiplier 乘的是基础补全价
+	//
+	// 1h 缓存写入价（上游 0.2.0 新增）刻意**不**派生：它是 5m 缓存写入的另一档，
+	// 与提示价没有固定比例，留空即回落 CacheWritePrice 的历史行为。
 	CompletionMultiplier    *float64 `json:"completion_multiplier"`     // 补全价 = 提示价 × 该倍率
 	CacheCreationMultiplier *float64 `json:"cache_creation_multiplier"` // 缓存创建价 = 提示价 × 该倍率
 	CacheReadMultiplier     *float64 `json:"cache_read_multiplier"`     // 缓存读取价 = 提示价 × 该倍率
@@ -152,6 +156,7 @@ type PricingInterval struct {
 	InputPrice           *float64  `json:"input_price"`
 	OutputPrice          *float64  `json:"output_price"`
 	CacheWritePrice      *float64  `json:"cache_write_price"`
+	CacheWrite1hPrice    *float64  `json:"cache_write_1h_price"`
 	CacheReadPrice       *float64  `json:"cache_read_price"`
 	InputMultiplier      *float64  `json:"input_multiplier"`
 	OutputMultiplier     *float64  `json:"output_multiplier"`
@@ -398,6 +403,7 @@ func validateIntervalPrices(iv *PricingInterval, idx int) error {
 		{"input_price", iv.InputPrice},
 		{"output_price", iv.OutputPrice},
 		{"cache_write_price", iv.CacheWritePrice},
+		{"cache_write_1h_price", iv.CacheWrite1hPrice},
 		{"cache_read_price", iv.CacheReadPrice},
 		{"per_request_price", iv.PerRequestPrice},
 	}
