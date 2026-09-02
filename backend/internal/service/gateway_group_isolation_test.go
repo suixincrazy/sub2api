@@ -5,6 +5,7 @@ package service
 import (
 	"context"
 	"testing"
+	"time"
 
 	"github.com/Wei-Shaw/sub2api/internal/config"
 	"github.com/stretchr/testify/require"
@@ -152,6 +153,29 @@ func (m *groupAwareMockAccountRepo) ListSchedulableByGroupIDAndPlatforms(ctx con
 		if platformSet[acc.Platform] && acc.IsSchedulable() && accountBelongsToGroup(acc, groupID) {
 			result = append(result, acc)
 		}
+	}
+	return result, nil
+}
+
+// ListTempParkedByGroupIDAndPlatforms 返回属于指定分组、且只被临时停调窗口挡住的账号。
+func (m *groupAwareMockAccountRepo) ListTempParkedByGroupIDAndPlatforms(ctx context.Context, groupID int64, platforms []string) ([]Account, error) {
+	platformSet := make(map[string]bool, len(platforms))
+	for _, p := range platforms {
+		platformSet[p] = true
+	}
+	now := time.Now()
+	var result []Account
+	for _, acc := range m.allAccounts {
+		if !platformSet[acc.Platform] || !accountBelongsToGroup(acc, groupID) {
+			continue
+		}
+		if acc.Status != StatusActive || !acc.Schedulable {
+			continue
+		}
+		if acc.TempUnschedulableUntil == nil || !now.Before(*acc.TempUnschedulableUntil) {
+			continue
+		}
+		result = append(result, acc)
 	}
 	return result, nil
 }

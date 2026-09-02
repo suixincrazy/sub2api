@@ -298,6 +298,32 @@ func (s *SchedulerSnapshotService) GetAccount(ctx context.Context, accountID int
 	return s.accountRepo.GetByID(fallbackCtx, accountID)
 }
 
+// RefreshAccountBuckets 同步重建某账号所在分组的分桶快照。
+//
+// 临时停调放行阀清掉 park 之后必须立刻调它一次：分桶里装的是
+// ListSchedulable* 的查询结果，被 park 的账号压根不在桶内，只清 DB 与单账号
+// 快照不会让它出现在候选表里。桶命中时（组里还有别的号，只是全被下游门挡住）
+// 不刷桶就得等 outbox worker 那一秒，本发照样 503。
+//
+// 桶为空时 GetSnapshot 本来就算未命中并回落数据库直查，此时这次刷新只是顺手把
+// 桶预热了，不影响正确性。拿不到桶锁一律跳过（strict=false），最坏就是退回
+// 等 outbox。
+func (s *SchedulerSnapshotService) RefreshAccountBuckets(ctx context.Context, accountID int64, reason string) error {
+	if s == nil || s.accountRepo == nil || accountID <= 0 {
+		return nil
+	}
+	account, err := s.accountRepo.GetByID(ctx, accountID)
+	if err != nil {
+		return err
+	}
+	if s.cache != nil {
+		if err := s.cache.SetAccount(ctx, account); err != nil {
+			return err
+		}
+	}
+	return s.rebuildByAccount(ctx, account, account.GroupIDs, reason, nil)
+}
+
 // GetGroupByID 获取分组信息（供调度器使用）
 func (s *SchedulerSnapshotService) GetGroupByID(ctx context.Context, groupID int64) (*Group, error) {
 	if s.groupRepo == nil {

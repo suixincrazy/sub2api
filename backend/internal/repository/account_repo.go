@@ -2114,6 +2114,73 @@ func (r *accountRepository) ListSchedulableByGroupIDAndPlatforms(ctx context.Con
 	})
 }
 
+// ListTempParkedByGroupIDAndPlatforms 只返回「除了 temp_unschedulable_until 之外
+// 每一项调度条件都成立」的账号，也就是纯粹被临时停调窗口挡住的那批。
+//
+// 存在这个方法只为一个用途：整档候选被清空导致分组直接回 503 时，调度层要能看见
+// 「其实只差一个 park 就能用」的号，从中挑最早到期的那个放行（见
+// GatewayService.releaseEarliestTempParkedAccount）。因此它与常规调度查询的差别
+// 必须**恰好只有 park 这一条**：schedulable / active / 未删除 / 平台 / 未过期 /
+// 未过载 / 未限流全部照常成立，park 谓词反向取「仍在窗口内」。
+//
+// 反向而不是省略：省略会把「本来就没被 park、只是因为别的原因没选中」的号也捞回来，
+// 那些号刚才在主循环里已经被逐条门否决过，再看一遍只是浪费一次查询。
+func (r *accountRepository) ListTempParkedByGroupIDAndPlatforms(ctx context.Context, groupID int64, platforms []string) ([]service.Account, error) {
+	if len(platforms) == 0 {
+		return nil, nil
+	}
+	now := time.Now()
+	q := r.client.AccountGroup.Query().
+		Where(dbaccountgroup.GroupIDEQ(groupID))
+	preds := []dbpredicate.Account{
+		dbaccount.DeletedAtIsNil(),
+		dbaccount.StatusEQ(service.StatusActive),
+		dbaccount.SchedulableEQ(true),
+		dbaccount.PlatformIn(platforms...),
+		stillTempParkedPredicate(),
+		notExpiredPredicate(now),
+		dbaccount.Or(dbaccount.OverloadUntilIsNil(), dbaccount.OverloadUntilLTE(now)),
+		dbaccount.Or(dbaccount.RateLimitResetAtIsNil(), dbaccount.RateLimitResetAtLTE(now)),
+	}
+	groups, err := q.
+		Where(dbaccountgroup.HasAccountWith(preds...)).
+		WithAccount().
+		All(ctx)
+	if err != nil {
+		return nil, err
+	}
+	orderedIDs := make([]int64, 0, len(groups))
+	accountMap := make(map[int64]*dbent.Account, len(groups))
+	for _, ag := range groups {
+		if ag.Edges.Account == nil {
+			continue
+		}
+		acc := ag.Edges.Account
+		if _, seen := accountMap[acc.ID]; seen {
+			continue
+		}
+		accountMap[acc.ID] = acc
+		orderedIDs = append(orderedIDs, acc.ID)
+	}
+	ordered := make([]*dbent.Account, 0, len(orderedIDs))
+	for _, id := range orderedIDs {
+		ordered = append(ordered, accountMap[id])
+	}
+	return r.accountsToService(ctx, ordered)
+}
+
+// stillTempParkedPredicate 是 tempUnschedulablePredicate 的反面：只匹配停调窗口
+// 尚未到点的账号。两者必须成对维护，任何一侧改了列名或时间语义，另一侧同步改。
+func stillTempParkedPredicate() dbpredicate.Account {
+	return dbpredicate.Account(func(s *entsql.Selector) {
+		col := s.C("temp_unschedulable_until")
+		s.Where(entsql.And(
+			entsql.NotNull(col),
+			entsql.GT(col, entsql.Expr("NOW()")),
+		))
+	})
+}
+
 // ListModelAvailabilityCandidates returns the persistently configured account
 // pool used to decide whether a model is supported. Unlike scheduling queries,
 // it intentionally ignores transient runtime state (rate limits, overload,

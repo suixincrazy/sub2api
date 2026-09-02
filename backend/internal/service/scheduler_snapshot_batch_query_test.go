@@ -48,6 +48,12 @@ func (r *batchAccountQueryRepo) ListSchedulableByGroupIDAndPlatforms(_ context.C
 	return r.run(batchAccountQueryKey{groupID: groupID, platform: platforms[0], mixed: true})
 }
 
+// 刻意不计入 run()：这个 stub 用调用次数断言快照批量查询的合并行为，
+// 放行阀的查询不属于被测路径，计进去会污染计数。
+func (r *batchAccountQueryRepo) ListTempParkedByGroupIDAndPlatforms(_ context.Context, _ int64, _ []string) ([]Account, error) {
+	return nil, nil
+}
+
 func (r *batchAccountQueryRepo) ListSchedulableUngroupedByPlatform(_ context.Context, platform string) ([]Account, error) {
 	return r.run(batchAccountQueryKey{platform: platform})
 }

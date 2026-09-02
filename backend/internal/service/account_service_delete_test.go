@@ -151,6 +151,11 @@ func (s *accountRepoStub) ListSchedulableByGroupIDAndPlatforms(ctx context.Conte
 	panic("unexpected ListSchedulableByGroupIDAndPlatforms call")
 }
 
+// 返回空而不是 panic：放行阀在任何 ErrNoAvailableAccounts 路径上都会被调用一次。
+func (s *accountRepoStub) ListTempParkedByGroupIDAndPlatforms(ctx context.Context, groupID int64, platforms []string) ([]Account, error) {
+	return nil, nil
+}
+
 func (s *accountRepoStub) ListSchedulableUngroupedByPlatform(ctx context.Context, platform string) ([]Account, error) {
 	panic("unexpected ListSchedulableUngroupedByPlatform call")
 }

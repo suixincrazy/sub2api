@@ -308,6 +308,11 @@ func (r *groupLifecycleTestAccountRepo) ListSchedulableByGroupIDAndPlatforms(ctx
 	return r.load(ctx, platform)
 }
 
+// 刻意不 load()：这个 stub 用调用次数断言分组生命周期行为，放行阀不属于被测路径。
+func (r *groupLifecycleTestAccountRepo) ListTempParkedByGroupIDAndPlatforms(_ context.Context, _ int64, _ []string) ([]Account, error) {
+	return nil, nil
+}
+
 func (r *groupLifecycleTestAccountRepo) callCount() int {
 	r.mu.Lock()
 	defer r.mu.Unlock()

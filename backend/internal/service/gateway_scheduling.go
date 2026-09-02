@@ -32,6 +32,19 @@ func (s *GatewayService) SelectAccountForModel(ctx context.Context, groupID *int
 
 // SelectAccountForModelWithExclusions selects an account supporting the requested model while excluding specified accounts.
 func (s *GatewayService) SelectAccountForModelWithExclusions(ctx context.Context, groupID *int64, sessionHash string, requestedModel string, excludedIDs map[int64]struct{}) (*Account, error) {
+	account, err := s.selectAccountForModelWithExclusionsOnce(ctx, groupID, sessionHash, requestedModel, excludedIDs)
+	if !isNoAvailableAccountsErr(err) {
+		return account, err
+	}
+	// 整档候选清空 = 本次请求必然回 503。放行一个只差 park 的号再重选一次，
+	// 重选会把所有门重新走一遍，阀门不构成绕过。见 releaseEarliestTempParkedAccount。
+	if !s.tryTempParkReleaseValve(ctx, groupID, requestedModel, excludedIDs) {
+		return account, err
+	}
+	return s.selectAccountForModelWithExclusionsOnce(ctx, groupID, sessionHash, requestedModel, excludedIDs)
+}
+
+func (s *GatewayService) selectAccountForModelWithExclusionsOnce(ctx context.Context, groupID *int64, sessionHash string, requestedModel string, excludedIDs map[int64]struct{}) (*Account, error) {
 	// 优先检查 context 中的强制平台（/antigravity 路由）
 	var platform string
 	forcePlatform, hasForcePlatform := ctx.Value(ctxkey.ForcePlatform).(string)
@@ -98,6 +111,39 @@ func (s *GatewayService) SelectAccountForModelWithExclusions(ctx context.Context
 // metadataUserID: 用于客户端亲和调度，从中提取客户端 ID
 // sub2apiUserID: 系统用户 ID，用于二维亲和调度
 func (s *GatewayService) SelectAccountWithLoadAwareness(ctx context.Context, groupID *int64, sessionHash string, requestedModel string, excludedIDs map[int64]struct{}, metadataUserID string, sub2apiUserID int64) (*AccountSelectionResult, error) {
+	result, err := s.selectAccountWithLoadAwarenessOnce(ctx, groupID, sessionHash, requestedModel, excludedIDs, metadataUserID, sub2apiUserID)
+	if !isNoAvailableAccountsErr(err) {
+		return result, err
+	}
+	if !s.tryTempParkReleaseValve(ctx, groupID, requestedModel, excludedIDs) {
+		return result, err
+	}
+	return s.selectAccountWithLoadAwarenessOnce(ctx, groupID, sessionHash, requestedModel, excludedIDs, metadataUserID, sub2apiUserID)
+}
+
+// tryTempParkReleaseValve 解析出平台后调用阀门，返回是否真的放行了一个号。
+// 解析失败一律当作"没放行"：那种情况下重选也不会有别的结果。
+func (s *GatewayService) tryTempParkReleaseValve(ctx context.Context, groupID *int64, requestedModel string, excludedIDs map[int64]struct{}) bool {
+	if s == nil || s.cfg == nil || !s.cfg.Gateway.TempParkReleaseValveEnabled {
+		return false
+	}
+	if groupID == nil || *groupID <= 0 {
+		return false
+	}
+	group, resolvedGroupID, err := s.resolveGatewayGroup(ctx, groupID)
+	if err != nil || group == nil {
+		return false
+	}
+	platform, hasForcePlatform, err := s.resolvePlatform(ctx, resolvedGroupID, group, requestedModel)
+	if err != nil || platform == "" {
+		return false
+	}
+	useMixed := (platform == PlatformAnthropic || platform == PlatformGemini) && !hasForcePlatform
+	releasedID, _ := s.releaseEarliestTempParkedAccount(ctx, resolvedGroupID, platform, useMixed, requestedModel, excludedIDs)
+	return releasedID > 0
+}
+
+func (s *GatewayService) selectAccountWithLoadAwarenessOnce(ctx context.Context, groupID *int64, sessionHash string, requestedModel string, excludedIDs map[int64]struct{}, metadataUserID string, sub2apiUserID int64) (*AccountSelectionResult, error) {
 	// 调试日志：记录调度入口参数
 	excludedIDsList := make([]int64, 0, len(excludedIDs))
 	for id := range excludedIDs {

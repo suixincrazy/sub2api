@@ -137,6 +137,12 @@ func (m *sessionWindowMockRepo) ListSchedulableByPlatforms(context.Context, []st
 func (m *sessionWindowMockRepo) ListSchedulableByGroupIDAndPlatforms(context.Context, int64, []string) ([]Account, error) {
 	panic("unexpected")
 }
+
+// 返回空而不是 panic：放行阀在任何 ErrNoAvailableAccounts 路径上都会被调用一次，
+// 空结果表示"没有只差 park 的号"，阀门不开火，原错误原样返回。
+func (m *sessionWindowMockRepo) ListTempParkedByGroupIDAndPlatforms(context.Context, int64, []string) ([]Account, error) {
+	return nil, nil
+}
 func (m *sessionWindowMockRepo) ListSchedulableUngroupedByPlatform(context.Context, string) ([]Account, error) {
 	panic("unexpected")
 }

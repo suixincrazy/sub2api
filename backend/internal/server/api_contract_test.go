@@ -1977,6 +1977,12 @@ func (s *stubAccountRepo) ListSchedulableByGroupIDAndPlatforms(ctx context.Conte
 	return nil, errors.New("not implemented")
 }
 
+// 返回空而不是报错：放行阀在任何 ErrNoAvailableAccounts 路径上都会被调用一次，
+// 空结果表示没有只差 park 的号，原错误原样返回。
+func (s *stubAccountRepo) ListTempParkedByGroupIDAndPlatforms(ctx context.Context, groupID int64, platforms []string) ([]service.Account, error) {
+	return nil, nil
+}
+
 func (s *stubAccountRepo) ListSchedulableUngroupedByPlatform(ctx context.Context, platform string) ([]service.Account, error) {
 	return nil, errors.New("not implemented")
 }

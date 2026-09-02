@@ -206,6 +206,11 @@ func (r *fullRebuildAccountRepo) ListSchedulableByGroupIDAndPlatforms(_ context.
 	return r.record(groupID, firstPlatform(platforms))
 }
 
+// 刻意不 record()：这个 stub 用调用记录断言重建行为，放行阀不属于被测路径。
+func (r *fullRebuildAccountRepo) ListTempParkedByGroupIDAndPlatforms(_ context.Context, _ int64, _ []string) ([]Account, error) {
+	return nil, nil
+}
+
 func (r *fullRebuildAccountRepo) ListSchedulableUngroupedByPlatform(_ context.Context, platform string) ([]Account, error) {
 	return r.record(0, platform)
 }

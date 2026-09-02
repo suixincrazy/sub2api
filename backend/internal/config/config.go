@@ -1269,6 +1269,24 @@ type GatewayConfig struct {
 	// 换号不存在误伤成本。详见 anthropicHoldbackVerdict 的说明。
 	AnthropicHoldbackDiscardBudgetMs int `mapstructure:"anthropic_holdback_discard_budget_ms"`
 
+	// TempParkReleaseValveEnabled: 整档候选被清空时，是否放行一个「只差临时停调窗口」的账号，
+	// 而不是直接给客户端回 503 no available accounts。默认开。
+	//
+	// 要解决的是这个具体形态：分组里能调度的号本身就少，而它们又在共用同一套
+	// stream_timeout_settings 阈值——短回合/截断惩罚会把它们**同时**关进 1 分钟停调窗口，
+	// 于是窗口内到达的每一发请求都在选号阶段就失败。实测 12 小时里这样丢掉 743 个独立
+	// 客户端请求（两个分组失败率 21% 与 39%），而且 88.7% 是「一次上游都没发」的冷失败：
+	// handler 的 failover 循环根本没进去，退避重选那套上限也就无从生效。
+	//
+	// 阀门只在**否则必然 503** 时开火，且只放行一个号：挑停调窗口最早到点的那个（离恢复
+	// 最近，也就是"最不坏"），清掉它的 park 再重选一次。清 park 而不是在选号里临时豁免，
+	// 是因为 IsSchedulable() 是无 ctx 的纯方法，下游 IsSchedulableForModelWithContext /
+	// 粘性校验 / hydrate 都会再查一遍——临时豁免要在四五处同时开洞，清 park 只有一处。
+	//
+	// 放行的号可能确实不健康：它下一发再触发阈值就会被重新 park，与阀门不冲突。
+	// 用「不健康的号试一次」换掉「确定失败的 503」，在这个形态下期望收益为正。
+	TempParkReleaseValveEnabled bool `mapstructure:"temp_park_release_valve_enabled"`
+
 	// 是否记录上游错误响应体摘要（避免输出请求内容）
 	LogUpstreamErrorBody bool `mapstructure:"log_upstream_error_body"`
 	// 上游错误响应体记录最大字节数（超过会截断）
@@ -2724,6 +2742,7 @@ func setDefaults() {
 	// 同上，靠 GATEWAY_ANTHROPIC_HOLDBACK_LONG_THINKING_HOLD_MS 免重新构建地改。
 	viper.SetDefault("gateway.anthropic_holdback_long_thinking_hold_ms", 360000)
 	viper.SetDefault("gateway.anthropic_holdback_discard_budget_ms", 45000)
+	viper.SetDefault("gateway.temp_park_release_valve_enabled", true)
 	viper.SetDefault("gateway.scheduling.sticky_session_max_waiting", 3)
 	viper.SetDefault("gateway.scheduling.sticky_session_wait_timeout", 120*time.Second)
 	viper.SetDefault("gateway.scheduling.fallback_wait_timeout", 30*time.Second)

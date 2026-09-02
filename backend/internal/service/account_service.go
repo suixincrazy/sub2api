@@ -91,6 +91,10 @@ type AccountRepository interface {
 	ListSchedulableByGroupIDAndPlatforms(ctx context.Context, groupID int64, platforms []string) ([]Account, error)
 	ListSchedulableUngroupedByPlatform(ctx context.Context, platform string) ([]Account, error)
 	ListSchedulableUngroupedByPlatforms(ctx context.Context, platforms []string) ([]Account, error)
+	// ListTempParkedByGroupIDAndPlatforms 返回只被临时停调窗口挡住的账号（其余每一项
+	// 调度条件都成立）。供整档候选清空时的最后一道放行阀使用，见
+	// GatewayService.releaseEarliestTempParkedAccount。
+	ListTempParkedByGroupIDAndPlatforms(ctx context.Context, groupID int64, platforms []string) ([]Account, error)
 	// ListModelAvailabilityCandidates returns accounts that are enabled by
 	// persistent configuration (active + schedulable) for model-support
 	// diagnosis. It deliberately does not filter transient runtime state such
