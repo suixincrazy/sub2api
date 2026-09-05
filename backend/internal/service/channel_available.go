@@ -117,22 +117,23 @@ func (s *ChannelService) ListAvailable(ctx context.Context) ([]AvailableChannel,
 //  1. Pricing == nil（渠道完全没声明该模型的定价条目）
 //  2. Pricing 非 nil 但所有价格字段为空（admin UI 建了条目但没填价格）
 //
-// 当 pricingService 为 nil（测试场景），跳过回落。可用渠道与模型广场共用。
+// 当 pricingService 为 nil（测试场景），跳过价格回落，但仍补充内置模型倍率。
+// 可用渠道与模型广场共用。
 func fillGlobalPricingFallback(pricingService *PricingService, models []SupportedModel) {
-	if pricingService == nil {
-		return
-	}
 	for i := range models {
 		// 派生倍率必须**先**按「运营是否显式配过该档」定案，再让全局回落去补 nil 字段。
 		// 顺序反了的话回落补上的 LiteLLM 补全价会挡住本该派生出来的价，
 		// 于是广场展示 LiteLLM 价、实际扣费按派生价，两个口径打架。
 		derived := computeDerivedDisplayPrices(pricingService, models[i].Name, models[i].Pricing)
-		if pricingNeedsFallback(models[i].Pricing) {
+		if pricingService != nil && pricingNeedsFallback(models[i].Pricing) {
 			if lp := pricingService.GetModelPricing(models[i].Name); lp != nil {
 				models[i].Pricing = synthesizePricingFromLiteLLM(lp, models[i].Pricing)
 			}
 		}
+		// 两次覆盖动的是不相交字段：派生管 output/cacheWrite/cacheRead，
+		// 上游这道只管 MaxReasoningEffortMultiplier，故先后顺序不影响结果。
 		models[i].Pricing = derived.applyTo(models[i].Pricing)
+		models[i].Pricing = withDefaultMaxReasoningEffortMultiplier(models[i].Pricing, models[i].Name)
 	}
 }
 
@@ -247,22 +248,31 @@ func synthesizePricingFromLiteLLM(lp *LiteLLMModelPricing, existing *ChannelMode
 
 	if mode == BillingModeImage || mode == BillingModePerRequest {
 		return &ChannelModelPricing{
-			BillingMode:      mode,
-			PerRequestPrice:  nonZeroPtr(lp.OutputCostPerImage),
-			ImageOutputPrice: nonZeroPtr(lp.OutputCostPerImageToken),
-			InputPrice:       nonZeroPtr(lp.InputCostPerToken),
-			OutputPrice:      nonZeroPtr(lp.OutputCostPerToken),
+			BillingMode:                  mode,
+			PerRequestPrice:              nonZeroPtr(lp.OutputCostPerImage),
+			ImageOutputPrice:             nonZeroPtr(lp.OutputCostPerImageToken),
+			InputPrice:                   nonZeroPtr(lp.InputCostPerToken),
+			OutputPrice:                  nonZeroPtr(lp.OutputCostPerToken),
+			MaxReasoningEffortMultiplier: maxReasoningEffortMultiplierFromPricing(existing),
 		}
 	}
 	return &ChannelModelPricing{
-		BillingMode:       mode,
-		InputPrice:        nonZeroPtr(lp.InputCostPerToken),
-		OutputPrice:       nonZeroPtr(lp.OutputCostPerToken),
-		CacheWritePrice:   nonZeroPtr(lp.CacheCreationInputTokenCost),
-		CacheWrite1hPrice: nonZeroPtr(lp.CacheCreationInputTokenCostAbove1hr),
-		CacheReadPrice:    nonZeroPtr(lp.CacheReadInputTokenCost),
-		ImageOutputPrice:  nonZeroPtr(lp.OutputCostPerImageToken),
+		BillingMode:                  mode,
+		InputPrice:                   nonZeroPtr(lp.InputCostPerToken),
+		OutputPrice:                  nonZeroPtr(lp.OutputCostPerToken),
+		CacheWritePrice:              nonZeroPtr(lp.CacheCreationInputTokenCost),
+		CacheWrite1hPrice:            nonZeroPtr(lp.CacheCreationInputTokenCostAbove1hr),
+		CacheReadPrice:               nonZeroPtr(lp.CacheReadInputTokenCost),
+		ImageOutputPrice:             nonZeroPtr(lp.OutputCostPerImageToken),
+		MaxReasoningEffortMultiplier: maxReasoningEffortMultiplierFromPricing(existing),
 	}
+}
+
+func maxReasoningEffortMultiplierFromPricing(pricing *ChannelModelPricing) *float64 {
+	if pricing == nil {
+		return nil
+	}
+	return pricing.MaxReasoningEffortMultiplier
 }
 
 func nonZeroPtr(v float64) *float64 {

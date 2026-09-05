@@ -20,7 +20,8 @@ var channelModelPricingTimePricingColumns = []string{
 	"id", "channel_id", "platform", "models", "billing_mode", "input_price", "output_price",
 	"cache_write_price", "cache_write_1h_price", "cache_read_price",
 	"completion_multiplier", "cache_creation_multiplier", "cache_read_multiplier",
-	"fast_multiplier", "flex_multiplier", "image_input_price", "image_output_price",
+	"fast_multiplier", "flex_multiplier", "max_reasoning_effort_multiplier",
+	"image_input_price", "image_output_price",
 	"per_request_price", "time_pricing", "created_at", "updated_at",
 }
 
@@ -39,7 +40,8 @@ func modelPricingTimePricingRow(timePricing any) *sqlmock.Rows {
 		int64(11), int64(7), "openai", `["gpt-5"]`, service.BillingModeToken,
 		nil, nil, nil, nil, nil, // 五档绝对价（含上游 0.2.0 新增的 1h 缓存写入）
 		nil, nil, nil, // 三个派生倍率
-		nil, nil, nil, nil, nil, timePricing,
+		nil, nil, nil, // fast / flex / max 推理等级倍率
+		nil, nil, nil, timePricing, // 图片双价 + 按次价 + 分时
 		time.Date(2026, 8, 17, 0, 0, 0, 0, time.UTC), time.Date(2026, 8, 17, 1, 0, 0, 0, time.UTC),
 	)
 }
@@ -111,10 +113,10 @@ func TestChannelModelPricingTimePricingCreateAndUpdateRoundTrip(t *testing.T) {
 
 	t.Run("create writes JSON", func(t *testing.T) {
 		repo, mock := newChannelModelPricingTimePricingRepo(t)
-		mock.ExpectQuery(regexp.QuoteMeta("INSERT INTO channel_model_pricing (channel_id, platform, models, billing_mode, input_price, output_price, cache_write_price, cache_write_1h_price, cache_read_price, completion_multiplier, cache_creation_multiplier, cache_read_multiplier, fast_multiplier, flex_multiplier, image_input_price, image_output_price, per_request_price, time_pricing)")).
+		mock.ExpectQuery(regexp.QuoteMeta("INSERT INTO channel_model_pricing (channel_id, platform, models, billing_mode, input_price, output_price, cache_write_price, cache_write_1h_price, cache_read_price, completion_multiplier, cache_creation_multiplier, cache_read_multiplier, fast_multiplier, flex_multiplier, max_reasoning_effort_multiplier, image_input_price, image_output_price, per_request_price, time_pricing)")).
 			WithArgs(
 				int64(7), "openai", []byte(`["gpt-5"]`), service.BillingModeToken,
-				nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, channelModelPricingTimePricingJSON,
+				nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, channelModelPricingTimePricingJSON,
 			).
 			WillReturnRows(sqlmock.NewRows([]string{"id", "created_at", "updated_at"}).AddRow(int64(11), time.Time{}, time.Time{}))
 
@@ -124,13 +126,12 @@ func TestChannelModelPricingTimePricingCreateAndUpdateRoundTrip(t *testing.T) {
 
 	t.Run("update writes JSON and entry ID", func(t *testing.T) {
 		repo, mock := newChannelModelPricingTimePricingRepo(t)
-		// $15 是 WHERE 里的 id，派生倍率从 $16 起 —— 这个"中间跳一位"的排布是故意的，
-		// 保留原有 $1..$14 编号才不用重排所有实参。
-		mock.ExpectExec(`(?s)UPDATE channel_model_pricing.*per_request_price = \$12, time_pricing = \$13, platform = \$14, completion_multiplier = \$16, cache_creation_multiplier = \$17, cache_read_multiplier = \$18.*WHERE id = \$15`).
+		// 占位符全部按顺序号排布（$1..$19），WHERE 里的 id 在末尾 $19。
+		mock.ExpectExec(`(?s)UPDATE channel_model_pricing.*per_request_price = \$13, time_pricing = \$14, platform = \$15, completion_multiplier = \$16, cache_creation_multiplier = \$17, cache_read_multiplier = \$18.*WHERE id = \$19`).
 			WithArgs(
 				[]byte(`["gpt-5"]`), service.BillingModeToken,
-				nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, channelModelPricingTimePricingJSON, "openai", int64(11),
-				nil, nil, nil,
+				nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, channelModelPricingTimePricingJSON, "openai",
+				nil, nil, nil, int64(11),
 			).
 			WillReturnResult(sqlmock.NewResult(0, 1))
 
@@ -162,10 +163,10 @@ func TestChannelModelPricingTimePricingCreateAndUpdateWriteNullWhenDisabled(t *t
 
 			t.Run("create writes SQL NULL", func(t *testing.T) {
 				repo, mock := newChannelModelPricingTimePricingRepo(t)
-				mock.ExpectQuery(regexp.QuoteMeta("INSERT INTO channel_model_pricing (channel_id, platform, models, billing_mode, input_price, output_price, cache_write_price, cache_write_1h_price, cache_read_price, completion_multiplier, cache_creation_multiplier, cache_read_multiplier, fast_multiplier, flex_multiplier, image_input_price, image_output_price, per_request_price, time_pricing)")).
+				mock.ExpectQuery(regexp.QuoteMeta("INSERT INTO channel_model_pricing (channel_id, platform, models, billing_mode, input_price, output_price, cache_write_price, cache_write_1h_price, cache_read_price, completion_multiplier, cache_creation_multiplier, cache_read_multiplier, fast_multiplier, flex_multiplier, max_reasoning_effort_multiplier, image_input_price, image_output_price, per_request_price, time_pricing)")).
 					WithArgs(
 						int64(7), "openai", []byte(`["gpt-5"]`), service.BillingModeToken,
-						nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil,
+						nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil,
 					).
 					WillReturnRows(sqlmock.NewRows([]string{"id", "created_at", "updated_at"}).AddRow(int64(11), time.Time{}, time.Time{}))
 
@@ -175,11 +176,11 @@ func TestChannelModelPricingTimePricingCreateAndUpdateWriteNullWhenDisabled(t *t
 
 			t.Run("update writes SQL NULL", func(t *testing.T) {
 				repo, mock := newChannelModelPricingTimePricingRepo(t)
-				mock.ExpectExec(`(?s)UPDATE channel_model_pricing.*per_request_price = \$12, time_pricing = \$13, platform = \$14, completion_multiplier = \$16, cache_creation_multiplier = \$17, cache_read_multiplier = \$18.*WHERE id = \$15`).
+				mock.ExpectExec(`(?s)UPDATE channel_model_pricing.*per_request_price = \$13, time_pricing = \$14, platform = \$15, completion_multiplier = \$16, cache_creation_multiplier = \$17, cache_read_multiplier = \$18.*WHERE id = \$19`).
 					WithArgs(
 						[]byte(`["gpt-5"]`), service.BillingModeToken,
-						nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, "openai", int64(11),
-						nil, nil, nil,
+						nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, "openai",
+						nil, nil, nil, int64(11),
 					).
 					WillReturnResult(sqlmock.NewResult(0, 1))
 

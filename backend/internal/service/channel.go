@@ -113,15 +113,18 @@ type ChannelModelPricing struct {
 	CacheCreationMultiplier *float64 `json:"cache_creation_multiplier"` // 缓存创建价 = 提示价 × 该倍率
 	CacheReadMultiplier     *float64 `json:"cache_read_multiplier"`     // 缓存读取价 = 提示价 × 该倍率
 
-	FastMultiplier   *float64            `json:"fast_multiplier"`
-	FlexMultiplier   *float64            `json:"flex_multiplier"`
-	ImageInputPrice  *float64            `json:"image_input_price"`
-	ImageOutputPrice *float64            `json:"image_output_price"`
-	PerRequestPrice  *float64            `json:"per_request_price"`
-	Intervals        []PricingInterval   `json:"intervals"`
-	TimePricing      *ChannelTimePricing `json:"time_pricing,omitempty"`
-	CreatedAt        time.Time           `json:"created_at,omitempty"`
-	UpdatedAt        time.Time           `json:"updated_at,omitempty"`
+	FastMultiplier *float64 `json:"fast_multiplier"`
+	FlexMultiplier *float64 `json:"flex_multiplier"`
+	// MaxReasoningEffortMultiplier（上游 0.2.1 新增）同样**不**派生：
+	// 它按转发的推理等级另乘一档，与提示价没有固定比例。
+	MaxReasoningEffortMultiplier *float64            `json:"max_reasoning_effort_multiplier"`
+	ImageInputPrice              *float64            `json:"image_input_price"`
+	ImageOutputPrice             *float64            `json:"image_output_price"`
+	PerRequestPrice              *float64            `json:"per_request_price"`
+	Intervals                    []PricingInterval   `json:"intervals"`
+	TimePricing                  *ChannelTimePricing `json:"time_pricing,omitempty"`
+	CreatedAt                    time.Time           `json:"created_at,omitempty"`
+	UpdatedAt                    time.Time           `json:"updated_at,omitempty"`
 }
 
 // HasDerivedTokenPrices 报告该定价项是否配置了任一派生倍率。

@@ -172,7 +172,7 @@
             </p>
           </div>
 
-          <div v-if="enableTierMultipliers" class="mt-3 grid max-w-md grid-cols-2 gap-2">
+          <div v-if="enableTierMultipliers" class="mt-3 grid max-w-2xl grid-cols-1 gap-2 sm:grid-cols-3">
             <div>
               <label class="text-xs text-gray-400">{{ t('admin.channels.form.fastMultiplier') }}</label>
               <input :value="entry.fast_multiplier" @input="emitField('fast_multiplier', ($event.target as HTMLInputElement).value)"
@@ -182,6 +182,11 @@
               <label class="text-xs text-gray-400">{{ t('admin.channels.form.flexMultiplier') }}</label>
               <input :value="entry.flex_multiplier" @input="emitField('flex_multiplier', ($event.target as HTMLInputElement).value)"
                 type="number" step="any" min="0.000001" class="input mt-0.5 text-sm" :placeholder="t('admin.channels.form.multiplierPlaceholder')" />
+            </div>
+            <div>
+              <label class="text-xs text-gray-400">{{ t('admin.channels.form.maxReasoningEffortMultiplier') }}</label>
+              <input :value="entry.max_reasoning_effort_multiplier" @input="emitField('max_reasoning_effort_multiplier', ($event.target as HTMLInputElement).value)"
+                type="number" step="any" min="0.000001" class="input mt-0.5 text-sm" :placeholder="maxReasoningEffortMultiplierPlaceholder" />
             </div>
           </div>
 
@@ -351,6 +356,12 @@ const derivedPricePreview = computed(() => {
     .map(([label, price]) => `${label} $${price}`)
 })
 
+const maxReasoningEffortMultiplierPlaceholder = computed(() =>
+  props.entry.models.some(model => /fable(?:-5-1|-5\.1|5\.1|51)(?!\d)/i.test(model))
+    ? t('admin.channels.form.fable51DefaultMaxReasoningMultiplier')
+    : t('admin.channels.form.multiplierPlaceholder')
+)
+
 function emitField(field: keyof PricingFormEntry, value: string) {
   emit('update', { ...props.entry, [field]: value === '' ? null : value })
 }
@@ -426,6 +437,7 @@ async function onModelsUpdate(newModels: string[]) {
         cache_read_price: perTokenToMTok(result.cache_read_price ?? null),
         image_input_price: perTokenToMTok(result.image_input_price ?? null),
         image_output_price: perTokenToMTok(result.image_output_price ?? null),
+        max_reasoning_effort_multiplier: result.max_reasoning_effort_multiplier ?? null,
       })
     }
   } catch {

@@ -63,19 +63,20 @@ type channelModelPricingRequest struct {
 	InputPrice  *float64 `json:"input_price" binding:"omitempty,min=0"`
 	OutputPrice *float64 `json:"output_price" binding:"omitempty,min=0"`
 	// 派生倍率：只填提示价时用来推出其余三档；对应绝对价一旦填了就以绝对价为准。
-	CompletionMultiplier    *float64                   `json:"completion_multiplier" binding:"omitempty,min=0"`
-	CacheCreationMultiplier *float64                   `json:"cache_creation_multiplier" binding:"omitempty,min=0"`
-	CacheReadMultiplier     *float64                   `json:"cache_read_multiplier" binding:"omitempty,min=0"`
-	CacheWritePrice         *float64                   `json:"cache_write_price" binding:"omitempty,min=0"`
-	CacheWrite1hPrice       *float64                   `json:"cache_write_1h_price" binding:"omitempty,min=0"`
-	CacheReadPrice          *float64                   `json:"cache_read_price" binding:"omitempty,min=0"`
-	FastMultiplier          *float64                   `json:"fast_multiplier" binding:"omitempty,gt=0"`
-	FlexMultiplier          *float64                   `json:"flex_multiplier" binding:"omitempty,gt=0"`
-	ImageInputPrice         *float64                   `json:"image_input_price" binding:"omitempty,min=0"`
-	ImageOutputPrice        *float64                   `json:"image_output_price" binding:"omitempty,min=0"`
-	PerRequestPrice         *float64                   `json:"per_request_price" binding:"omitempty,min=0"`
-	Intervals               []pricingIntervalRequest   `json:"intervals"`
-	TimePricing             *channelTimePricingRequest `json:"time_pricing"`
+	CompletionMultiplier         *float64                   `json:"completion_multiplier" binding:"omitempty,min=0"`
+	CacheCreationMultiplier      *float64                   `json:"cache_creation_multiplier" binding:"omitempty,min=0"`
+	CacheReadMultiplier          *float64                   `json:"cache_read_multiplier" binding:"omitempty,min=0"`
+	CacheWritePrice              *float64                   `json:"cache_write_price" binding:"omitempty,min=0"`
+	CacheWrite1hPrice            *float64                   `json:"cache_write_1h_price" binding:"omitempty,min=0"`
+	CacheReadPrice               *float64                   `json:"cache_read_price" binding:"omitempty,min=0"`
+	FastMultiplier               *float64                   `json:"fast_multiplier" binding:"omitempty,gt=0"`
+	FlexMultiplier               *float64                   `json:"flex_multiplier" binding:"omitempty,gt=0"`
+	MaxReasoningEffortMultiplier *float64                   `json:"max_reasoning_effort_multiplier" binding:"omitempty,gt=0"`
+	ImageInputPrice              *float64                   `json:"image_input_price" binding:"omitempty,min=0"`
+	ImageOutputPrice             *float64                   `json:"image_output_price" binding:"omitempty,min=0"`
+	PerRequestPrice              *float64                   `json:"per_request_price" binding:"omitempty,min=0"`
+	Intervals                    []pricingIntervalRequest   `json:"intervals"`
+	TimePricing                  *channelTimePricingRequest `json:"time_pricing"`
 }
 
 type channelTimePricingRequest struct {
@@ -133,25 +134,26 @@ type channelResponse struct {
 }
 
 type channelModelPricingResponse struct {
-	ID                      int64                       `json:"id"`
-	Platform                string                      `json:"platform"`
-	Models                  []string                    `json:"models"`
-	BillingMode             string                      `json:"billing_mode"`
-	InputPrice              *float64                    `json:"input_price"`
-	OutputPrice             *float64                    `json:"output_price"`
-	CacheWritePrice         *float64                    `json:"cache_write_price"`
-	CacheWrite1hPrice       *float64                    `json:"cache_write_1h_price"`
-	CacheReadPrice          *float64                    `json:"cache_read_price"`
-	CompletionMultiplier    *float64                    `json:"completion_multiplier"`
-	CacheCreationMultiplier *float64                    `json:"cache_creation_multiplier"`
-	CacheReadMultiplier     *float64                    `json:"cache_read_multiplier"`
-	FastMultiplier          *float64                    `json:"fast_multiplier"`
-	FlexMultiplier          *float64                    `json:"flex_multiplier"`
-	ImageInputPrice         *float64                    `json:"image_input_price"`
-	ImageOutputPrice        *float64                    `json:"image_output_price"`
-	PerRequestPrice         *float64                    `json:"per_request_price"`
-	Intervals               []pricingIntervalResponse   `json:"intervals"`
-	TimePricing             *channelTimePricingResponse `json:"time_pricing"`
+	ID                           int64                       `json:"id"`
+	Platform                     string                      `json:"platform"`
+	Models                       []string                    `json:"models"`
+	BillingMode                  string                      `json:"billing_mode"`
+	InputPrice                   *float64                    `json:"input_price"`
+	OutputPrice                  *float64                    `json:"output_price"`
+	CacheWritePrice              *float64                    `json:"cache_write_price"`
+	CacheWrite1hPrice            *float64                    `json:"cache_write_1h_price"`
+	CacheReadPrice               *float64                    `json:"cache_read_price"`
+	CompletionMultiplier         *float64                    `json:"completion_multiplier"`
+	CacheCreationMultiplier      *float64                    `json:"cache_creation_multiplier"`
+	CacheReadMultiplier          *float64                    `json:"cache_read_multiplier"`
+	FastMultiplier               *float64                    `json:"fast_multiplier"`
+	FlexMultiplier               *float64                    `json:"flex_multiplier"`
+	MaxReasoningEffortMultiplier *float64                    `json:"max_reasoning_effort_multiplier"`
+	ImageInputPrice              *float64                    `json:"image_input_price"`
+	ImageOutputPrice             *float64                    `json:"image_output_price"`
+	PerRequestPrice              *float64                    `json:"per_request_price"`
+	Intervals                    []pricingIntervalResponse   `json:"intervals"`
+	TimePricing                  *channelTimePricingResponse `json:"time_pricing"`
 }
 
 type channelTimePricingResponse struct {
@@ -265,25 +267,26 @@ func pricingToResponse(p *service.ChannelModelPricing) channelModelPricingRespon
 		intervals = append(intervals, intervalToResponse(iv))
 	}
 	return channelModelPricingResponse{
-		ID:                      p.ID,
-		Platform:                platform,
-		Models:                  models,
-		BillingMode:             billingMode,
-		InputPrice:              p.InputPrice,
-		OutputPrice:             p.OutputPrice,
-		CacheWritePrice:         p.CacheWritePrice,
-		CacheWrite1hPrice:       p.CacheWrite1hPrice,
-		CacheReadPrice:          p.CacheReadPrice,
-		CompletionMultiplier:    p.CompletionMultiplier,
-		CacheCreationMultiplier: p.CacheCreationMultiplier,
-		CacheReadMultiplier:     p.CacheReadMultiplier,
-		FastMultiplier:          p.FastMultiplier,
-		FlexMultiplier:          p.FlexMultiplier,
-		ImageInputPrice:         p.ImageInputPrice,
-		ImageOutputPrice:        p.ImageOutputPrice,
-		PerRequestPrice:         p.PerRequestPrice,
-		Intervals:               intervals,
-		TimePricing:             timePricingToResponse(p.TimePricing),
+		ID:                           p.ID,
+		Platform:                     platform,
+		Models:                       models,
+		BillingMode:                  billingMode,
+		InputPrice:                   p.InputPrice,
+		OutputPrice:                  p.OutputPrice,
+		CacheWritePrice:              p.CacheWritePrice,
+		CacheWrite1hPrice:            p.CacheWrite1hPrice,
+		CacheReadPrice:               p.CacheReadPrice,
+		CompletionMultiplier:         p.CompletionMultiplier,
+		CacheCreationMultiplier:      p.CacheCreationMultiplier,
+		CacheReadMultiplier:          p.CacheReadMultiplier,
+		FastMultiplier:               p.FastMultiplier,
+		FlexMultiplier:               p.FlexMultiplier,
+		MaxReasoningEffortMultiplier: p.MaxReasoningEffortMultiplier,
+		ImageInputPrice:              p.ImageInputPrice,
+		ImageOutputPrice:             p.ImageOutputPrice,
+		PerRequestPrice:              p.PerRequestPrice,
+		Intervals:                    intervals,
+		TimePricing:                  timePricingToResponse(p.TimePricing),
 	}
 }
 
@@ -360,36 +363,38 @@ func pricingRequestToService(reqs []channelModelPricingRequest, allowChannelMult
 				SortOrder:            iv.SortOrder,
 			})
 		}
-		var fastMultiplier, flexMultiplier *float64
-		// 派生倍率与 fast/flex 同一处境：账号成本统计那条路径直接用 *float64 价格算钱、
+		var fastMultiplier, flexMultiplier, maxReasoningEffortMultiplier *float64
+		// 派生倍率与 fast/flex/max 同一处境：账号成本统计那条路径直接用 *float64 价格算钱、
 		// 不查模型目录，倍率在那边没有生效点，所以在边界上一起丢掉，避免"存了却不生效"。
 		var completionMultiplier, cacheCreationMultiplier, cacheReadMultiplier *float64
 		if allowChannelMultipliers {
 			fastMultiplier = r.FastMultiplier
 			flexMultiplier = r.FlexMultiplier
+			maxReasoningEffortMultiplier = r.MaxReasoningEffortMultiplier
 			completionMultiplier = r.CompletionMultiplier
 			cacheCreationMultiplier = r.CacheCreationMultiplier
 			cacheReadMultiplier = r.CacheReadMultiplier
 		}
 		result = append(result, service.ChannelModelPricing{
-			Platform:                platform,
-			Models:                  r.Models,
-			BillingMode:             billingMode,
-			InputPrice:              r.InputPrice,
-			OutputPrice:             r.OutputPrice,
-			CacheWritePrice:         r.CacheWritePrice,
-			CacheWrite1hPrice:       r.CacheWrite1hPrice,
-			CacheReadPrice:          r.CacheReadPrice,
-			CompletionMultiplier:    completionMultiplier,
-			CacheCreationMultiplier: cacheCreationMultiplier,
-			CacheReadMultiplier:     cacheReadMultiplier,
-			FastMultiplier:          fastMultiplier,
-			FlexMultiplier:          flexMultiplier,
-			ImageInputPrice:         r.ImageInputPrice,
-			ImageOutputPrice:        r.ImageOutputPrice,
-			PerRequestPrice:         r.PerRequestPrice,
-			Intervals:               intervals,
-			TimePricing:             timePricingRequestToService(r.TimePricing),
+			Platform:                     platform,
+			Models:                       r.Models,
+			BillingMode:                  billingMode,
+			InputPrice:                   r.InputPrice,
+			OutputPrice:                  r.OutputPrice,
+			CacheWritePrice:              r.CacheWritePrice,
+			CacheWrite1hPrice:            r.CacheWrite1hPrice,
+			CacheReadPrice:               r.CacheReadPrice,
+			CompletionMultiplier:         completionMultiplier,
+			CacheCreationMultiplier:      cacheCreationMultiplier,
+			CacheReadMultiplier:          cacheReadMultiplier,
+			FastMultiplier:               fastMultiplier,
+			FlexMultiplier:               flexMultiplier,
+			MaxReasoningEffortMultiplier: maxReasoningEffortMultiplier,
+			ImageInputPrice:              r.ImageInputPrice,
+			ImageOutputPrice:             r.ImageOutputPrice,
+			PerRequestPrice:              r.PerRequestPrice,
+			Intervals:                    intervals,
+			TimePricing:                  timePricingRequestToService(r.TimePricing),
 		})
 	}
 	return result
@@ -634,14 +639,15 @@ func (h *ChannelHandler) GetModelDefaultPricing(c *gin.Context) {
 	}
 
 	response.Success(c, gin.H{
-		"found":                true,
-		"input_price":          pricing.InputPricePerToken,
-		"output_price":         pricing.OutputPricePerToken,
-		"cache_write_price":    cacheWritePrice,
-		"cache_write_1h_price": cacheWrite1hPrice,
-		"cache_read_price":     pricing.CacheReadPricePerToken,
-		"image_input_price":    pricing.ImageInputPricePerToken,
-		"image_output_price":   pricing.ImageOutputPricePerToken,
+		"found":                           true,
+		"input_price":                     pricing.InputPricePerToken,
+		"output_price":                    pricing.OutputPricePerToken,
+		"cache_write_price":               cacheWritePrice,
+		"cache_write_1h_price":            cacheWrite1hPrice,
+		"cache_read_price":                pricing.CacheReadPricePerToken,
+		"max_reasoning_effort_multiplier": pricing.MaxReasoningEffortMultiplier,
+		"image_input_price":               pricing.ImageInputPricePerToken,
+		"image_output_price":              pricing.ImageOutputPricePerToken,
 	})
 }
 
