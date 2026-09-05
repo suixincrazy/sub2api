@@ -36,7 +36,8 @@ type transportFailoverSpec struct {
 // proxy / DNS / TCP / TLS). It:
 //  1. records the failure in Ops error logs (status 0, kind=request_error) —
 //     the caller passes path-specific fields (UpstreamURL, Passthrough) via
-//     event; identity and classification fields are filled here;
+//     event; identity, proxy attribution and classification fields are
+//     filled here from the same account snapshot that built the transport;
 //  2. for durable faults (expired/rejected proxy creds, dead proxy,
 //     DNS/routing) emits a stable warn event that alert rules can key on —
 //     see logUpstreamTransportPersistentFault for why this does not touch
@@ -50,6 +51,7 @@ type transportFailoverSpec struct {
 func (s *GatewayService) handleUpstreamTransportError(ctx context.Context, c *gin.Context, account *Account, err error, event OpsUpstreamErrorEvent, spec transportFailoverSpec) error {
 	safeErr := sanitizeUpstreamErrorMessage(err.Error())
 	setOpsUpstreamError(c, 0, safeErr, "")
+	event.ProxyID, event.ProxyName = opsUpstreamProxyAttribution(account)
 	event.Platform = account.Platform
 	event.AccountID = account.ID
 	event.AccountName = account.Name
