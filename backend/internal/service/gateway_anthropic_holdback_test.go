@@ -347,9 +347,10 @@ func TestAnthropicHoldbackVerdict(t *testing.T) {
 		// 次数额度还有余额，但累计墙钟已经吃满，不能再换号：这一档正是 12:56:10 的形态，
 		// 三次尝试各 92.6s / 51.7s / 75.9s，次数额度（2）严格按设计工作，代价却是 220 秒。
 		{
-			name:       "预算吃满：次数还有余额也不再丢弃",
-			budgetGone: true,
-			stopReason: "end_turn", proseRunes: 131, outputTokens: 70,
+			name:              "预算吃满：次数还有余额也不再丢弃",
+			budgetGone:        true,
+			heuristicDiscards: 1,
+			stopReason:        "end_turn", proseRunes: 131, outputTokens: 70,
 			want: anthropicHoldbackRelease,
 		},
 		// 反面：预算没吃满时判定一字不改，免得这条线悄悄改掉既有行为。
@@ -380,7 +381,8 @@ func TestAnthropicHoldbackVerdict(t *testing.T) {
 		{
 			name:       "预算吃满与死气吃满同时成立：放行",
 			budgetGone: true, deadAir: true, windowGone: true,
-			stopReason: "end_turn", proseRunes: 131, outputTokens: 70,
+			heuristicDiscards: 1,
+			stopReason:        "end_turn", proseRunes: 131, outputTokens: 70,
 			want: anthropicHoldbackRelease,
 		},
 		// 预算不得让「本来就该放行」的健康回合改变结局。
@@ -2372,14 +2374,13 @@ func TestAnthropicPassthrough_HoldbackZeroProseThinkingExposedWhenExtensionDisab
 //
 // 洞在「零正文」那个入口原本附加的 thinkingRunes > 0 上：能提交响应的帧本身**不一定贡献
 // rune**。anthropicSSEPayloadCommitsResponse 对带非空 thinking 的 content_block_start 返回
-// true，而 anthropicThinkingRunes 只数 content_block_delta 的 thinking_delta，于是首个提交帧
+// true，而当时 anthropicThinkingRunes 只数 content_block_delta 的 thinking_delta，于是首个提交帧
 // 落地那一刻 thinkingRunes 还是 0、proseRunes 也是 0，两个入口双双不成立，三条线全按未放宽的
 // 原值走，maxHold 在 firstCommitPointAt+10s 就把缓冲放了出去。text 块、tool_use 块的起始帧
 // 同理，redacted_thinking 带 data 时也一样。
 //
-// 判据只有两件事：stop_reason 未到、正文为零。这一条钉的就是「提交了但一个 rune 都没有」
-// 这个中间态必须已经在放宽状态里。
-func TestAnthropicHoldbackObserverZeroRuneCommitFrameStillRelaxes(t *testing.T) {
+// 起始内容现在计入 rune；正文仍为零时，无论思考是零还是很短，都必须保留判定窗口。
+func TestAnthropicHoldbackObserverInitialCommitFrameStillRelaxes(t *testing.T) {
 	const window = 15 * time.Second
 	const maxHold = 10 * time.Second
 	const deadAir = 25 * time.Second
@@ -2387,14 +2388,15 @@ func TestAnthropicHoldbackObserverZeroRuneCommitFrameStillRelaxes(t *testing.T) 
 
 	base := time.Date(2026, 8, 27, 22, 55, 7, 0, time.UTC)
 
-	// 三种「提交但零 rune」的起始帧，逐个确认放宽都成立。
+	// 空 text 起始帧仍不贡献 rune，其余两种必须计入初始思考。
 	for _, tc := range []struct {
-		name  string
-		frame string
+		name     string
+		frame    string
+		thinking int
 	}{
-		{"thinking块起始帧带非空thinking", `{"type":"content_block_start","index":0,"content_block":{"type":"thinking","thinking":"嗯"}}`},
-		{"redacted_thinking块起始帧带data", `{"type":"content_block_start","index":0,"content_block":{"type":"redacted_thinking","data":"AAAA"}}`},
-		{"text块起始帧", `{"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}`},
+		{"thinking块起始帧带非空thinking", `{"type":"content_block_start","index":0,"content_block":{"type":"thinking","thinking":"嗯"}}`, 1},
+		{"redacted_thinking块起始帧带data", `{"type":"content_block_start","index":0,"content_block":{"type":"redacted_thinking","data":"AAAA"}}`, 4},
+		{"text块起始帧", `{"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}`, 0},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			o := &anthropicHoldbackObserver{longThinkingHoldFloor: floor}
@@ -2406,10 +2408,10 @@ func TestAnthropicHoldbackObserverZeroRuneCommitFrameStillRelaxes(t *testing.T) 
 			o.observe(parsed, true, base)
 
 			require.False(t, o.firstCommitPointAt.IsZero(), "构造前提：提交点已经就位")
-			require.Zero(t, o.thinkingRunes, "构造前提：提交帧本身不贡献 thinking rune")
+			require.Equal(t, tc.thinking, o.thinkingRunes, "起始思考内容必须按 rune 计数")
 			require.Zero(t, o.proseRunes, "构造前提：正文仍是零")
 			require.True(t, o.longThinkingJudgementPending(),
-				"提交了但零 rune 时放宽必须成立——这正是 06:55:07 漏掉的中间态")
+				"正文仍为零时放宽必须成立，包括空 text 起始帧")
 
 			// 三条线都被推到下限，原值到点时一条都不该放行。
 			require.False(t, o.maxHoldElapsed(base.Add(maxHold), maxHold))

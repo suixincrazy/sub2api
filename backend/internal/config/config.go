@@ -1220,7 +1220,8 @@ type GatewayConfig struct {
 	AnthropicHoldbackLongThinkingHoldMs int `mapstructure:"anthropic_holdback_long_thinking_hold_ms"`
 
 	// AnthropicHoldbackDiscardBudgetMs: 一次客户端请求允许花在丢弃重试上的累计墙钟（毫秒），
-	// 0 表示不封顶。预算吃满后即便次数额度还有余额也不再丢弃，直接放行手上这一发。
+	// 0 表示不封顶。首次内容丢弃不受时间预算限制；之后预算吃满即放行手上这一发。
+	// HTTP 错误和慢 TTFB 不能耗掉唯一的内容修复机会，后续重试仍受累计墙钟与次数双重限制。
 	//
 	// 为什么次数额度不够：anthropicShortTurnDiscardBudget 数的是**丢了几次**，而客户端痛的是
 	// **等了多久**。这两个量之间隔着上游 TTFB，而 TTFB 的尾巴极长（3 天 13023 发流式回合：
@@ -1262,7 +1263,7 @@ type GatewayConfig struct {
 	//
 	// 退化行为是放行 + 给下一发解绑，也就是持流机制存在之前的行为，不会更差：这条线只在
 	// 「已经等了很久」时才生效，而那种情形下继续丢弃的期望收益本来就低——上游慢的时候换号
-	// 大概率还是慢。丢弃计数额度保持不变，两条判据取先到者。
+	// 大概率还是慢。首次内容丢弃之后，两条判据取先到者，丢弃计数额度保持不变。
 	//
 	// 块序违规（anthropicBlockOrderDiscardBudget）刻意**不**受这条线约束，理由与它不受
 	// deadAirExhausted 否决相同：那是协议层的确定性矛盾，交付等于把伪造的工具输出交给客户端，

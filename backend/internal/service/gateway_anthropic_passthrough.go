@@ -467,6 +467,18 @@ func anthropicStopReasonIsHealthy(stopReason string) bool {
 // 口径保持一致：signature_delta 与空思考块不算内容，否则纯 signature 的响应会被
 // 误判成有正文。
 func anthropicVisibleDeltaChars(parsed gjson.Result) int {
+	if strings.TrimSpace(parsed.Get("type").String()) == "content_block_start" {
+		block := parsed.Get("content_block")
+		switch strings.ToLower(strings.TrimSpace(block.Get("type").String())) {
+		case "text":
+			return len(block.Get("text").String())
+		case "thinking":
+			return len(block.Get("thinking").String())
+		case "redacted_thinking":
+			return len(block.Get("data").String())
+		}
+		return 0
+	}
 	if strings.TrimSpace(parsed.Get("type").String()) != "content_block_delta" {
 		return 0
 	}
@@ -494,12 +506,17 @@ func anthropicVisibleDeltaChars(parsed gjson.Result) int {
 //
 //  2. 口径。thinking_delta 和 input_json_delta 也被 anthropicVisibleDeltaChars 计入，
 //     但思考链和工具入参都不是「把话说完」的证据：模型可以想很久然后只吐一句就收尾，
-//     那恰恰是要抓的形态。这里只认 text_delta。
+//     那恰恰是要抓的形态。这里只认 text 块起始内容和 text_delta。
 //
-// anthropicVisibleDeltaChars 保持原样不动：它唯一的用途是
-// anthropicStreamLooksIncompleteDespiteTerminal 里的 `== 0` 判零，与单位无关，而那条
-// 路径**会罚号**，不能借这次改动改变它的行为。
+// anthropicVisibleDeltaChars 保留字节单位，只用于残缺判定里的 `== 0` 判零。
+// 起始块可直接携带内容，必须与后续 delta 分别累计，不能把这种合法响应判为空流。
 func anthropicVisibleProseRunes(parsed gjson.Result) int {
+	if strings.TrimSpace(parsed.Get("type").String()) == "content_block_start" {
+		if strings.EqualFold(strings.TrimSpace(parsed.Get("content_block.type").String()), "text") {
+			return utf8.RuneCountInString(parsed.Get("content_block.text").String())
+		}
+		return 0
+	}
 	if strings.TrimSpace(parsed.Get("type").String()) != "content_block_delta" {
 		return 0
 	}
@@ -511,11 +528,20 @@ func anthropicVisibleProseRunes(parsed gjson.Result) int {
 
 // anthropicThinkingRunes 取这一帧的**思考链**贡献的 rune 数。
 //
-// 与 anthropicVisibleProseRunes 严格分开：那个只认 text_delta，这个只认 thinking_delta。
+// 与 anthropicVisibleProseRunes 严格分开：分别累计起始块和 delta 中的正文、思考内容。
 // 两个口径都要，才能分辨「想了很久但正文被切掉」——这一形态下 output_tokens 被思考撑得
 // 很大，而正文近乎为零，单看任何一个量都判不出来。见
 // anthropicTurnLooksSuspiciouslyShort 里的思考分支。
 func anthropicThinkingRunes(parsed gjson.Result) int {
+	if strings.TrimSpace(parsed.Get("type").String()) == "content_block_start" {
+		switch strings.ToLower(strings.TrimSpace(parsed.Get("content_block.type").String())) {
+		case "thinking":
+			return utf8.RuneCountInString(parsed.Get("content_block.thinking").String())
+		case "redacted_thinking":
+			return utf8.RuneCountInString(parsed.Get("content_block.data").String())
+		}
+		return 0
+	}
 	if strings.TrimSpace(parsed.Get("type").String()) != "content_block_delta" {
 		return 0
 	}
@@ -796,7 +822,8 @@ const (
 // 闸门取先到者——次数数的是丢了几次，这一条量的是客户端等了多久，两者之间隔着上游 TTFB，
 // 而 TTFB 的尾巴极长（p99 127s），所以同样丢 2 次可能是 25 秒也可能是 220 秒。到点之后
 // 即便次数还有余额也放行手上这一发，退化成「放行 + 给下一发解绑」，也就是持流存在之前的
-// 行为，不会更差。标定见 GatewayConfig.AnthropicHoldbackDiscardBudgetMs。
+// 行为。首次内容丢弃豁免时间预算，避免 HTTP failover 或慢 TTFB 把第一次修复机会耗尽；
+// 已丢弃过内容后仍按原累计墙钟封顶。标定见 GatewayConfig.AnthropicHoldbackDiscardBudgetMs。
 //
 // blockOrderViolation 是唯一一条**排在所有提前放行出口之前**的判据，而且刻意不受
 // deadAirExhausted 与 discardBudgetExhausted 否决。理由是这一条与其余判据的性质不同：
@@ -837,7 +864,7 @@ func anthropicHoldbackVerdict(
 	// stop_reason 已知时判定是确定的，优先于窗口：窗口只是「等不起了」的兜底，
 	// 而这里已经拿到了全部判据。
 	if strings.TrimSpace(stopReason) != "" {
-		if !discardBudgetExhausted &&
+		if (!discardBudgetExhausted || heuristicDiscardsUsed == 0) &&
 			anthropicTurnLooksSuspiciouslyShort(stopReason, proseRunes, outputTokens, sawToolUseBlock, thinkingRunes) &&
 			heuristicDiscardsUsed < anthropicHoldbackDiscardBudget(stopReason, proseRunes, outputTokens, sawToolUseBlock) {
 			return anthropicHoldbackDiscard
@@ -2237,8 +2264,9 @@ func (s *GatewayService) handleStreamingResponseAnthropicAPIKeyPassthrough(
 	scanner.Buffer(scanBuf[:0], maxLineSize)
 
 	type scanEvent struct {
-		line string
-		err  error
+		line   string
+		err    error
+		readAt time.Time
 	}
 	events := make(chan scanEvent, 16)
 	done := make(chan struct{})
@@ -2256,8 +2284,9 @@ func (s *GatewayService) handleStreamingResponseAnthropicAPIKeyPassthrough(
 		defer putSSEScannerBuf64K(scanBuf)
 		defer close(events)
 		for scanner.Scan() {
-			atomic.StoreInt64(&lastReadAt, time.Now().UnixNano())
-			if !sendEvent(scanEvent{line: scanner.Text()}) {
+			now := time.Now()
+			atomic.StoreInt64(&lastReadAt, now.UnixNano())
+			if !sendEvent(scanEvent{line: scanner.Text(), readAt: now}) {
 				return
 			}
 		}
@@ -2435,10 +2464,6 @@ func (s *GatewayService) handleStreamingResponseAnthropicAPIKeyPassthrough(
 				proseRunes += anthropicVisibleProseRunes(parsedFrame)
 				thinkingRunes += anthropicThinkingRunes(parsedFrame)
 			}
-			if firstTokenMs == nil && trimmed != "" && trimmed != "[DONE]" {
-				ms := int(time.Since(startTime).Milliseconds())
-				firstTokenMs = &ms
-			}
 			parseSSEUsagePassthrough(data, usage)
 		} else {
 			trimmed := strings.TrimSpace(line)
@@ -2595,6 +2620,15 @@ func (s *GatewayService) handleStreamingResponseAnthropicAPIKeyPassthrough(
 			}
 
 			line := ev.line
+			// Measure upstream arrival before buffering, never at prelude replay/flush time.
+			if firstTokenMs == nil {
+				if data, ok := extractAnthropicSSEDataLine(line); ok {
+					if trimmed := strings.TrimSpace(data); trimmed != "" && trimmed != "[DONE]" {
+						ms := int(ev.readAt.Sub(startTime).Milliseconds())
+						firstTokenMs = &ms
+					}
+				}
+			}
 			trimmedLine := strings.TrimSpace(line)
 			if !streamCommitted {
 				pendingPreludeLines = append(pendingPreludeLines, line)
