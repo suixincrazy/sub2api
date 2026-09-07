@@ -879,6 +879,9 @@ func resolveOpenAIErrorSchedulingModel(billingModel, upstreamModel string) strin
 }
 
 func (s *OpenAIGatewayService) selectAccountForModelWithExclusions(ctx context.Context, groupID *int64, platform string, sessionHash string, requestedModel string, excludedIDs map[int64]struct{}, requireCompact bool, stickyAccountID int64, requiredCapability OpenAIEndpointCapability, preferLowUpstreamRate bool) (*Account, error) {
+	if s.clearOpenAIOverloadFallbackBinding(ctx, groupID, sessionHash, requestedModel, excludedIDs) {
+		stickyAccountID = 0
+	}
 	platform = NormalizeOpenAICompatiblePlatform(platform)
 	if stickyAccountID <= 0 && sessionHash != "" && s.cache != nil {
 		if accountID, err := s.getStickySessionAccountID(ctx, groupID, sessionHash); err == nil {
@@ -955,6 +958,9 @@ func (s *OpenAIGatewayService) tryStickySessionHit(ctx context.Context, groupID 
 
 	account, err := s.getSchedulableAccount(ctx, accountID)
 	if err != nil {
+		return nil
+	}
+	if s.shouldYieldOpenAIOverloadSticky(groupID, account, requestedModel) {
 		return nil
 	}
 
@@ -1057,6 +1063,7 @@ func (s *OpenAIGatewayService) selectBestAccount(ctx context.Context, groupID *i
 	if len(eligible) == 0 {
 		return nil, compactBlocked, filterStats
 	}
+	eligible = s.preferOpenAIOverloadRecovery(groupID, requestedModel, eligible)
 	rateOrder := openAILegacyUpstreamRateOrder{}
 	if preferLowUpstreamRate {
 		rateOrder = newOpenAILegacyUpstreamRateOrder(eligible, time.Now(), s.openAIOAuthSchedulingRateMultiplier(ctx))
@@ -1118,6 +1125,7 @@ func (s *OpenAIGatewayService) SelectAccountWithLoadAwareness(ctx context.Contex
 }
 
 func (s *OpenAIGatewayService) selectAccountWithLoadAwareness(ctx context.Context, groupID *int64, platform string, sessionHash string, requestedModel string, excludedIDs map[int64]struct{}, requireCompact bool, requiredCapability OpenAIEndpointCapability, useUpstreamTokenCost bool) (*AccountSelectionResult, error) {
+	s.clearOpenAIOverloadFallbackBinding(ctx, groupID, sessionHash, requestedModel, excludedIDs)
 	platform = NormalizeOpenAICompatiblePlatform(platform)
 	if s.checkChannelPricingRestriction(ctx, groupID, requestedModel) {
 		slog.Warn("channel pricing restriction blocked request",
@@ -1199,6 +1207,8 @@ func (s *OpenAIGatewayService) selectAccountWithLoadAwareness(ctx context.Contex
 					account = s.recheckSelectedOpenAIAccountFromDB(ctx, account, groupID, platform, requestedModel, requireCompact, requiredCapability)
 					if account == nil {
 						_ = s.deleteStickySessionAccountID(ctx, groupID, sessionHash)
+					} else if s.shouldYieldOpenAIOverloadSticky(groupID, account, requestedModel) {
+						// Recovered primaries take precedence over fallback affinity.
 					} else if s.maybePreemptOpenAISticky(ctx, groupID, sessionHash, account, accounts,
 						isExcluded, platform, requestedModel, requireCompact, requiredCapability,
 						needsUpstreamCheck, stickyPreemptionConfigFromScheduling(cfg)) {
@@ -1274,7 +1284,7 @@ func (s *OpenAIGatewayService) selectAccountWithLoadAwareness(ctx context.Contex
 			filterStats.exclude("shadow_parent_unhealthy")
 			continue
 		}
-		if s.isOpenAIAccountRequestRuntimeBlocked(acc, requestedModel) {
+		if s.isOpenAIAccountRequestRuntimeBlocked(acc, requestedModel) || s.isOpenAIOverloadBlocked(groupID, acc, requestedModel) {
 			filterStats.exclude("runtime_blocked")
 			continue
 		}
@@ -1344,6 +1354,11 @@ func (s *OpenAIGatewayService) selectAccountWithLoadAwareness(ctx context.Contex
 		if rateOrder.enabled {
 			sort.SliceStable(available, func(i, j int) bool {
 				return rateOrder.compare(available[i].account, available[j].account) < 0
+			})
+		}
+		if priority, recovered := s.openAIOverloadRecoveryPriority(groupID, requestedModel); recovered {
+			sort.SliceStable(available, func(i, j int) bool {
+				return available[i].account.Priority <= priority && available[j].account.Priority > priority
 			})
 		}
 
@@ -1595,7 +1610,7 @@ func (s *OpenAIGatewayService) recheckSelectedOpenAIAccountFromDB(ctx context.Co
 }
 
 func (s *OpenAIGatewayService) recheckSelectedOpenAIAccountFromDBBeforeProfit(ctx context.Context, account *Account, groupID *int64, platform string, requestedModel string, requireCompact bool, requiredCapability OpenAIEndpointCapability) *Account {
-	if account == nil {
+	if account == nil || s.isOpenAIOverloadBlocked(groupID, account, requestedModel) {
 		return nil
 	}
 	platform = NormalizeOpenAICompatiblePlatform(platform)
@@ -1634,7 +1649,7 @@ func (s *OpenAIGatewayService) recheckSelectedOpenAIAccountFromDBBeforeProfit(ct
 	if !parentHealthyForShadow(latest, s.parentAccountLookup(ctx)) {
 		return nil
 	}
-	if s.isOpenAIAccountRequestRuntimeBlocked(latest, requestedModel) {
+	if s.isOpenAIAccountRequestRuntimeBlocked(latest, requestedModel) || s.isOpenAIOverloadBlocked(groupID, latest, requestedModel) {
 		return nil
 	}
 	if s.isOpenAIAccountBlockedBySchedulingThreshold(ctx, latest) {

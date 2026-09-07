@@ -1162,6 +1162,7 @@ func (s *OpenAIGatewayService) proxyResponsesWebSocketV2Passthrough(
 		firstTurnStartedAt = hooks.InitialTurnStartedAt
 	}
 	failureAccountSideEffectsApplied := false
+	var turnCapacityShed atomic.Bool
 	relayResult, relayExit := openaiwsv2.RunEntry(openaiwsv2.EntryInput{
 		Ctx:                ctx,
 		ClientConn:         policyClientConn,
@@ -1193,6 +1194,11 @@ func (s *OpenAIGatewayService) proxyResponsesWebSocketV2Passthrough(
 				)
 			},
 			OnTurnComplete: func(turn openaiwsv2.RelayTurnResult) {
+				capacityShed := turnCapacityShed.Swap(false)
+				terminalEvent := normalizeOpenAIWSTerminalEvent(turn.TerminalEventType)
+				if terminalEvent == "response.completed" || terminalEvent == "response.done" {
+					capacityShed = false
+				}
 				turnNo := int(completedTurns.Add(1))
 				if hooks != nil && hooks.TurnStarted != nil && !turn.StartedAt.IsZero() {
 					hooks.TurnStarted(turnNo, turn.StartedAt)
@@ -1217,7 +1223,8 @@ func (s *OpenAIGatewayService) proxyResponsesWebSocketV2Passthrough(
 					RequestedReasoningEffort:      usageMeta.requestedReasoningEffort.Load(),
 					Stream:                        true,
 					OpenAIWSMode:                  true,
-					UpstreamTerminalEvent:         normalizeOpenAIWSTerminalEvent(turn.TerminalEventType),
+					UpstreamTerminalEvent:         terminalEvent,
+					UpstreamCapacityShed:          capacityShed,
 					ResponseHeaders:               cloneHeader(handshakeHeaders),
 					Duration:                      turn.Duration,
 					FirstTokenMs:                  turn.FirstTokenMs,
@@ -1276,6 +1283,9 @@ func (s *OpenAIGatewayService) proxyResponsesWebSocketV2Passthrough(
 				eventType, _, _ := parseOpenAIWSEventEnvelope(payload)
 				if eventType == "response.created" {
 					failureAccountSideEffectsApplied = false
+				}
+				if (eventType == "error" || eventType == "response.failed") && isOpenAIUpstreamCapacityShedEvent(payload) {
+					turnCapacityShed.Store(true)
 				}
 				if (eventType == "error" || eventType == "response.failed") && markOpenAIWSV2PassthroughCyberPolicy(c, payload) {
 					return nil
@@ -1352,6 +1362,7 @@ func (s *OpenAIGatewayService) proxyResponsesWebSocketV2Passthrough(
 		Stream:                        true,
 		OpenAIWSMode:                  true,
 		UpstreamTerminalEvent:         normalizeOpenAIWSTerminalEvent(relayResult.TerminalEventType),
+		UpstreamCapacityShed:          turnCapacityShed.Load(),
 		ResponseHeaders:               cloneHeader(handshakeHeaders),
 		Duration:                      relayResult.Duration,
 		FirstTokenMs:                  relayResult.FirstTokenMs,

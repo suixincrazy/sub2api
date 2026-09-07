@@ -177,6 +177,13 @@ func openAIForwardSucceededForScheduling(result *service.OpenAIForwardResult) bo
 	return result.SucceededForScheduling()
 }
 
+func (h *OpenAIGatewayHandler) observeOpenAIOverloadResult(groupID *int64, account *service.Account, model string, result *service.OpenAIForwardResult, err error) {
+	if result != nil && result.UpstreamCapacityShed {
+		err = service.ErrOpenAIUpstreamOverloaded
+	}
+	h.gatewayService.ObserveOpenAIAccountOverloadResult(groupID, account, model, err == nil && openAIForwardSucceededForScheduling(result), err)
+}
+
 func openAIAccountScheduleModel(c *gin.Context, account *service.Account, forwardModel string, requireCompact bool, result *service.OpenAIForwardResult) string {
 	if result != nil {
 		if actual := strings.TrimSpace(result.UpstreamModel); actual != "" {
@@ -772,6 +779,7 @@ func (h *OpenAIGatewayHandler) Responses(c *gin.Context) {
 			}()
 			return h.gatewayService.Forward(c.Request.Context(), c, account, attemptBody)
 		}()
+		h.observeOpenAIOverloadResult(apiKey.GroupID, account, forwardModel, result, err)
 		var cyberBlockBodyHTTP []byte
 		if service.GetOpsCyberPolicy(c) != nil {
 			cyberBlockBodyHTTP = sessionHashBody
@@ -1337,6 +1345,7 @@ func (h *OpenAIGatewayHandler) Messages(c *gin.Context) {
 			}()
 			return h.gatewayService.ForwardAsAnthropic(c.Request.Context(), c, account, forwardBody, promptCacheKey, defaultMappedModel)
 		}()
+		h.observeOpenAIOverloadResult(apiKey.GroupID, account, currentRoutingModel, result, err)
 		var cyberBlockBodyMsg []byte
 		if service.GetOpsCyberPolicy(c) != nil {
 			cyberBlockBodyMsg = body
@@ -2731,6 +2740,9 @@ func (h *OpenAIGatewayHandler) ResponsesWebSocket(c *gin.Context) {
 		// turn 级定价：BeforeTurn 重新冻结 pricingAt 并按最新门复核当前账号；
 		// passthrough 没有 BeforeTurn 时，AfterTurn 回退到 TurnStarted 的所属 turn 时刻。
 		var turnPricing openAIWSTurnPricing
+		var overloadFailureObserved atomic.Bool
+		var overloadRoutingModel atomic.Pointer[string]
+		overloadRoutingModel.Store(&wsForwardModel)
 		hooks := &service.OpenAIWSIngressHooks{
 			ClientLifecycleContext:      clientLifecycleCtx,
 			InitialRequestModel:         reqModel,
@@ -2776,6 +2788,12 @@ func (h *OpenAIGatewayHandler) ResponsesWebSocket(c *gin.Context) {
 				}
 				setOpsRequestContext(c, model, true)
 				mapping, _ := h.gatewayService.ResolveChannelMappingAndRestrict(ctx, apiKey.GroupID, model)
+				routingModel := openAIChannelForwardModel(mapping, model)
+				overloadRoutingModel.Store(&routingModel)
+				overloadFailureObserved.Store(false)
+				if turn > 1 && h.gatewayService.ShouldReselectOpenAIAccountAfterOverload(apiKey.GroupID, account, routingModel) {
+					return "", service.NewOpenAIWSClientCloseError(coderws.StatusGoingAway, "account routing changed after overload; please reconnect", nil)
+				}
 				mappedModelUnchanged := false
 				if previous := turnChannelMapping.Load(); previous != nil && previous.turn < turn {
 					mappedModelUnchanged = strings.TrimSpace(previous.mapping.MappedModel) == strings.TrimSpace(mapping.MappedModel)
@@ -2859,6 +2877,12 @@ func (h *OpenAIGatewayHandler) ResponsesWebSocket(c *gin.Context) {
 				} else {
 					turnMapping, _ = h.gatewayService.ResolveChannelMappingAndRestrict(ctx, apiKey.GroupID, turnRequestedModel)
 				}
+				if turnErr != nil || (result != nil && result.UpstreamCapacityShed) {
+					overloadFailureObserved.Store(true)
+				}
+				if turnErr != nil || result != nil {
+					h.observeOpenAIOverloadResult(apiKey.GroupID, account, *overloadRoutingModel.Load(), result, turnErr)
+				}
 				if turnUpstreamModel == "" {
 					turnUpstreamModel = turnRequestedModel
 				}
@@ -2904,7 +2928,9 @@ func (h *OpenAIGatewayHandler) ResponsesWebSocket(c *gin.Context) {
 				if scheduleModel == "" {
 					scheduleModel = turnRequestedModel
 				}
-				h.gatewayService.ReportOpenAIAccountScheduleResult(account, scheduleModel, openAIForwardSucceededForScheduling(result), result.FirstTokenMs)
+				if !result.UpstreamCapacityShed {
+					h.gatewayService.ReportOpenAIAccountScheduleResult(account, scheduleModel, openAIForwardSucceededForScheduling(result), result.FirstTokenMs)
+				}
 				inboundEndpoint := GetInboundEndpoint(c)
 				upstreamEndpoint := resolveOpenAIUpstreamEndpoint(c, account, result)
 				quotaPlatform := service.QuotaPlatform(c.Request.Context(), apiKey)
@@ -2961,7 +2987,11 @@ func (h *OpenAIGatewayHandler) ResponsesWebSocket(c *gin.Context) {
 		}
 
 		for {
+			overloadFailureObserved.Store(false)
 			err := h.gatewayService.ProxyResponsesWebSocketFromClient(ctx, c, wsConn, account, token, wsFirstMessage, hooks)
+			if err != nil && !overloadFailureObserved.Load() {
+				h.gatewayService.ObserveOpenAIAccountOverloadResult(apiKey.GroupID, account, *overloadRoutingModel.Load(), false, err)
+			}
 			if err == nil {
 				reqLog.Info("openai.websocket_ingress_closed", zap.Int64("account_id", account.ID))
 				return
@@ -2986,7 +3016,7 @@ func (h *OpenAIGatewayHandler) ResponsesWebSocket(c *gin.Context) {
 						zap.Int("retry_payload_bytes", len(retryPayload)),
 					)
 				}
-				if waitForWSSameAccountRetry(account, failoverErr) {
+				if !h.gatewayService.ShouldReselectOpenAIAccountAfterOverload(apiKey.GroupID, account, *overloadRoutingModel.Load()) && waitForWSSameAccountRetry(account, failoverErr) {
 					if failoverErr.ShouldReportAccountScheduleFailure() {
 						h.gatewayService.ReportOpenAIAccountScheduleResult(account, openAIAccountScheduleModel(c, account, wsForwardModel, false, nil), false, nil, err)
 					}

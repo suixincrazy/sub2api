@@ -376,6 +376,9 @@ func (s *defaultOpenAIAccountScheduler) Select(
 	ctx context.Context,
 	req OpenAIAccountScheduleRequest,
 ) (*AccountSelectionResult, OpenAIAccountScheduleDecision, error) {
+	if s != nil && !req.PreserveStickyBinding && s.service.clearOpenAIOverloadFallbackBinding(ctx, req.GroupID, req.SessionHash, req.RequestedModel, req.ExcludedIDs) {
+		req.StickyAccountID = 0
+	}
 	if s != nil && s.service != nil && s.service.openAIGroupRequiresPrivacySet(ctx, req.GroupID) {
 		req.RequirePrivacySet = true
 	}
@@ -408,7 +411,7 @@ func (s *defaultOpenAIAccountScheduler) Select(
 			if hasGroupMetadata && s.service != nil {
 				groupCompatible = s.service.openAIAccountMatchesSchedulingGroup(selection.Account, req.GroupID)
 			}
-			if !groupCompatible ||
+			if s.service.shouldYieldOpenAIOverloadSticky(req.GroupID, selection.Account, req.RequestedModel) || !groupCompatible ||
 				!compatible || !s.isAccountTransportCompatible(selection.Account, req.RequiredTransport) {
 				if selection.ReleaseFunc != nil {
 					selection.ReleaseFunc()
@@ -523,6 +526,9 @@ func (s *defaultOpenAIAccountScheduler) selectBySessionHash(
 	}
 	if shouldClearStickySession(account, req.RequestedModel) || account.Platform != NormalizeOpenAICompatiblePlatform(req.Platform) || !account.IsOpenAICompatible() || !account.IsSchedulable() {
 		clearBinding()
+		return nil, false, nil
+	}
+	if s.service.shouldYieldOpenAIOverloadSticky(req.GroupID, account, req.RequestedModel) {
 		return nil, false, nil
 	}
 	if compatible, reason := s.isAccountRequestCompatibleReason(ctx, account, req); !compatible {
@@ -1148,6 +1154,21 @@ func (s *defaultOpenAIAccountScheduler) buildOpenAISelectionOrder(
 		return append(primary, overflow...)
 	}
 
+	buildRecoveryOrder := func(pool []openAIAccountCandidateScore) []openAIAccountCandidateScore {
+		priority, recovered := s.service.openAIOverloadRecoveryPriority(req.GroupID, req.RequestedModel)
+		if !recovered {
+			return buildSelectionOrder(pool)
+		}
+		var preferred, fallback []openAIAccountCandidateScore
+		for _, candidate := range pool {
+			if candidate.account.Platform == PlatformOpenAI && candidate.account.Priority <= priority {
+				preferred = append(preferred, candidate)
+			} else {
+				fallback = append(fallback, candidate)
+			}
+		}
+		return append(buildSelectionOrder(preferred), buildSelectionOrder(fallback)...)
+	}
 	if req.RequireCompact {
 		supported := make([]openAIAccountCandidateScore, 0, len(plan.candidates))
 		unknown := make([]openAIAccountCandidateScore, 0, len(plan.candidates))
@@ -1160,15 +1181,15 @@ func (s *defaultOpenAIAccountScheduler) buildOpenAISelectionOrder(
 			}
 		}
 		selectionOrder := make([]openAIAccountCandidateScore, 0, len(plan.allCandidates))
-		selectionOrder = append(selectionOrder, buildSelectionOrder(supported)...)
-		selectionOrder = append(selectionOrder, buildSelectionOrder(unknown)...)
+		selectionOrder = append(selectionOrder, buildRecoveryOrder(supported)...)
+		selectionOrder = append(selectionOrder, buildRecoveryOrder(unknown)...)
 		if len(plan.staleSnapshotCompactRetry) > 0 && s.service.schedulerSnapshot != nil {
 			selectionOrder = append(selectionOrder, sortOpenAICompactRetryCandidates(plan.staleSnapshotCompactRetry)...)
 		}
 		return selectionOrder
 	}
 
-	return buildSelectionOrder(plan.candidates)
+	return buildRecoveryOrder(plan.candidates)
 }
 
 func sortOpenAICompactRetryCandidates(pool []openAIAccountCandidateScore) []openAIAccountCandidateScore {
@@ -1536,7 +1557,8 @@ func (s *defaultOpenAIAccountScheduler) selectByLoadBalance(
 		}
 	}
 
-	if req.SubscriptionPriority {
+	_, overloadRecovered := s.service.openAIOverloadRecoveryPriority(req.GroupID, req.RequestedModel)
+	if req.SubscriptionPriority && !overloadRecovered {
 		subscriptionAccounts, regularAccounts := partitionOpenAIChatGPTSubscriptionAccounts(filtered)
 		if len(subscriptionAccounts) > 0 {
 			attempt := s.trySelectByLoadBalancePool(ctx, req, subscriptionAccounts, loadMap, budget)
@@ -1836,6 +1858,9 @@ func (s *defaultOpenAIAccountScheduler) isAccountRequestCompatibleReason(ctx con
 	}
 	if req.RequirePrivacySet && !account.IsPrivacySet() {
 		return false, "privacy_not_set"
+	}
+	if s != nil && s.service != nil && s.service.isOpenAIOverloadBlocked(req.GroupID, account, req.RequestedModel) {
+		return false, "overload_demoted"
 	}
 	if s != nil && s.service != nil && s.service.isOpenAIAccountRequestRuntimeBlocked(account, req.RequestedModel) {
 		return false, "runtime_blocked"
@@ -2493,6 +2518,11 @@ func (s *OpenAIGatewayService) isOpenAIAccountTransportCompatible(account *Accou
 
 func (s *OpenAIGatewayService) ReportOpenAIAccountScheduleResult(account *Account, model string, success bool, firstTokenMs *int, observedErr ...error) bool {
 	if account == nil {
+		return false
+	}
+	// Capacity failures have their own group/model state, not generic EWMA or
+	// persistent health penalties that would delay the immediate primary retry.
+	if account.Platform == PlatformOpenAI && !success && len(observedErr) > 0 && isOpenAIObservedOverload(observedErr[0]) {
 		return false
 	}
 	accountID := account.ID
