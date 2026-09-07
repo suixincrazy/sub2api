@@ -14,6 +14,7 @@ var ErrOpenAIUpstreamOverloaded = errors.New("OpenAI servers are currently overl
 
 const (
 	openAIOverloadThreshold  = 6
+	openAIOverloadProbeDelay = 2 * time.Minute
 	openAIOverloadStateTTL   = 10 * time.Minute
 	openAIOverloadMaxEntries = 4096
 )
@@ -25,10 +26,11 @@ type openAIOverloadKey struct {
 }
 
 type openAIOverloadEntry struct {
-	failures  int
-	priority  int
-	recovered bool
-	expiresAt time.Time
+	failures   int
+	priority   int
+	recovered  bool
+	expiresAt  time.Time
+	probeAfter time.Time
 }
 
 type openAIAccountOverloadState struct {
@@ -69,15 +71,8 @@ func (s *OpenAIGatewayService) observeOpenAIAccountOverloadResult(groupID *int64
 	state.mu.Lock()
 	defer state.mu.Unlock()
 	key := openAIOverloadKey{derefGroupID(groupID), openAIOverloadModel(model), account.ID}
-	for k, entry := range state.entries {
-		if !now.Before(entry.expiresAt) {
-			delete(state.entries, k)
-		} else if k.groupID == key.groupID && k.model == key.model && entry.failures >= openAIOverloadThreshold {
-			// Active fallback traffic keeps demotion alive until a success;
-			// the TTL only discards idle routing state, not a slow fallback.
-			entry.expiresAt = now.Add(openAIOverloadStateTTL)
-			state.entries[k] = entry
-		}
+	for k := range state.entries {
+		state.refreshEntryLocked(k, now)
 	}
 	entry := state.entries[key]
 	if success && observedErr == nil {
@@ -132,10 +127,30 @@ func (s *OpenAIGatewayService) observeOpenAIAccountOverloadResult(groupID *int64
 		entry.expiresAt = now.Add(openAIOverloadStateTTL)
 		if entry.failures == openAIOverloadThreshold {
 			entry.recovered = false
+			entry.probeAfter = now.Add(openAIOverloadProbeDelay)
 			slog.Warn("openai_overload_demoted", "group_id", key.groupID, "model", key.model, "account_id", key.accountID, "failure_count", entry.failures)
 		}
 	}
 	state.entries[key] = entry
+}
+
+func (state *openAIAccountOverloadState) refreshEntryLocked(key openAIOverloadKey, now time.Time) openAIOverloadEntry {
+	entry, exists := state.entries[key]
+	if !exists {
+		return entry
+	}
+	if !now.Before(entry.expiresAt) {
+		delete(state.entries, key)
+		return openAIOverloadEntry{}
+	}
+	if entry.failures >= openAIOverloadThreshold && !now.Before(entry.probeAfter) {
+		entry.failures = 0
+		entry.recovered = true
+		entry.expiresAt = now.Add(openAIOverloadStateTTL)
+		state.entries[key] = entry
+		slog.Info("openai_overload_probe_ready", "group_id", key.groupID, "model", key.model, "account_id", key.accountID)
+	}
+	return entry
 }
 
 func (s *OpenAIGatewayService) isOpenAIOverloadBlocked(groupID *int64, account *Account, model string) bool {
@@ -146,8 +161,8 @@ func (s *OpenAIGatewayService) isOpenAIOverloadBlocked(groupID *int64, account *
 	state.mu.Lock()
 	defer state.mu.Unlock()
 	key := openAIOverloadKey{derefGroupID(groupID), openAIOverloadModel(model), account.ID}
-	entry := state.entries[key]
-	return entry.failures >= openAIOverloadThreshold && time.Now().Before(entry.expiresAt)
+	entry := state.refreshEntryLocked(key, time.Now())
+	return entry.failures >= openAIOverloadThreshold
 }
 
 // ShouldReselectOpenAIAccountAfterOverload prevents a long-lived WS connection
@@ -165,7 +180,8 @@ func (s *OpenAIGatewayService) openAIOverloadRecoveryPriority(groupID *int64, mo
 	defer state.mu.Unlock()
 	priority, found := 0, false
 	now := time.Now()
-	for key, entry := range state.entries {
+	for key := range state.entries {
+		entry := state.refreshEntryLocked(key, now)
 		if key.groupID == derefGroupID(groupID) && key.model == openAIOverloadModel(model) && entry.recovered && now.Before(entry.expiresAt) && (!found || entry.priority < priority) {
 			priority, found = entry.priority, true
 		}

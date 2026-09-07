@@ -174,14 +174,14 @@ func TestOpenAIOverloadSchedule_OnlyCapacityErrors(t *testing.T) {
 	}
 }
 
-func TestOpenAIOverloadSchedule_SlowFallbackAndConcurrency(t *testing.T) {
+func TestOpenAIOverloadSchedule_ProbeDelayAndConcurrency(t *testing.T) {
 	svc, accounts, groupID := newOverloadScheduleFixture("true", false)
 	old := time.Now().Add(-3 * time.Minute)
 	for i := 0; i < 6; i++ {
 		svc.observeOpenAIAccountOverloadResult(groupID, &accounts[0], "alias", false, ErrOpenAIUpstreamOverloaded, old)
 	}
-	require.True(t, svc.isOpenAIOverloadBlocked(groupID, &accounts[0], "alias"))
-	// A slow fallback must still succeed before the primary is retried.
+	require.False(t, svc.isOpenAIOverloadBlocked(groupID, &accounts[0], "alias"))
+	// Slow or failing fallback traffic must not indefinitely prevent a primary probe.
 	svc.ObserveOpenAIAccountOverloadResult(groupID, &accounts[1], "alias", true, nil)
 	require.True(t, svc.ShouldReselectOpenAIAccountAfterOverload(groupID, &accounts[1], "alias"))
 	var wg sync.WaitGroup
@@ -199,17 +199,27 @@ func TestOpenAIOverloadSchedule_SlowFallbackAndConcurrency(t *testing.T) {
 	require.Equal(t, int64(16), overloadTestPick(t, svc, groupID, "alias", ""))
 }
 
-func TestOpenAIOverloadSchedule_IdleExpiryDoesNotInterruptActiveFallback(t *testing.T) {
+func TestOpenAIOverloadSchedule_ProbeDespiteUnsuccessfulStickyFallback(t *testing.T) {
+	for _, advanced := range []string{"false", "true"} {
+		t.Run(advanced, func(t *testing.T) {
+			svc, accounts, groupID := newOverloadScheduleFixture(advanced, true)
+			overloadTestTrip(svc, groupID, &accounts[0], "alias")
+			require.Equal(t, int64(1), overloadTestPick(t, svc, groupID, "alias", "unsuccessful-fallback"))
+			svc.ObserveOpenAIAccountOverloadResult(groupID, &accounts[1], "alias", false, errors.New("upstream timeout"))
+			require.Equal(t, int64(1), overloadTestPick(t, svc, groupID, "alias", "unsuccessful-fallback"))
+			key := openAIOverloadKey{*groupID, "alias", accounts[0].ID}
+			svc.openaiOverload.mu.Lock()
+			entry := svc.openaiOverload.entries[key]
+			entry.probeAfter = time.Now().Add(-time.Second)
+			svc.openaiOverload.entries[key] = entry
+			svc.openaiOverload.mu.Unlock()
+			require.Equal(t, int64(16), overloadTestPick(t, svc, groupID, "alias", "unsuccessful-fallback"))
+		})
+	}
+}
+
+func TestOpenAIOverloadSchedule_IdleExpiry(t *testing.T) {
 	svc, accounts, groupID := newOverloadScheduleFixture("true", false)
-	start := time.Now().Add(-openAIOverloadStateTTL + time.Minute)
-	for i := 0; i < 6; i++ {
-		svc.observeOpenAIAccountOverloadResult(groupID, &accounts[0], "alias", false, ErrOpenAIUpstreamOverloaded, start)
-	}
-	for i := 1; i <= 3; i++ {
-		now := start.Add(time.Duration(i) * 9 * time.Minute)
-		svc.observeOpenAIAccountOverloadResult(groupID, &accounts[1], "alias", false, errors.New("upstream timeout"), now)
-		require.True(t, svc.isOpenAIOverloadBlocked(groupID, &accounts[0], "alias"))
-	}
 	// Entirely idle scopes are reclaimed, without a permanent account change.
 	idleModel := "idle-model"
 	for i := 0; i < 6; i++ {
