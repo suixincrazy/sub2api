@@ -76,6 +76,11 @@ func (s *OpenAIGatewayService) observeOpenAIAccountOverloadResult(groupID *int64
 	}
 	entry := state.entries[key]
 	if success && observedErr == nil {
+		state.markHigherPriorityProbeLocked(key, account.Priority, now, "fallback_success")
+	} else if observedErr != nil && !errors.Is(observedErr, context.Canceled) {
+		state.markHigherPriorityProbeLocked(key, account.Priority, now, "fallback_failure")
+	}
+	if success && observedErr == nil {
 		// A peer at the same priority must not immediately re-admit a bad peer.
 		// Keep recovered priority preference briefly so existing fallback sticky
 		// sessions and weighted routing also return to the primary tier.
@@ -84,15 +89,6 @@ func (s *OpenAIGatewayService) observeOpenAIAccountOverloadResult(groupID *int64
 			state.entries[key] = entry
 		} else {
 			delete(state.entries, key)
-		}
-		for k, failed := range state.entries {
-			if k.groupID == key.groupID && k.model == key.model && failed.failures >= openAIOverloadThreshold && failed.priority < account.Priority {
-				failed.failures = 0
-				failed.recovered = true
-				failed.expiresAt = now.Add(openAIOverloadStateTTL)
-				state.entries[k] = failed
-				slog.Info("openai_overload_recovered", "group_id", key.groupID, "model", key.model, "account_id", k.accountID, "fallback_account_id", account.ID)
-			}
 		}
 		return
 	}
@@ -132,6 +128,28 @@ func (s *OpenAIGatewayService) observeOpenAIAccountOverloadResult(groupID *int64
 		}
 	}
 	state.entries[key] = entry
+}
+
+// markHigherPriorityProbeLocked lets a demoted primary be retried after any
+// fallback result. A fallback error must not pin traffic to a lower-priority
+// account indefinitely; the next request is the controlled probe.
+func (state *openAIAccountOverloadState) markHigherPriorityProbeLocked(key openAIOverloadKey, fallbackPriority int, now time.Time, reason string) {
+	for failedKey, failed := range state.entries {
+		if failedKey.groupID != key.groupID || failedKey.model != key.model || failedKey.accountID == key.accountID ||
+			failed.failures < openAIOverloadThreshold || failed.priority >= fallbackPriority {
+			continue
+		}
+		failed.failures = 0
+		failed.recovered = true
+		failed.expiresAt = now.Add(openAIOverloadStateTTL)
+		failed.probeAfter = time.Time{}
+		state.entries[failedKey] = failed
+		event := "openai_overload_probe_ready"
+		if reason == "fallback_success" {
+			event = "openai_overload_recovered"
+		}
+		slog.Info(event, "group_id", key.groupID, "model", key.model, "account_id", failedKey.accountID, "reason", reason, "fallback_account_id", key.accountID)
+	}
 }
 
 func (state *openAIAccountOverloadState) refreshEntryLocked(key openAIOverloadKey, now time.Time) openAIOverloadEntry {

@@ -206,16 +206,25 @@ func TestOpenAIOverloadSchedule_ProbeDespiteUnsuccessfulStickyFallback(t *testin
 			overloadTestTrip(svc, groupID, &accounts[0], "alias")
 			require.Equal(t, int64(1), overloadTestPick(t, svc, groupID, "alias", "unsuccessful-fallback"))
 			svc.ObserveOpenAIAccountOverloadResult(groupID, &accounts[1], "alias", false, errors.New("upstream timeout"))
-			require.Equal(t, int64(1), overloadTestPick(t, svc, groupID, "alias", "unsuccessful-fallback"))
-			key := openAIOverloadKey{*groupID, "alias", accounts[0].ID}
-			svc.openaiOverload.mu.Lock()
-			entry := svc.openaiOverload.entries[key]
-			entry.probeAfter = time.Now().Add(-time.Second)
-			svc.openaiOverload.entries[key] = entry
-			svc.openaiOverload.mu.Unlock()
 			require.Equal(t, int64(16), overloadTestPick(t, svc, groupID, "alias", "unsuccessful-fallback"))
 		})
 	}
+}
+
+func TestOpenAIOverloadSchedule_FallbackOverloadAlsoReleasesPrimaryProbe(t *testing.T) {
+	svc, accounts, groupID := newOverloadScheduleFixture("true", true)
+	overloadTestTrip(svc, groupID, &accounts[0], "alias")
+	require.Equal(t, int64(1), overloadTestPick(t, svc, groupID, "alias", "fallback-overload"))
+	svc.ObserveOpenAIAccountOverloadResult(groupID, &accounts[1], "alias", false, ErrOpenAIUpstreamOverloaded)
+	require.Equal(t, int64(16), overloadTestPick(t, svc, groupID, "alias", "fallback-overload"))
+}
+
+func TestOpenAIOverloadSchedule_CancelledFallbackDoesNotReleasePrimary(t *testing.T) {
+	svc, accounts, groupID := newOverloadScheduleFixture("true", true)
+	overloadTestTrip(svc, groupID, &accounts[0], "alias")
+	svc.ObserveOpenAIAccountOverloadResult(groupID, &accounts[1], "alias", false, context.Canceled)
+	svc.ObserveOpenAIAccountOverloadResult(groupID, &accounts[1], "alias", false, nil)
+	require.Equal(t, int64(1), overloadTestPick(t, svc, groupID, "alias", "cancelled-fallback"))
 }
 
 func TestOpenAIOverloadSchedule_IdleExpiry(t *testing.T) {
