@@ -486,6 +486,10 @@ func (s *AccountTestService) ProbeClaudeStreamHealth(ctx context.Context, accoun
 		modelID = claude.DefaultTestModel
 	}
 	var apiURL, authToken string
+	// authBaseURL 是本次探测实际选用的 Anthropic 上游 base，交给
+	// setAnthropicAPIKeyAuthHeader 判定认证方案（Ollama Cloud 兼容端点只认 Bearer）。
+	// 必须与下面 apiURL 的取值同源，OAuth 分支走官方端点故留空。
+	var authBaseURL string
 
 	switch {
 	case account.IsOAuth():
@@ -508,6 +512,7 @@ func (s *AccountTestService) ProbeClaudeStreamHealth(ctx context.Context, accoun
 		if err != nil {
 			return fmt.Errorf("%w: invalid base url: %v", errStreamProbeInconclusive, err)
 		}
+		authBaseURL = account.GetBaseURL()
 		apiURL = strings.TrimSuffix(normalized, "/") + "/v1/messages?beta=true"
 	default:
 		return errStreamProbeUnsupported
@@ -536,7 +541,9 @@ func (s *AccountTestService) ProbeClaudeStreamHealth(ctx context.Context, accoun
 		req.Header.Set("Authorization", "Bearer "+authToken)
 	} else {
 		req.Header.Set("anthropic-beta", claude.APIKeyBetaHeader)
-		setAnthropicAPIKeyAuthHeader(req.Header, account, authToken)
+		// Ollama Cloud Anthropic 兼容端点按实际 base_url 强制 Bearer，
+		// 其余保持 extra/default 行为。
+		setAnthropicAPIKeyAuthHeader(req.Header, account, authToken, authBaseURL)
 	}
 	account.ApplyHeaderOverrides(req.Header)
 
