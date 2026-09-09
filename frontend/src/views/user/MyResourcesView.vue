@@ -631,28 +631,28 @@
                     <div class="text-sm font-medium text-gray-900 dark:text-white">{{ mr('fields.modelsList') }}</div>
                     <div class="text-xs text-gray-500 dark:text-dark-400">{{ mr('fields.modelsListHint') }}</div>
                   </div>
-                  <button type="button" class="relative inline-flex h-6 w-11 items-center rounded-full transition-colors" :class="groupModelsListState.enabled ? 'bg-primary-500' : 'bg-gray-300 dark:bg-dark-600'" @click="groupModelsListState.enabled = !groupModelsListState.enabled">
-                    <span class="inline-block h-4 w-4 rounded-full bg-white shadow transition-transform" :class="groupModelsListState.enabled ? 'translate-x-6' : 'translate-x-1'" />
+                  <button type="button" class="relative inline-flex h-6 w-11 items-center rounded-full transition-colors" :class="groupModelAllowlistState.enabled ? 'bg-primary-500' : 'bg-gray-300 dark:bg-dark-600'" @click="groupModelAllowlistState.enabled = !groupModelAllowlistState.enabled">
+                    <span class="inline-block h-4 w-4 rounded-full bg-white shadow transition-transform" :class="groupModelAllowlistState.enabled ? 'translate-x-6' : 'translate-x-1'" />
                   </button>
                 </div>
-                <div v-if="groupModelsListState.enabled" class="space-y-3">
+                <div v-if="groupModelAllowlistState.enabled" class="space-y-3">
                   <div class="flex flex-col gap-2 sm:flex-row">
                     <input v-model.trim="groupModelInput" class="input min-w-0 flex-1" :placeholder="mr('fields.modelIdPlaceholder')" @keyup.enter.prevent="addGroupModel" />
                     <button type="button" class="btn btn-secondary" :disabled="!groupModelInput" @click="addGroupModel"><Icon name="plus" size="sm" />{{ mr('actions.add') }}</button>
                     <button v-if="editingId" type="button" class="btn btn-secondary" :disabled="groupModelCandidatesLoading" @click="loadGroupModelCandidates"><Icon name="refresh" size="sm" :class="groupModelCandidatesLoading ? 'animate-spin' : ''" />{{ mr('actions.loadCandidates') }}</button>
                   </div>
-                  <div v-if="groupModelsListState.items.length" class="flex flex-wrap items-center justify-between gap-2">
-                    <span class="text-xs text-gray-500">{{ mr('fields.modelsSelected', { selected: groupModelsListState.items.filter(item => item.selected).length, total: groupModelsListState.items.length }) }}</span>
-                    <div class="flex gap-2"><button type="button" class="text-xs font-medium text-primary-600" @click="selectAllModelsListItems(groupModelsListState)">{{ mr('actions.selectAll') }}</button><button type="button" class="text-xs font-medium text-gray-600 dark:text-gray-300" @click="invertModelsListSelection(groupModelsListState)">{{ mr('actions.invertSelection') }}</button></div>
+                  <div v-if="groupModelAllowlistState.items.length" class="flex flex-wrap items-center justify-between gap-2">
+                    <span class="text-xs text-gray-500">{{ mr('fields.modelsSelected', { selected: groupModelAllowlistState.items.filter(item => item.selected).length, total: groupModelAllowlistState.items.length }) }}</span>
+                    <div class="flex gap-2"><button type="button" class="text-xs font-medium text-primary-600" @click="selectAllModelAllowlistItems(groupModelAllowlistState)">{{ mr('actions.selectAll') }}</button><button type="button" class="text-xs font-medium text-gray-600 dark:text-gray-300" @click="invertModelAllowlistSelection(groupModelAllowlistState)">{{ mr('actions.invertSelection') }}</button></div>
                   </div>
                   <div class="max-h-64 space-y-2 overflow-y-auto">
-                    <div v-for="(item, index) in groupModelsListState.items" :key="item.id" class="flex items-center gap-2 rounded-md border border-gray-200 px-3 py-2 dark:border-dark-600">
+                    <div v-for="(item, index) in groupModelAllowlistState.items" :key="item.id" class="flex items-center gap-2 rounded-md border border-gray-200 px-3 py-2 dark:border-dark-600">
                       <input v-model="item.selected" type="checkbox" class="h-4 w-4 rounded border-gray-300 text-primary-600" />
                       <span class="min-w-0 flex-1 break-all text-sm text-gray-700 dark:text-gray-200">{{ item.id }}</span>
-                      <button type="button" class="btn btn-xs btn-secondary" :disabled="index === 0" :title="mr('actions.moveUp')" @click="moveModelsListItem(groupModelsListState, index, index - 1)"><Icon name="chevronUp" size="sm" /></button>
-                      <button type="button" class="btn btn-xs btn-secondary" :disabled="index === groupModelsListState.items.length - 1" :title="mr('actions.moveDown')" @click="moveModelsListItem(groupModelsListState, index, index + 1)"><Icon name="chevronDown" size="sm" /></button>
+                      <button type="button" class="btn btn-xs btn-secondary" :disabled="index === 0" :title="mr('actions.moveUp')" @click="moveModelAllowlistItem(groupModelAllowlistState, index, index - 1)"><Icon name="chevronUp" size="sm" /></button>
+                      <button type="button" class="btn btn-xs btn-secondary" :disabled="index === groupModelAllowlistState.items.length - 1" :title="mr('actions.moveDown')" @click="moveModelAllowlistItem(groupModelAllowlistState, index, index + 1)"><Icon name="chevronDown" size="sm" /></button>
                     </div>
-                    <div v-if="!groupModelsListState.items.length" class="py-4 text-center text-sm text-gray-500">{{ mr('fields.noModels') }}</div>
+                    <div v-if="!groupModelAllowlistState.items.length" class="py-4 text-center text-sm text-gray-500">{{ mr('fields.noModels') }}</div>
                   </div>
                 </div>
               </section>
@@ -1276,14 +1276,14 @@ import {
 import { extractApiErrorMessage } from '@/utils/apiError'
 import { formatBytes, formatDateTime } from '@/utils/format'
 import {
-  buildModelsListConfig,
-  createModelsListState,
-  hydrateModelsListState,
-  invertModelsListSelection,
-  moveModelsListItem,
-  selectAllModelsListItems,
-  type ModelsListState,
-} from '@/views/admin/groupsModelsList'
+  buildModelAllowlistConfig,
+  createModelAllowlistState,
+  hydrateModelAllowlistState,
+  invertModelAllowlistSelection,
+  moveModelAllowlistItem,
+  selectAllModelAllowlistItems,
+  type ModelAllowlistState,
+} from '@/views/admin/groupModelAllowlist'
 
 type ResourceKind =
   | 'groups'
@@ -1626,7 +1626,7 @@ const redeemUsageTarget = ref<ResourceItem | null>(null)
 const redeemUsages = ref<ResourceItem[]>([])
 const redeemUsageError = ref('')
 const accountUsageStats = ref<ResourceItem | null>(null)
-const groupModelsListState = reactive<ModelsListState>(createModelsListState())
+const groupModelAllowlistState = reactive<ModelAllowlistState>(createModelAllowlistState())
 const groupModelCandidatesLoading = ref(false)
 const groupModelInput = ref('')
 const extendOpen = ref(false)
@@ -1707,7 +1707,7 @@ const editorForm = reactive({
     require_privacy_set: false,
     default_mapped_model: '',
     messages_dispatch_model_config_text: '{}',
-    models_list_config_text: '{}',
+    model_allowlist_text: '{}',
     claude_code_only: false,
     is_exclusive: false,
     mcp_xml_inject: false,
@@ -2017,8 +2017,8 @@ function populateEditorForm(payload: ResourceItem): void {
   editorForm.group.require_privacy_set = Boolean(payload.require_privacy_set)
   editorForm.group.default_mapped_model = stringValue(payload.default_mapped_model)
   editorForm.group.messages_dispatch_model_config_text = JSON.stringify(payload.messages_dispatch_model_config || {}, null, 2)
-  editorForm.group.models_list_config_text = JSON.stringify(payload.models_list_config || {}, null, 2)
-  Object.assign(groupModelsListState, hydrateModelsListState(payload.models_list_config || {}, []))
+  editorForm.group.model_allowlist_text = JSON.stringify(payload.model_allowlist || {}, null, 2)
+  Object.assign(groupModelAllowlistState, hydrateModelAllowlistState(payload.model_allowlist || {}, []))
   editorForm.group.copy_accounts_from_group_ids = idsArray(payload.copy_accounts_from_group_ids)
   editorForm.group.claude_code_only = Boolean(payload.claude_code_only)
   editorForm.group.is_exclusive = Boolean(payload.is_exclusive)
@@ -2116,7 +2116,7 @@ function mergeEditorFormPayload(payload: ResourceItem): ResourceItem {
     out.require_privacy_set = editorForm.group.require_privacy_set
     out.default_mapped_model = editorForm.group.default_mapped_model
     out.messages_dispatch_model_config = parseJSONField(editorForm.group.messages_dispatch_model_config_text, {})
-    out.models_list_config = buildModelsListConfig(groupModelsListState)
+    out.model_allowlist = buildModelAllowlistConfig(groupModelAllowlistState)
     if (!editingId.value && editorForm.group.copy_accounts_from_group_ids.length) {
       out.copy_accounts_from_group_ids = editorForm.group.copy_accounts_from_group_ids.map(Number)
     }
@@ -2738,9 +2738,9 @@ function sourceTypeLabel(value: unknown): string {
 function addGroupModel(): void {
   const model = groupModelInput.value.trim()
   if (!model) return
-  const existing = groupModelsListState.items.find(item => item.id === model)
+  const existing = groupModelAllowlistState.items.find(item => item.id === model)
   if (existing) existing.selected = true
-  else groupModelsListState.items.push({ id: model, selected: true })
+  else groupModelAllowlistState.items.push({ id: model, selected: true })
   groupModelInput.value = ''
 }
 
@@ -2749,8 +2749,8 @@ async function loadGroupModelCandidates(): Promise<void> {
   groupModelCandidatesLoading.value = true
   try {
     const result = await myResourcesApi.groups.modelCandidates(editingId.value, editorForm.group.platform)
-    const current = buildModelsListConfig(groupModelsListState)
-    Object.assign(groupModelsListState, hydrateModelsListState(current, result.models || []))
+    const current = buildModelAllowlistConfig(groupModelAllowlistState)
+    Object.assign(groupModelAllowlistState, hydrateModelAllowlistState(current, result.models || []))
   } catch (error) {
     editorError.value = extractApiErrorMessage(error, mr('messages.modelCandidatesFailed'))
   } finally {

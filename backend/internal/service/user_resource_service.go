@@ -756,7 +756,7 @@ var groupWritableColumns = map[string]columnSpec{
 	"require_privacy_set":                  {Kind: colBool, Create: true, Update: true},
 	"default_mapped_model":                 {Kind: colString, Create: true, Update: true},
 	"messages_dispatch_model_config":       {Kind: colJSON, Create: true, Update: true},
-	"models_list_config":                   {Kind: colJSON, Create: true, Update: true},
+	"model_allowlist":                      {Kind: colJSON, Create: true, Update: true},
 	"rpm_limit":                            {Kind: colInt, Create: true, Update: true},
 }
 
@@ -923,7 +923,7 @@ SELECT
   g.sort_order, g.allow_messages_dispatch, g.allow_live, g.require_oauth_only, g.require_privacy_set,
   g.default_mapped_model,
   COALESCE(g.messages_dispatch_model_config, '{}'::jsonb)::text AS messages_dispatch_model_config,
-  COALESCE(g.models_list_config, '{}'::jsonb)::text AS models_list_config,
+  COALESCE(g.model_allowlist, '{}'::jsonb)::text AS model_allowlist,
   g.rpm_limit, g.created_at, g.updated_at,
   COUNT(ag.account_id)::bigint AS account_count,
   COALESCE(SUM(CASE WHEN a.status = 'active' AND a.schedulable = true AND (a.rate_limit_reset_at IS NULL OR a.rate_limit_reset_at <= NOW()) AND (a.temp_unschedulable_until IS NULL OR a.temp_unschedulable_until <= NOW()) THEN 1 ELSE 0 END), 0)::bigint AS active_account_count,
@@ -973,7 +973,7 @@ SELECT
   g.mcp_xml_inject, COALESCE(g.supported_model_scopes, '[]'::jsonb)::text AS supported_model_scopes,
   g.sort_order, g.allow_messages_dispatch, g.allow_live, g.require_oauth_only, g.require_privacy_set,
   g.default_mapped_model, COALESCE(g.messages_dispatch_model_config, '{}'::jsonb)::text AS messages_dispatch_model_config,
-  COALESCE(g.models_list_config, '{}'::jsonb)::text AS models_list_config, g.rpm_limit, g.created_at, g.updated_at,
+  COALESCE(g.model_allowlist, '{}'::jsonb)::text AS model_allowlist, g.rpm_limit, g.created_at, g.updated_at,
   (SELECT COUNT(*) FROM account_groups ag JOIN accounts a ON a.id = ag.account_id AND a.deleted_at IS NULL
    WHERE ag.group_id = g.id AND a.owner_user_id IS NOT DISTINCT FROM g.owner_user_id)::bigint AS account_count
 FROM groups g
@@ -1244,7 +1244,7 @@ func (s *UserResourceService) CreateGroup(ctx context.Context, ownerID int64, pa
 		"allow_live":                      false,
 		"supported_model_scopes":          []string{"claude", "gemini_text", "gemini_image"},
 		"messages_dispatch_model_config":  map[string]any{},
-		"models_list_config":              map[string]any{},
+		"model_allowlist":                 map[string]any{},
 	})
 	if err := s.normalizeAndValidateGroupPayload(ctx, ownerID, 0, nil, payload); err != nil {
 		return nil, err
