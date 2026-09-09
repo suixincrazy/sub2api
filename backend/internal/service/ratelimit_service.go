@@ -1281,6 +1281,9 @@ func (s *RateLimitService) handle429(ctx context.Context, account *Account, head
 }
 
 func (s *RateLimitService) apply429FallbackRateLimit(ctx context.Context, account *Account, reason string) {
+	if s == nil || account == nil {
+		return
+	}
 	cooldown, enabled := s.get429FallbackCooldown(ctx, account)
 	if !enabled {
 		slog.Info("rate_limit_429_fallback_ignored", "account_id", account.ID, "platform", account.Platform, "reason", reason)
@@ -1290,6 +1293,10 @@ func (s *RateLimitService) apply429FallbackRateLimit(ctx context.Context, accoun
 	resetAt := time.Now().Add(cooldown)
 	slog.Warn("rate_limit_429_fallback_used", "account_id", account.ID, "platform", account.Platform, "reason", reason, "using_default", cooldown.String())
 	s.notifyAccountSchedulingBlocked(account, resetAt, "429_fallback")
+	if s.accountRepo == nil {
+		slog.Warn("rate_limit_set_skipped", "account_id", account.ID, "reason", "account_repository_unavailable")
+		return
+	}
 	if err := s.accountRepo.SetRateLimited(ctx, account.ID, resetAt); err != nil {
 		slog.Warn("rate_limit_set_failed", "account_id", account.ID, "error", err)
 	}
