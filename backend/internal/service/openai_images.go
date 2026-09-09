@@ -557,6 +557,19 @@ func (s *OpenAIGatewayService) ForwardImages(
 	parsed *OpenAIImagesRequest,
 	channelMappedModel string,
 ) (*OpenAIForwardResult, error) {
+	return retryUpstream429(ctx, c, account, func(ctx context.Context) (*OpenAIForwardResult, error) {
+		return s.forwardImagesOnce(ctx, c, account, body, parsed, channelMappedModel)
+	})
+}
+
+func (s *OpenAIGatewayService) forwardImagesOnce(
+	ctx context.Context,
+	c *gin.Context,
+	account *Account,
+	body []byte,
+	parsed *OpenAIImagesRequest,
+	channelMappedModel string,
+) (*OpenAIForwardResult, error) {
 	if parsed == nil {
 		return nil, fmt.Errorf("parsed images request is required")
 	}

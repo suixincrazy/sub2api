@@ -420,6 +420,26 @@ func (s *OpenAIGatewayService) proxyOpenAIWSHTTPBridgeTurn(
 	turn int,
 	writeClientMessage func([]byte) error,
 ) (*OpenAIForwardResult, error) {
+	return retryUpstream429(ctx, c, account, func(ctx context.Context) (*OpenAIForwardResult, error) {
+		return s.proxyOpenAIWSHTTPBridgeTurnOnce(ctx, c, account, token, payload, payloadBytes, originalModel, imageBillingModel, imageSizeTier, imageInputSize, grokCacheIdentity, turn, writeClientMessage)
+	})
+}
+
+func (s *OpenAIGatewayService) proxyOpenAIWSHTTPBridgeTurnOnce(
+	ctx context.Context,
+	c *gin.Context,
+	account *Account,
+	token string,
+	payload []byte,
+	payloadBytes int,
+	originalModel string,
+	imageBillingModel string,
+	imageSizeTier string,
+	imageInputSize string,
+	grokCacheIdentity string,
+	turn int,
+	writeClientMessage func([]byte) error,
+) (*OpenAIForwardResult, error) {
 	if s == nil {
 		return nil, errors.New("service is nil")
 	}

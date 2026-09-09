@@ -91,7 +91,12 @@ func TestOpenAIWSOverloadQuotaMerge_LaterTurnPreservesOverload(t *testing.T) {
 				require.False(t, svc.ShouldReselectOpenAIAccountAfterOverload(&groupID, account, model))
 			}
 			writeNextTurn()
-			requirePassthroughUpstreamWrite(t, upstream, 3*time.Second)
+			currentRequest := requirePassthroughUpstreamWrite(t, upstream, 3*time.Second)
+			for i := 0; i < 6; i++ {
+				upstream.Send(`{"type":"error","error":{"type":"rate_limit_error","code":"server_is_overloaded","message":"Our servers are currently overloaded"}}`)
+				upstream.Send(`{"type":"response.failed","response":{"id":"resp_overload_quota","error":{"type":"rate_limit_error","code":"server_is_overloaded","message":"Our servers are currently overloaded"}}}`)
+				require.Equal(t, currentRequest, requirePassthroughUpstreamWrite(t, upstream, 3*time.Second))
+			}
 			upstream.Send(`{"type":"error","error":{"type":"rate_limit_error","code":"server_is_overloaded","message":"Our servers are currently overloaded"}}`)
 			upstream.Send(`{"type":"response.failed","response":{"id":"resp_overload_quota","error":{"type":"rate_limit_error","code":"server_is_overloaded","message":"Our servers are currently overloaded"}}}`)
 			_, err := readPassthroughLifecycleFrame(t, client, 3*time.Second)

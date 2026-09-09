@@ -222,6 +222,11 @@ func TestProxyResponsesWebSocketFromClient_MarksCyberPolicyBeforeEarlyReturn(t *
 			cfg.Gateway.OpenAIWS.MinIdlePerAccount = 0
 
 			captureConn := &openAIWSCaptureConn{events: [][]byte{append([]byte(nil), tt.upstreamEvent...)}}
+			if tt.wantFailover {
+				for i := 0; i < 6; i++ {
+					captureConn.events = append(captureConn.events, append([]byte(nil), tt.upstreamEvent...))
+				}
+			}
 			pool := newOpenAIWSConnPool(cfg)
 			pool.setClientDialerForTest(&openAIWSCaptureDialer{conn: captureConn})
 			svc := &OpenAIGatewayService{
@@ -294,7 +299,7 @@ func TestProxyResponsesWebSocketFromClient_MarksCyberPolicyBeforeEarlyReturn(t *
 				require.Equal(t, "cyber_policy", mark.Code)
 				require.Equal(t, tt.wantInput, mark.UpstreamInTok)
 				require.Equal(t, tt.wantOutput, mark.UpstreamOutTok)
-			case <-time.After(3 * time.Second):
+			case <-time.After(10 * time.Second):
 				t.Fatal("AfterTurn did not observe the cyber mark")
 			}
 

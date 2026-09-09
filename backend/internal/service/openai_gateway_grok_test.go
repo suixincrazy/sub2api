@@ -3564,6 +3564,9 @@ func TestOpenAIWSHTTPBridgeSSEErrorSideEffectsRunOncePerPlatform(t *testing.T) {
 					"data: {\"type\":\"error\",\"error\":{\"type\":\"rate_limit_error\",\"code\":\"rate_limit_exceeded\",\"message\":\"limited\"}}\n\n",
 				)),
 			}}
+			if platform == PlatformOpenAI {
+				upstream.responses = repeatHTTPResponseForTest(upstream.resp, 7)
+			}
 			svc := &OpenAIGatewayService{
 				cfg:          cfg,
 				accountRepo:  repo,

@@ -35,6 +35,18 @@ func (s *GatewayService) ForwardAsResponses(
 	body []byte,
 	parsed *ParsedRequest,
 ) (*ForwardResult, error) {
+	return retryUpstream429(ctx, c, account, func(ctx context.Context) (*ForwardResult, error) {
+		return s.forwardAsResponsesOnce(ctx, c, account, body, parsed)
+	})
+}
+
+func (s *GatewayService) forwardAsResponsesOnce(
+	ctx context.Context,
+	c *gin.Context,
+	account *Account,
+	body []byte,
+	parsed *ParsedRequest,
+) (*ForwardResult, error) {
 	startTime := time.Now()
 
 	normalizedBody, normalized, err := normalizeOpenAIResponsesLegacyIngress(body)

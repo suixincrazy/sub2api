@@ -27,6 +27,12 @@ const (
 // *OpenAIForwardResult（WebSearchCalls=1，供按次计费）；上游错误被原样透传
 // 给客户端时返回 (nil, nil)，不产生计费。
 func (s *OpenAIGatewayService) ForwardAlphaSearch(ctx context.Context, c *gin.Context, account *Account, body []byte) (*OpenAIForwardResult, error) {
+	return retryUpstream429(ctx, c, account, func(ctx context.Context) (*OpenAIForwardResult, error) {
+		return s.forwardAlphaSearchOnce(ctx, c, account, body)
+	})
+}
+
+func (s *OpenAIGatewayService) forwardAlphaSearchOnce(ctx context.Context, c *gin.Context, account *Account, body []byte) (*OpenAIForwardResult, error) {
 	if s == nil || c == nil || account == nil {
 		return nil, fmt.Errorf("service, context, and account are required")
 	}

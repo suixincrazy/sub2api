@@ -12,7 +12,7 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-func TestGatewayCompatPoolMode429AllowsSameAccountRetry(t *testing.T) {
+func TestGatewayCompatPoolMode429ExhaustsSixSameAccountRetries(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 
 	tests := []struct {
@@ -46,6 +46,9 @@ func TestGatewayCompatPoolMode429AllowsSameAccountRetry(t *testing.T) {
 				Header:     http.Header{"X-Request-Id": []string{"pool-429"}},
 				Body:       io.NopCloser(http.NoBody),
 			}}}
+			for i := 0; i < 6; i++ {
+				upstream.responses = append(upstream.responses, &http.Response{StatusCode: http.StatusTooManyRequests, Header: http.Header{}, Body: io.NopCloser(http.NoBody)})
+			}
 			svc := &GatewayService{
 				cfg:                 &config.Config{},
 				httpUpstream:        upstream,
@@ -70,8 +73,8 @@ func TestGatewayCompatPoolMode429AllowsSameAccountRetry(t *testing.T) {
 			var failoverErr *UpstreamFailoverError
 			require.ErrorAs(t, err, &failoverErr)
 			require.Equal(t, http.StatusTooManyRequests, failoverErr.StatusCode)
-			require.True(t, failoverErr.RetryableOnSameAccount)
-			require.Equal(t, 1, upstream.callCount)
+			require.False(t, failoverErr.RetryableOnSameAccount)
+			require.Equal(t, 7, upstream.callCount)
 			require.Empty(t, recorder.Body.String())
 		})
 	}

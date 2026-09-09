@@ -129,7 +129,7 @@ func TestOpenAIWSHTTPBridgeLaterTurn429RetriesCurrentTurnOnReplacementAccount(t 
 		},
 		{
 			StatusCode: http.StatusTooManyRequests,
-			Header:     http.Header{"Retry-After": []string{"60"}},
+			Header:     http.Header{"Retry-After": []string{"0"}},
 			Body:       io.NopCloser(strings.NewReader(`{"error":{"type":"usage_limit_reached","message":"The usage limit has been reached"}}`)),
 		},
 		{
@@ -140,6 +140,12 @@ func TestOpenAIWSHTTPBridgeLaterTurn429RetriesCurrentTurnOnReplacementAccount(t 
 			)),
 		},
 	}}
+	finalResponse := upstream.responses[2]
+	upstream.responses = upstream.responses[:2]
+	for i := 0; i < 6; i++ {
+		upstream.responses = append(upstream.responses, &http.Response{StatusCode: http.StatusTooManyRequests, Header: http.Header{}, Body: io.NopCloser(strings.NewReader(`{"error":{"type":"usage_limit_reached","message":"The usage limit has been reached"}}`))})
+	}
+	upstream.responses = append(upstream.responses, finalResponse)
 	svc := &OpenAIGatewayService{
 		cfg:              cfg,
 		httpUpstream:     upstream,
@@ -218,7 +224,7 @@ func TestOpenAIWSHTTPBridgeLaterTurn429RetriesCurrentTurnOnReplacementAccount(t 
 	cancel()
 	require.NoError(t, err)
 
-	readCtx, cancel = context.WithTimeout(context.Background(), 3*time.Second)
+	readCtx, cancel = context.WithTimeout(context.Background(), 10*time.Second)
 	_, retriedCompleted, err := clientConn.Read(readCtx)
 	cancel()
 	require.NoError(t, err)
@@ -251,13 +257,16 @@ func TestOpenAIWSHTTPBridgeLaterTurn429RetriesCurrentTurnOnReplacementAccount(t 
 	case <-time.After(5 * time.Second):
 		t.Fatal("timed out waiting for replacement-account completion")
 	}
-	require.Len(t, upstream.bodies, 3)
+	require.Len(t, upstream.bodies, 9)
 	require.Contains(t, string(upstream.bodies[0]), "first")
 	require.Equal(t, scopeCodexAccountIdentityValue(account, 0, "session", "client-session"), gjson.GetBytes(upstream.bodies[1], "client_metadata.session_id").String())
 	require.Equal(t, scopeCodexAccountIdentityValue(account, 0, "thread", "client-thread"), gjson.GetBytes(upstream.bodies[1], "client_metadata.thread_id").String())
-	require.NotContains(t, string(upstream.bodies[2]), "previous_response_id")
-	require.Contains(t, string(upstream.bodies[2]), "second")
-	require.Equal(t, scopeCodexAccountIdentityValue(&nextAccount, 0, "session", "client-session"), gjson.GetBytes(upstream.bodies[2], "client_metadata.session_id").String())
-	require.Equal(t, scopeCodexAccountIdentityValue(&nextAccount, 0, "thread", "client-thread"), gjson.GetBytes(upstream.bodies[2], "client_metadata.thread_id").String())
-	require.Empty(t, upstream.requests[2].Header.Get(openAIWSTurnStateHeader))
+	for i := 1; i <= 7; i++ {
+		require.Equal(t, upstream.bodies[1], upstream.bodies[i])
+	}
+	require.NotContains(t, string(upstream.bodies[8]), "previous_response_id")
+	require.Contains(t, string(upstream.bodies[8]), "second")
+	require.Equal(t, scopeCodexAccountIdentityValue(&nextAccount, 0, "session", "client-session"), gjson.GetBytes(upstream.bodies[8], "client_metadata.session_id").String())
+	require.Equal(t, scopeCodexAccountIdentityValue(&nextAccount, 0, "thread", "client-thread"), gjson.GetBytes(upstream.bodies[8], "client_metadata.thread_id").String())
+	require.Empty(t, upstream.requests[8].Header.Get(openAIWSTurnStateHeader))
 }

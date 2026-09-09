@@ -866,6 +866,8 @@ func (s *OpenAIGatewayService) proxyResponsesWebSocketV2Passthrough(
 		return errors.New("openai ws passthrough dialer is nil")
 	}
 
+	ctx, rateLimitRetry, restoreRateLimitRetry := beginUpstream429Retry(ctx, c, account)
+	defer restoreRateLimitRetry()
 	agentTaskRecoveryTried := false
 	var upstreamConn openAIWSClientConn
 	statusCode := 0
@@ -903,7 +905,12 @@ func (s *OpenAIGatewayService) proxyResponsesWebSocketV2Passthrough(
 		s.handleOpenAIWSDialTransientFailure(ctx, account, capturedSessionModel, dialErr)
 		if statusCode == http.StatusTooManyRequests {
 			s.persistOpenAIWSRateLimitSignal(ctx, account, handshakeHeaders, nil, "rate_limit_exceeded", "rate_limit_error", strings.TrimSpace(err.Error()), capturedSessionModel)
-			return s.newOpenAIWSRateLimitFailoverError(account, handshakeHeaders, nil, err.Error())
+			failure := s.newOpenAIWSRateLimitFailoverError(account, handshakeHeaders, nil, err.Error())
+			again, finalErr := rateLimitRetry.retry(ctx, nil, account, failure)
+			if again {
+				continue
+			}
+			return finalErr
 		}
 		return s.mapOpenAIWSPassthroughDialError(err, statusCode, handshakeHeaders)
 	}
@@ -953,6 +960,40 @@ func (s *OpenAIGatewayService) proxyResponsesWebSocketV2Passthrough(
 	completedTurns := atomic.Int32{}
 	turnLifecycle := newOpenAIWSPassthroughTurnLifecycle(true)
 	var acceptedTurnStartedAt atomic.Pointer[time.Time]
+	var relayFrameConn openaiwsv2.FrameConn = relayUpstreamFrameConn
+	if rateLimitRetry != nil {
+		relayFrameConn = &openAIWS429RetryFrameConn{
+			FrameConn: relayUpstreamFrameConn, service: s, account: account, headers: handshakeHeaders, state: rateLimitRetry,
+			reconnect: func(ctx context.Context) (openaiwsv2.FrameConn, error) {
+				for {
+					dialCtx, cancel := context.WithTimeout(ctx, s.openAIWSDialTimeout())
+					next, status, responseHeaders, dialErr := dialer.Dial(dialCtx, wsURL, headers, proxyURL)
+					cancel()
+					if dialErr != nil {
+						if status != http.StatusTooManyRequests {
+							return nil, dialErr
+						}
+						s.persistOpenAIWSRateLimitSignal(ctx, account, responseHeaders, nil, "rate_limit_exceeded", "rate_limit_error", dialErr.Error(), capturedSessionModel)
+						failure := s.newOpenAIWSRateLimitFailoverError(account, responseHeaders, nil, dialErr.Error())
+						again, err := rateLimitRetry.retry(ctx, nil, account, failure)
+						if again {
+							continue
+						}
+						return nil, err
+					}
+					frame, ok := next.(openaiwsv2.FrameConn)
+					if !ok {
+						_ = next.Close()
+						return nil, errors.New("reconnected upstream does not support frame relay")
+					}
+					return &openAIWSPassthroughFirstOutputFrameConn{
+						inner: frame, activeReadTimeout: s.openAIWSPassthroughIdleTimeout(),
+						deadlineChanged: make(chan struct{}, 1), resolveDeadline: relayUpstreamFrameConn.resolveDeadline,
+					}, nil
+				}
+			},
+		}
+	}
 	clientFrameConn := &openAIWSClientFrameConn{
 		conn:                 clientConn,
 		controlCtx:           ctx,
@@ -1136,7 +1177,7 @@ func (s *OpenAIGatewayService) proxyResponsesWebSocketV2Passthrough(
 	}
 	upstreamFirstMessageSent := false
 	firstWriteCtx, cancelFirstWrite := context.WithTimeout(ctx, s.openAIWSWriteTimeout())
-	firstWriteErr := relayUpstreamFrameConn.WriteFrame(firstWriteCtx, coderws.MessageText, firstClientMessage)
+	firstWriteErr := relayFrameConn.WriteFrame(firstWriteCtx, coderws.MessageText, firstClientMessage)
 	cancelFirstWrite()
 	if firstWriteErr != nil {
 		return wrapOpenAIWSIngressTurnError(
@@ -1156,7 +1197,7 @@ func (s *OpenAIGatewayService) proxyResponsesWebSocketV2Passthrough(
 			if (msgType == coderws.MessageText || msgType == coderws.MessageBinary) && strings.TrimSpace(gjson.GetBytes(payload, "type").String()) == "response.create" {
 				return msgType, payload, nil
 			}
-			if writeErr := upstreamFrameConn.WriteFrame(readCtx, msgType, payload); writeErr != nil {
+			if writeErr := relayFrameConn.WriteFrame(readCtx, msgType, payload); writeErr != nil {
 				return msgType, payload, writeErr
 			}
 		}
@@ -1171,7 +1212,7 @@ func (s *OpenAIGatewayService) proxyResponsesWebSocketV2Passthrough(
 	relayResult, relayExit := openaiwsv2.RunEntry(openaiwsv2.EntryInput{
 		Ctx:                ctx,
 		ClientConn:         policyClientConn,
-		UpstreamConn:       relayUpstreamFrameConn,
+		UpstreamConn:       relayFrameConn,
 		FirstClientMessage: firstClientMessage,
 		Options: openaiwsv2.RelayOptions{
 			WriteTimeout:       s.openAIWSWriteTimeout(),
@@ -1420,6 +1461,9 @@ func (s *OpenAIGatewayService) proxyResponsesWebSocketV2Passthrough(
 	)
 
 	relayErr := relayExit.Err
+	if errors.Is(relayErr, ErrOpenAIUpstreamOverloaded) {
+		result.UpstreamCapacityShed = true
+	}
 	var firstOutputTimeoutErr *openAIWSPassthroughFirstOutputTimeoutError
 	if errors.As(relayErr, &firstOutputTimeoutErr) {
 		deadline := firstOutputTimeoutErr.deadline
@@ -1494,6 +1538,10 @@ func (s *OpenAIGatewayService) proxyResponsesWebSocketV2Passthrough(
 }
 
 func openAIWSPassthroughRelayClientClose(exit openaiwsv2.RelayExit, completedTurns int) (coderws.StatusCode, string, bool) {
+	var failoverErr *UpstreamFailoverError
+	if completedTurns == 0 && !exit.WroteDownstream && errors.As(exit.Err, &failoverErr) && failoverErr.ShouldRetryNextAccount() {
+		return 0, "", false
+	}
 	var closeErr *OpenAIWSClientCloseError
 	if errors.As(exit.Err, &closeErr) {
 		return closeErr.StatusCode(), closeErr.Reason(), true

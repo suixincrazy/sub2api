@@ -325,6 +325,12 @@ func (s *RateLimitService) CheckErrorPolicy(ctx context.Context, account *Accoun
 // HandleUpstreamError 处理上游错误响应，标记账号状态
 // 返回是否应该停止该账号的调度
 func (s *RateLimitService) HandleUpstreamError(ctx context.Context, account *Account, statusCode int, headers http.Header, responseBody []byte, requestedModel ...string) (shouldDisable bool) {
+	if deferUpstream429SideEffects(ctx, account, statusCode, headers, func(ctx context.Context) {
+		s.HandleUpstreamError(ctx, account, statusCode, headers, responseBody, requestedModel...)
+	}) {
+		return false
+	}
+	exhausted429 := statusCode == http.StatusTooManyRequests && upstream429RetryExhausted(ctx, account)
 	ctx = withTempUnschedulableModel(ctx, requestedModel)
 	// Team 联动熔断必须先于池模式/自定义错误码/临时不可调度的各类早退；
 	// 同请求内与 fastpath 调用点的重复触发由方法内去重吸收。
@@ -333,7 +339,7 @@ func (s *RateLimitService) HandleUpstreamError(ctx context.Context, account *Acc
 
 	// 池模式默认不标记本地账号状态；但管理员显式配置的临时不可调度规则优先。
 	// 401 保留现有认证错误语义，不在这里改变池模式的认证处理。
-	if account.IsPoolMode() && !customErrorCodesEnabled {
+	if account.IsPoolMode() && !customErrorCodesEnabled && !exhausted429 {
 		if statusCode != http.StatusUnauthorized && s.tryTempUnschedulable(ctx, account, statusCode, responseBody) {
 			return true
 		}
@@ -343,7 +349,7 @@ func (s *RateLimitService) HandleUpstreamError(ctx context.Context, account *Acc
 
 	// apikey 类型账号：检查自定义错误码配置
 	// 如果启用且错误码不在列表中，则不处理（不停止调度、不标记限流/过载）
-	if !account.ShouldHandleErrorCode(statusCode) {
+	if !account.ShouldHandleErrorCode(statusCode) && !exhausted429 {
 		slog.Info("account_error_code_skipped", "account_id", account.ID, "status_code", statusCode)
 		return false
 	}
@@ -1134,7 +1140,7 @@ func (s *RateLimitService) handle429(ctx context.Context, account *Account, head
 	// OpenAI OAuth stays on the same account for the gateway's bounded retry
 	// window. Persisting a rate-limit reset on the first 429 would make the next
 	// retry ineligible and silently turn same-account recovery into a switch.
-	if account != nil && isOpenAIOAuthAccount(account) && s.runtimeBlocker != nil {
+	if account != nil && isOpenAIOAuthAccount(account) && s.runtimeBlocker != nil && !upstream429RetryExhausted(ctx, account) {
 		if checker, ok := s.runtimeBlocker.(interface {
 			ShouldRetryOpenAIOAuth429(*Account, http.Header, []byte) bool
 		}); ok && checker.ShouldRetryOpenAIOAuth429(account, headers, responseBody) {
@@ -2249,6 +2255,11 @@ func (s *RateLimitService) GetTempUnschedStatus(ctx context.Context, accountID i
 }
 
 func (s *RateLimitService) HandleTempUnschedulable(ctx context.Context, account *Account, statusCode int, responseBody []byte, requestedModel ...string) bool {
+	if deferUpstream429SideEffects(ctx, account, statusCode, nil, func(ctx context.Context) {
+		s.HandleTempUnschedulable(ctx, account, statusCode, responseBody, requestedModel...)
+	}) {
+		return false
+	}
 	if account == nil {
 		return false
 	}

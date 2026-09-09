@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -45,6 +46,22 @@ type openAIInputTokensCountPrepared struct {
 // implement /responses but not this preflight endpoint, so those accounts use
 // the local estimator instead of receiving a request that is known to fail.
 func (s *OpenAIGatewayService) ForwardResponsesInputTokens(
+	ctx context.Context,
+	c *gin.Context,
+	account *Account,
+	body []byte,
+) error {
+	_, err := retryUpstream429(ctx, c, account, func(ctx context.Context) (struct{}, error) {
+		return struct{}{}, s.forwardResponsesInputTokensOnce(ctx, c, account, body)
+	})
+	var failure *UpstreamFailoverError
+	if errors.As(err, &failure) && failure.StatusCode == http.StatusTooManyRequests {
+		writeOpenAIResponsesInputTokensError(c, http.StatusTooManyRequests, "upstream_error", "Upstream request failed")
+	}
+	return err
+}
+
+func (s *OpenAIGatewayService) forwardResponsesInputTokensOnce(
 	ctx context.Context,
 	c *gin.Context,
 	account *Account,
@@ -105,6 +122,9 @@ func (s *OpenAIGatewayService) ForwardResponsesInputTokens(
 		}
 		if s.rateLimitService != nil {
 			s.rateLimitService.HandleUpstreamError(ctx, account, resp.StatusCode, resp.Header, respBody)
+		}
+		if resp.StatusCode == http.StatusTooManyRequests && upstream429State(ctx, account) != nil {
+			return &UpstreamFailoverError{StatusCode: resp.StatusCode, ResponseHeaders: resp.Header, ResponseBody: respBody}
 		}
 		upstreamMsg := sanitizeUpstreamErrorMessage(strings.TrimSpace(extractUpstreamErrorMessage(respBody)))
 		setOpsUpstreamError(c, resp.StatusCode, upstreamMsg, "")
@@ -259,6 +279,23 @@ func (s *OpenAIGatewayService) ForwardCountTokensAsAnthropic(
 	body []byte,
 	defaultMappedModel string,
 ) error {
+	_, err := retryUpstream429(ctx, c, account, func(ctx context.Context) (struct{}, error) {
+		return struct{}{}, s.forwardCountTokensAsAnthropicOnce(ctx, c, account, body, defaultMappedModel)
+	})
+	var failure *UpstreamFailoverError
+	if errors.As(err, &failure) && failure.StatusCode == http.StatusTooManyRequests {
+		writeAnthropicCountTokensError(c, http.StatusTooManyRequests, "upstream_error", "Upstream request failed")
+	}
+	return err
+}
+
+func (s *OpenAIGatewayService) forwardCountTokensAsAnthropicOnce(
+	ctx context.Context,
+	c *gin.Context,
+	account *Account,
+	body []byte,
+	defaultMappedModel string,
+) error {
 	if account == nil {
 		writeAnthropicCountTokensError(c, http.StatusServiceUnavailable, "api_error", "No available OpenAI accounts")
 		return fmt.Errorf("count_tokens: missing account")
@@ -347,6 +384,9 @@ func (s *OpenAIGatewayService) ForwardCountTokensAsAnthropic(
 
 		if s.rateLimitService != nil {
 			s.rateLimitService.HandleUpstreamError(ctx, account, resp.StatusCode, resp.Header, respBody)
+		}
+		if resp.StatusCode == http.StatusTooManyRequests && upstream429State(ctx, account) != nil {
+			return &UpstreamFailoverError{StatusCode: resp.StatusCode, ResponseHeaders: resp.Header, ResponseBody: respBody}
 		}
 
 		if isOpenAIInputTokensUnsupported(resp.StatusCode, respBody) {

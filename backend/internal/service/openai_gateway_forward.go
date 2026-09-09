@@ -19,6 +19,12 @@ import (
 
 // Forward forwards request to OpenAI API
 func (s *OpenAIGatewayService) Forward(ctx context.Context, c *gin.Context, account *Account, body []byte) (*OpenAIForwardResult, error) {
+	return retryUpstream429(ctx, c, account, func(ctx context.Context) (*OpenAIForwardResult, error) {
+		return s.forwardOnce(ctx, c, account, body)
+	})
+}
+
+func (s *OpenAIGatewayService) forwardOnce(ctx context.Context, c *gin.Context, account *Account, body []byte) (*OpenAIForwardResult, error) {
 	beginUpstreamResponseModelObservation(c)
 	ClearActualOpenAIUpstreamEndpoint(c)
 	if shouldForwardOpenAIResponsesViaRawChatCompletions(account) {
@@ -895,7 +901,14 @@ func (s *OpenAIGatewayService) Forward(ctx context.Context, c *gin.Context, acco
 			if errors.As(wsErr, &taskRecoveredErr) {
 				continue
 			}
+			var rateLimitFailure *UpstreamFailoverError
+			if errors.As(wsErr, &rateLimitFailure) && rateLimitFailure.StatusCode == http.StatusTooManyRequests {
+				break
+			}
 
+			if status, _, _, _, ok := resolveOpenAIWSFallbackErrorResponse(wsErr); ok && status == http.StatusTooManyRequests {
+				break // The enclosing 429 scope owns retries, not reconnect policy.
+			}
 			reason, retryable := classifyOpenAIWSReconnectReason(wsErr)
 			if reason != "" {
 				wsLastFailureReason = reason
@@ -995,6 +1008,9 @@ func (s *OpenAIGatewayService) Forward(ctx context.Context, c *gin.Context, acco
 				wsResult.BillingModel = imageBillingModel
 			}
 			return wsResult, nil
+		}
+		if status, _, _, message, ok := resolveOpenAIWSFallbackErrorResponse(wsErr); ok && status == http.StatusTooManyRequests && !c.Writer.Written() {
+			return nil, s.newOpenAIAccountFailoverError(account, status, nil, nil, message, false, false)
 		}
 		s.writeOpenAIWSFallbackErrorResponse(c, account, wsErr)
 		return nil, wsErr

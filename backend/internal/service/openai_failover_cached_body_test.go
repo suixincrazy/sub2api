@@ -88,6 +88,7 @@ func TestOpenAIGatewayService_Forward_FailoverReparsesCachedBodyForNextAccount(t
 					Body:       io.NopCloser(strings.NewReader(`{"id":"resp_123","status":"completed","model":"ok","output":[],"usage":{"input_tokens":1,"output_tokens":1}}`)),
 				},
 			}}
+			upstream.responses = append(repeatHTTPResponseForTest(upstream.responses[0], 7), upstream.responses[1])
 			svc := &OpenAIGatewayService{httpUpstream: upstream}
 
 			firstAccount := openAIFailoverCachedBodyTestAccount(1, "account-a", tt.firstMapping)
@@ -97,15 +98,15 @@ func TestOpenAIGatewayService_Forward_FailoverReparsesCachedBodyForNextAccount(t
 			require.Error(t, err)
 			var failoverErr *UpstreamFailoverError
 			require.True(t, errors.As(err, &failoverErr))
-			require.Len(t, upstream.bodies, 1)
+			require.Len(t, upstream.bodies, 7)
 			require.Equal(t, tt.wantFirst, gjson.GetBytes(upstream.bodies[0], "model").String())
 
 			c.Set("openai_parsed_request_body", map[string]any{"model": tt.wantFirst, "stream": true})
 			result, err := svc.Forward(context.Background(), c, secondAccount, body)
 			require.NoError(t, err)
 			require.NotNil(t, result)
-			require.Len(t, upstream.bodies, 2)
-			require.Equal(t, tt.wantSecond, gjson.GetBytes(upstream.bodies[1], "model").String())
+			require.Len(t, upstream.bodies, 8)
+			require.Equal(t, tt.wantSecond, gjson.GetBytes(upstream.bodies[7], "model").String())
 		})
 	}
 }

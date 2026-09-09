@@ -18,6 +18,17 @@ import (
 // ForwardCountTokens 转发 count_tokens 请求到上游 API
 // 特点：不记录使用量、仅支持非流式响应
 func (s *GatewayService) ForwardCountTokens(ctx context.Context, c *gin.Context, account *Account, parsed *ParsedRequest) error {
+	_, err := retryUpstream429(ctx, c, account, func(ctx context.Context) (struct{}, error) {
+		return struct{}{}, s.forwardCountTokensOnce(ctx, c, account, parsed)
+	})
+	var failure *UpstreamFailoverError
+	if errors.As(err, &failure) && failure.StatusCode == http.StatusTooManyRequests {
+		s.countTokensError(c, http.StatusTooManyRequests, "upstream_error", "Rate limit exceeded")
+	}
+	return err
+}
+
+func (s *GatewayService) forwardCountTokensOnce(ctx context.Context, c *gin.Context, account *Account, parsed *ParsedRequest) error {
 	if parsed == nil {
 		s.countTokensError(c, http.StatusBadRequest, "invalid_request_error", "Request body is empty")
 		return fmt.Errorf("parse request: empty request")
@@ -199,6 +210,9 @@ func (s *GatewayService) ForwardCountTokens(ctx context.Context, c *gin.Context,
 	if resp.StatusCode >= 400 {
 		// 标记账号状态（429/529等）
 		s.rateLimitService.HandleUpstreamError(ctx, account, resp.StatusCode, resp.Header, respBody)
+		if resp.StatusCode == http.StatusTooManyRequests && upstream429State(ctx, account) != nil {
+			return &UpstreamFailoverError{StatusCode: resp.StatusCode, ResponseHeaders: resp.Header, ResponseBody: respBody}
+		}
 
 		upstreamMsg := strings.TrimSpace(extractUpstreamErrorMessage(respBody))
 		upstreamMsg = sanitizeUpstreamErrorMessage(upstreamMsg)
@@ -300,6 +314,9 @@ func (s *GatewayService) forwardCountTokensAnthropicAPIKeyPassthrough(ctx contex
 	if resp.StatusCode >= 400 {
 		if s.rateLimitService != nil {
 			s.rateLimitService.HandleUpstreamError(ctx, account, resp.StatusCode, resp.Header, respBody)
+		}
+		if resp.StatusCode == http.StatusTooManyRequests && upstream429State(ctx, account) != nil {
+			return &UpstreamFailoverError{StatusCode: resp.StatusCode, ResponseHeaders: resp.Header, ResponseBody: respBody}
 		}
 
 		upstreamMsg := strings.TrimSpace(extractUpstreamErrorMessage(respBody))

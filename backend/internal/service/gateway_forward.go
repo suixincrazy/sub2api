@@ -39,6 +39,9 @@ const (
 var anthropicTransportFailoverBody = []byte(`{"type":"error","error":{"type":"upstream_error","message":"Upstream request failed"}}`)
 
 func (s *GatewayService) shouldRetryUpstreamError(account *Account, statusCode int) bool {
+	if upstream429RetryEnabled(account) && statusCode == http.StatusTooManyRequests {
+		return false // The forwarding scope owns all six 429 retries.
+	}
 	// OAuth/Setup Token 账号：仅 403 重试
 	if account.IsOAuth() {
 		return statusCode == 403
@@ -106,6 +109,12 @@ func sleepWithContext(ctx context.Context, d time.Duration) error {
 
 // Forward 转发请求到Claude API
 func (s *GatewayService) Forward(ctx context.Context, c *gin.Context, account *Account, parsed *ParsedRequest) (result *ForwardResult, err error) {
+	return retryUpstream429(ctx, c, account, func(ctx context.Context) (*ForwardResult, error) {
+		return s.forwardOnce(ctx, c, account, parsed)
+	})
+}
+
+func (s *GatewayService) forwardOnce(ctx context.Context, c *gin.Context, account *Account, parsed *ParsedRequest) (result *ForwardResult, err error) {
 	startTime := time.Now()
 	if parsed == nil {
 		return nil, fmt.Errorf("parse request: empty request")

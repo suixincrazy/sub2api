@@ -242,6 +242,12 @@ func TestPassthroughLifecycle_LaterTurnPreOutputRateLimitRequestsReconnect(t *te
 	require.Equal(t, "response.create", gjson.GetBytes(secondRequest, "type").String())
 
 	resetAt := time.Now().Add(90 * time.Minute).Unix()
+	for i := 0; i < 6; i++ {
+		upstream.Send(fmt.Sprintf(`{"type":"error","error":{"code":"rate_limit_exceeded","type":"usage_limit_reached","message":"The usage limit has been reached","resets_at":%d}}`, resetAt))
+		retry := requirePassthroughUpstreamWrite(t, upstream, time.Second)
+		require.Equal(t, secondRequest, retry, "only the rejected second turn may be replayed")
+		require.Empty(t, repo.rateLimitCalls, "must not freeze while retries remain")
+	}
 	upstream.Send(fmt.Sprintf(`{"type":"error","error":{"code":"rate_limit_exceeded","type":"usage_limit_reached","message":"The usage limit has been reached","resets_at":%d}}`, resetAt))
 	_, err = readPassthroughLifecycleFrame(t, clientConn, time.Second)
 	var websocketCloseErr coderws.CloseError

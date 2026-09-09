@@ -33,6 +33,18 @@ func (s *GatewayService) ForwardAsChatCompletions(
 	body []byte,
 	parsed *ParsedRequest,
 ) (*ForwardResult, error) {
+	return retryUpstream429(ctx, c, account, func(ctx context.Context) (*ForwardResult, error) {
+		return s.forwardAsChatCompletionsOnce(ctx, c, account, body, parsed)
+	})
+}
+
+func (s *GatewayService) forwardAsChatCompletionsOnce(
+	ctx context.Context,
+	c *gin.Context,
+	account *Account,
+	body []byte,
+	parsed *ParsedRequest,
+) (*ForwardResult, error) {
 	startTime := time.Now()
 
 	// 1. Parse Chat Completions request

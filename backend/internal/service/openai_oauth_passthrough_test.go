@@ -27,6 +27,19 @@ import (
 
 func f64p(v float64) *float64 { return &v }
 
+func repeatHTTPResponseForTest(resp *http.Response, count int) []*http.Response {
+	body, _ := io.ReadAll(resp.Body)
+	_ = resp.Body.Close()
+	responses := make([]*http.Response, count)
+	for i := range responses {
+		clone := *resp
+		clone.Header = resp.Header.Clone()
+		clone.Body = io.NopCloser(bytes.NewReader(body))
+		responses[i] = &clone
+	}
+	return responses
+}
+
 type httpUpstreamRecorder struct {
 	lastReq      *http.Request
 	lastBody     []byte

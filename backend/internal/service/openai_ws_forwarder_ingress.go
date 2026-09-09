@@ -797,6 +797,8 @@ func (s *OpenAIGatewayService) ProxyResponsesWebSocketFromClient(
 		}(),
 		ForceNewConn: false,
 	}
+	ctx, rateLimitRetry, restoreRateLimitRetry := beginUpstream429Retry(ctx, c, account)
+	defer restoreRateLimitRetry()
 	pool := s.getOpenAIWSConnPool()
 	if pool == nil {
 		return errors.New("openai ws conn pool is nil")
@@ -901,7 +903,12 @@ func (s *OpenAIGatewayService) ProxyResponsesWebSocketFromClient(
 			var dialErr *openAIWSDialError
 			if errors.As(acquireErr, &dialErr) && dialErr != nil && dialErr.StatusCode == http.StatusTooManyRequests {
 				s.persistOpenAIWSRateLimitSignal(ctx, account, dialErr.ResponseHeaders, nil, "rate_limit_exceeded", "rate_limit_error", strings.TrimSpace(acquireErr.Error()), canonicalModel)
-				return nil, s.newOpenAIWSRateLimitFailoverError(account, dialErr.ResponseHeaders, nil, acquireErr.Error())
+				failure := s.newOpenAIWSRateLimitFailoverError(account, dialErr.ResponseHeaders, nil, acquireErr.Error())
+				again, finalErr := rateLimitRetry.retry(ctx, nil, account, failure)
+				if again {
+					return acquireTurnLease(turn, preferred, forcePreferredConn)
+				}
+				return nil, finalErr
 			}
 			if errors.Is(acquireErr, errOpenAIWSPreferredConnUnavailable) {
 				return nil, NewOpenAIWSClientCloseError(
@@ -1031,6 +1038,11 @@ func (s *OpenAIGatewayService) ProxyResponsesWebSocketFromClient(
 			}
 			if eventType == "error" || eventType == "response.failed" {
 				markOpenAICyberPolicyEvent(c, upstreamMessage, http.StatusOK, &usage)
+				if !wroteDownstream && openAIStreamFailedEventSemanticStatus(upstreamMessage, "") == http.StatusTooManyRequests {
+					message := extractOpenAISSEErrorMessage(upstreamMessage)
+					s.persistOpenAIWSRateLimitSignal(ctx, account, lease.HandshakeHeaders(), upstreamMessage, "rate_limit_exceeded", "rate_limit_error", message, mappedModel)
+					return nil, s.newOpenAIWSRateLimitFailoverError(account, lease.HandshakeHeaders(), upstreamMessage, message)
+				}
 			}
 			if eventType == "error" {
 				s.handleOpenAIWSErrorEventTransientFailure(ctx, account, mappedModel, lease.HandshakeHeaders(), upstreamMessage)
@@ -1130,7 +1142,6 @@ func (s *OpenAIGatewayService) ProxyResponsesWebSocketFromClient(
 					)
 				}
 				if !wroteDownstream && isOpenAIWSRateLimitError(errCodeRaw, errTypeRaw, errMsgRaw) {
-					lease.MarkBroken()
 					return nil, s.newOpenAIWSRateLimitFailoverError(account, lease.HandshakeHeaders(), upstreamMessage, errMsgRaw)
 				}
 			}
@@ -1773,6 +1784,15 @@ func (s *OpenAIGatewayService) ProxyResponsesWebSocketFromClient(
 		result, relayErr := sendAndRelay(turn, sessionLease, currentPayload, currentPayloadBytes, currentOriginalModel, currentImageBillingModel, currentImageSizeTier, currentImageInputSize, currentRequestedReasoningEffort)
 		if relayErr != nil {
 			lastTurnClean = false
+			again, retryErr := rateLimitRetry.retry(ctx, nil, account, relayErr)
+			if again {
+				turnRetry = 0
+				// A rejected turn has not changed the upstream continuation state.
+				// Keep this lease and resend only the current payload, not turn one.
+				skipBeforeTurn = true
+				continue
+			}
+			relayErr = retryErr
 			if isOpenAIWSSessionPreempted(ctx) {
 				sessionLease.MarkBroken()
 				return errOpenAIWSSessionPreempted
@@ -1798,8 +1818,19 @@ func (s *OpenAIGatewayService) ProxyResponsesWebSocketFromClient(
 				hooks.AfterTurn(turn, nil, finalErr)
 			}
 			sessionLease.MarkBroken()
+			if turn > 1 {
+				var failure *UpstreamFailoverError
+				if errors.As(finalErr, &failure) && failure.StatusCode == http.StatusTooManyRequests {
+					payload, safe, buildErr := buildOpenAIWSCurrentTurnRetryPayload(currentPayload, currentTurnReplayInput, currentTurnReplayInputExists, currentOriginalModel)
+					if buildErr != nil || !safe {
+						payload = nil
+					}
+					return newOpenAIWSCurrentTurnFailoverError(finalErr, payload)
+				}
+			}
 			return finalErr
 		}
+		rateLimitRetry.reset()
 		turnRetry = 0
 		turnPrevRecoveryTried = false
 		lastTurnFinishedAt = time.Now()
