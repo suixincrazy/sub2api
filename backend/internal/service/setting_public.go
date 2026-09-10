@@ -649,7 +649,6 @@ type PublicSettingsInjectionPayload struct {
 	AffiliateEnabled              bool `json:"affiliate_enabled"`
 	RiskControlEnabled            bool `json:"risk_control_enabled"`
 	AllowUserViewErrorRequests    bool `json:"allow_user_view_error_requests"`
-
 }
 
 // GetPublicSettingsForInjection returns public settings in a format suitable for HTML injection.
