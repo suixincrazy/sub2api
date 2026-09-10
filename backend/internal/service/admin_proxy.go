@@ -80,13 +80,13 @@ func (s *adminServiceImpl) GetProxiesByIDs(ctx context.Context, ids []int64) ([]
 }
 
 func (s *adminServiceImpl) CreateProxy(ctx context.Context, input *CreateProxyInput) (*Proxy, error) {
+	if !isJSONTimeInRange(input.ExpiresAt) {
+		return nil, infraerrors.BadRequest("PROXY_EXPIRY_INVALID", "proxy expiry year must be between 0 and 9999")
+	}
 	kind := normalizeAdminProxyKind(input.Kind)
 	protocol := strings.ToLower(strings.TrimSpace(input.Protocol))
 	if err := validateAdminProxyMode(kind, protocol, input.Extra); err != nil {
 		return nil, err
-	}
-	if !isJSONTimeInRange(input.ExpiresAt) {
-		return nil, infraerrors.BadRequest("PROXY_EXPIRY_INVALID", "proxy expiry year must be between 0 and 9999")
 	}
 	// 规范化 fallback_mode
 	mode := input.FallbackMode
@@ -152,8 +152,13 @@ func (s *adminServiceImpl) UpdateProxy(ctx context.Context, id int64, input *Upd
 	if input.Extra != nil {
 		extra = input.Extra
 	}
-	if err := validateAdminProxyMode(kind, protocol, extra); err != nil {
-		return nil, err
+	// 官方 v0.2.4 起支持代理「部分更新」（只改名字／状态／到期时间等）。
+	// Xray 独有的模式校验只在本次请求真的带了 kind／protocol／extra 时才重跑，
+	// 否则库里 kind／protocol 为空的历史代理会让任何部分更新都被拒掉。
+	if strings.TrimSpace(input.Kind) != "" || strings.TrimSpace(input.Protocol) != "" || input.Extra != nil {
+		if err := validateAdminProxyMode(kind, protocol, extra); err != nil {
+			return nil, err
+		}
 	}
 	if input.IsPublic != nil && *input.IsPublic && proxy.OwnerUserID != nil {
 		return nil, infraerrors.BadRequest("PROXY_PUBLIC_OWNER_INVALID", "only system proxies can be public")

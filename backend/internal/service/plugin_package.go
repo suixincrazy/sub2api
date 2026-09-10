@@ -108,13 +108,14 @@ func (i *PluginPackageInstaller) Install(ctx context.Context, reader io.Reader, 
 		return nil, fmt.Errorf("插件包不是有效的 ZIP: %w", err)
 	}
 	archiveClosed := false
-	closeArchive := func() {
-		if !archiveClosed {
-			archiveClosed = true
-			_ = archive.Close()
+	closeArchive := func() error {
+		if archiveClosed {
+			return nil
 		}
+		archiveClosed = true
+		return archive.Close()
 	}
-	defer closeArchive()
+	defer func() { _ = closeArchive() }()
 	manifest, _, signatureStatus, err := i.inspectArchive(&archive.Reader)
 	if err != nil {
 		return nil, err
@@ -145,16 +146,15 @@ func (i *PluginPackageInstaller) Install(ctx context.Context, reader io.Reader, 
 		return nil, err
 	}
 	// Windows 不允许重命名仍被打开的文件，提交前先释放 ZIP 读取器。
-	closeArchive()
+	// 同时保留 Xray「关闭失败要上报」的行为：此时 extracted 仍为 false，
+	// 上面的 defer 会清掉解包目录，不会留下半成品。
+	if err := closeArchive(); err != nil {
+		return nil, fmt.Errorf("关闭插件包: %w", err)
+	}
 	if err := os.Rename(extractPath, installPath); err != nil {
 		return nil, fmt.Errorf("提交插件安装目录: %w", err)
 	}
 	extracted = true
-	if err := archive.Close(); err != nil {
-		_ = os.RemoveAll(installPath)
-		return nil, fmt.Errorf("关闭插件包: %w", err)
-	}
-	archiveClosed = true
 
 	artifactPath := filepath.Join(packagesDir, manifest.ID+"-"+manifest.Version+"-"+artifactSHA[:12]+"-"+installNonce+".s2plugin")
 	if err := os.Rename(tempPath, artifactPath); err != nil {
