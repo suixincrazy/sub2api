@@ -1247,19 +1247,34 @@ type GatewayConfig struct {
 	// AnthropicHoldbackDeadAirBudgetMs 代替——那条刻意不计首帧前的 TTFB，而 TTFB 恰恰是这里
 	// 220 秒的主要成分。
 	//
-	// 45000ms 的标定：取近 3 天 /v1/messages 的 http request completed，按请求区间内发生的
-	// anthropic_short_turn_holdback_failover 条数分档，量客户端总延迟：
+	// 20000ms 的标定（2026-09-11 从 45000 降下来）：先前那次标定量错了对象——它取「http request
+	// completed 的总延迟」按丢弃档位分组（n_disc=2 的 p50=24596ms，于是取 45000 留余量）。那批
+	// 样本只包含**活到返回**的请求，等不及先走的客户端压根不在里面，拿它定「客户端还愿意等多久」
+	// 是幸存者偏差。这条线要防的恰恰是那些不在样本里的请求。
 	//
-	//	丢弃次数    n_req      p50      p90      p99
-	//	     0       7192   10634ms  39954ms  160514ms
-	//	     1       1274   21008ms  70002ms  194001ms
-	//	     2       1466   24596ms  70000ms  188029ms
-	//	     3        388   43171ms 161713ms  299991ms
-	//	     4        234   48025ms 181523ms  364071ms
+	// 重新标定改用客户端断开日志。注意这批数只能在**宿主日志**里找：ops_error_logs 近 7 天
+	// 3464 行里 disconnect 记录为 0 条（这条路径不落库），实证在
+	// /www/sub2api/data/logs/sub2api.log，9/2~9/11 共 109 条，其中 92 条能与紧随其后的
+	// completed 行配对。按「请求区间内有没有发生丢弃」分两组，量 latency_ms：
 	//
-	// 一次丢弃的边际代价约 10~14 秒（p50 10.6→21.0→24.6），到第 3 次 p90 从 70s 跳到 162s。
-	// 45000 落在 n_disc=2 的 p50（24596ms）之上并留一次 TTFB p50（约 12s）的余量，也就是
-	// TTFB 正常时两次丢弃照旧跑满；同时把 3 次以上那 622 发（p50 43~48s）截在门口。
+	//	分组           n     min      p10      p25      p50      p75      p90
+	//	无丢弃        47   7084ms  10138ms  17814ms  51659ms 308031ms 318751ms
+	//	有丢弃        45   9628ms  46774ms  63379ms 184870ms 354128ms 565813ms
+	//
+	// latency_ms 是客户端耐心的**上界**而不是等值：客户端断开后代码仍继续 drain 上游取 usage，
+	// completed 行在 drain 结束才落。所以只有「小」那一侧的数是硬证据——上界都不到 45 秒，
+	// 说明真实等待更短。无丢弃那组没有被丢弃拖延，最接近纯客户端耐心：p10=10.1s、p25=17.8s，
+	// 也就是四分之一的客户端 18 秒内就走。
+	//
+	// 决定性的是断在持流释放路径（gateway_anthropic_passthrough.go:2487/2490）那 14 发里最小的
+	// 两条：34313ms（2026-09-11 11:51:16，账号 7）与 40167ms（同日 19:11:13，账号 14）。两条的
+	// 上界都小于 45000，也就是 45 秒的线**必然**在客户端离开之后才到点——那两发注定零字节收场。
+	// 20000 压在 p25 拐点之上、覆盖这两条实证，同时留住一次 TTFB p50（约 12s）的余量。
+	//
+	// 代价是显式接受的：20000 会让一部分「本来能再换一次号」的回合改为直接放行，而现存被判可疑
+	// 的回合丢弃前累计等待 p50 约 24.8s，所以确实有回合被收紧。这个取舍的方向是清楚的——放行
+	// 等于用户拿到一个偏短的答案，线设过长等于用户什么都拿不到。判定本身也偏激进（1516 discarded
+	// 对 59 delivered，96.3%），收紧的边际损失有限。
 	//
 	// 退化行为是放行 + 给下一发解绑，也就是持流机制存在之前的行为，不会更差：这条线只在
 	// 「已经等了很久」时才生效，而那种情形下继续丢弃的期望收益本来就低——上游慢的时候换号
@@ -2742,7 +2757,8 @@ func setDefaults() {
 	viper.SetDefault("gateway.anthropic_holdback_dead_air_budget_ms", 25000)
 	// 同上，靠 GATEWAY_ANTHROPIC_HOLDBACK_LONG_THINKING_HOLD_MS 免重新构建地改。
 	viper.SetDefault("gateway.anthropic_holdback_long_thinking_hold_ms", 360000)
-	viper.SetDefault("gateway.anthropic_holdback_discard_budget_ms", 45000)
+	// 同上，靠 GATEWAY_ANTHROPIC_HOLDBACK_DISCARD_BUDGET_MS 免重新构建地改。
+	viper.SetDefault("gateway.anthropic_holdback_discard_budget_ms", 20000)
 	viper.SetDefault("gateway.temp_park_release_valve_enabled", true)
 	viper.SetDefault("gateway.scheduling.sticky_session_max_waiting", 3)
 	viper.SetDefault("gateway.scheduling.sticky_session_wait_timeout", 120*time.Second)
@@ -3677,8 +3693,11 @@ func (c *Config) Validate() error {
 	//
 	// 上界 600000：这一条不是等待上限，而是**丢弃权的截止线**——到点之后正常放行，不会让请求
 	// 继续挂着，所以配大只是让它更少生效、退回纯次数额度的旧行为，没有失控风险。600000 给
-	// 默认值（45000）留了充足上调余量，也盖得住长思考放宽（420000 上界）之后一次尝试的最坏
+	// 默认值（20000）留了充足上调余量，也盖得住长思考放宽（420000 上界）之后一次尝试的最坏
 	// 时长——配得比那条还小会让长思考回合刚放宽完就撞上这条线，两条设计意图互相抵消。
+	//
+	// 默认值 2026-09-11 从 45000 降到 20000（依据见 AnthropicHoldbackDiscardBudgetMs 的标定段）。
+	// 下界没跟着动：10000 拦的是「持流形同关闭」，与默认值往哪个方向调无关。
 	if c.Gateway.AnthropicHoldbackDiscardBudgetMs != 0 &&
 		(c.Gateway.AnthropicHoldbackDiscardBudgetMs < 10000 || c.Gateway.AnthropicHoldbackDiscardBudgetMs > 600000) {
 		return fmt.Errorf("gateway.anthropic_holdback_discard_budget_ms must be 0 or between 10000-600000 milliseconds")

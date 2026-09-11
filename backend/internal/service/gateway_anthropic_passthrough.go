@@ -98,6 +98,17 @@ func (s *GatewayService) forwardAnthropicAPIKeyPassthroughWithInput(
 	// 一次，而 noteAnthropicDiscardBudgetStart 是 write-once，所以换号重试改不动它，累计口径
 	// 因此跨 failover 成立。见 GatewayConfig.AnthropicHoldbackDiscardBudgetMs。
 	noteAnthropicDiscardBudgetStart(c, retryStart)
+	// 这一次账号尝试如果没有产生任何丢弃，它的墙钟就不该记在丢弃代价账上：预算量的是
+	// 「为丢弃重来花掉了多少客户端等待」，而 429/502/传输层失败压根没有可丢弃的内容。
+	// 用「丢弃计数有没有变」判定，而不是看返回的错误类型：两类丢弃各有独立计数器，且
+	// 计数只由 newAnthropic{ShortTurn,BlockOrder}FailoverError 唯一入口增加，比枚举
+	// 错误类型更不容易漏。见 anthropicDiscardBudgetCreditKey。
+	discardsAtEntry := anthropicHoldbackDiscardsUsed(c) + anthropicBlockOrderDiscardsUsed(c)
+	defer func() {
+		if anthropicHoldbackDiscardsUsed(c)+anthropicBlockOrderDiscardsUsed(c) == discardsAtEntry {
+			noteAnthropicDiscardBudgetCredit(c, time.Since(retryStart))
+		}
+	}()
 	for attempt := 1; attempt <= maxRetryAttempts; attempt++ {
 		upstreamCtx, releaseUpstreamCtx := detachStreamUpstreamContext(ctx, input.RequestStream)
 		upstreamReq, wireBody, err := s.buildUpstreamRequestAnthropicAPIKeyPassthrough(upstreamCtx, c, account, input.Body, token)
@@ -1972,8 +1983,47 @@ func noteAnthropicHoldbackElapsed(c *gin.Context, elapsed time.Duration) {
 // 放在 gin.Context 上，跨账号重试共享同一个值，作用域与丢弃计数一致。
 const anthropicDiscardBudgetStartKey = "anthropic_discard_budget_start"
 
-// anthropicDiscardBudgetElapsed 给出本次客户端请求已经等了多久。锚点缺失时返回 0，
-// 让预算判据整体退化成「不限制」，也就是改动前的行为。
+// anthropicDiscardBudgetCreditKey 记录本次客户端请求里**不由丢弃负责**的那部分墙钟，
+// 在预算里退回去。预算量的是「为丢弃重来花掉了多少客户端等待」，而一次上游 HTTP 失败
+// （429/502/503/传输层）压根没产生任何可丢弃的内容，它的耗时不该记在丢弃账上。
+//
+// 2026-09-09 20:45:09 那一发就是这么烧穿的（ops_error_logs id=23352）：
+//
+//	20:41:44.193  账号 14 短回合 prose=304 out=136 -> discarded（正确，记账 ~28s）
+//	20:42:12.383  账号 10 起 8 连 429 daily_free_credits_exhausted
+//	20:44:58.851  429 风暴结束，白烧 166.5 秒
+//	20:45:09.591  账号 13 短回合 prose=236 out=121 -> **delivered**
+//
+// 账号 13 那一发与账号 14 形态几乎一样，只因为 45 秒预算早被 429 风暴吃光而只能放行，
+// 客户端看到了那条没说完的回答。退回 166.5 秒之后，这一发能拿到它应得的换号机会。
+//
+// 记账口径是「上一次账号尝试没有增加任何丢弃计数」，由透传入口在返回时统一补记，
+// 见 forwardAnthropicAPIKeyPassthroughWithInput 里的 defer。
+const anthropicDiscardBudgetCreditKey = "anthropic_discard_budget_credit"
+
+func anthropicDiscardBudgetCredit(c *gin.Context) time.Duration {
+	if c == nil {
+		return 0
+	}
+	if v, ok := c.Get(anthropicDiscardBudgetCreditKey); ok {
+		if credit, ok := v.(time.Duration); ok && credit > 0 {
+			return credit
+		}
+	}
+	return 0
+}
+
+// noteAnthropicDiscardBudgetCredit 累加一段不计入丢弃代价的墙钟。刻意做成累加而不是取最大值：
+// 一次请求里可能连着撞上多个坏号（20:45:09 那一条链就跨了 8 次 429），每一段都要退。
+func noteAnthropicDiscardBudgetCredit(c *gin.Context, spent time.Duration) {
+	if c == nil || spent <= 0 {
+		return
+	}
+	c.Set(anthropicDiscardBudgetCreditKey, anthropicDiscardBudgetCredit(c)+spent)
+}
+
+// anthropicDiscardBudgetElapsed 给出本次客户端请求已经在**丢弃重来**上烧掉多久。锚点缺失时
+// 返回 0，让预算判据整体退化成「不限制」，也就是这个机制存在之前的行为。
 func anthropicDiscardBudgetElapsed(c *gin.Context, now time.Time) time.Duration {
 	if c == nil {
 		return 0
@@ -1986,7 +2036,38 @@ func anthropicDiscardBudgetElapsed(c *gin.Context, now time.Time) time.Duration 
 	if !ok || start.IsZero() || !now.After(start) {
 		return 0
 	}
-	return now.Sub(start)
+	elapsed := now.Sub(start) - anthropicDiscardBudgetCredit(c)
+	if elapsed <= 0 {
+		return 0
+	}
+	return elapsed
+}
+
+// anthropicDiscardBudgetDeadline 给出预算耗尽的时刻，也就是第四条放行线。返回零值表示这条线
+// 不参与（没配预算或锚点还没钉下）。
+//
+// 这个时刻在一次尝试内是恒定的：now + (budget - (now - 锚点 - 退款)) = 锚点 + 退款 + budget，
+// 与 now 无关。退款只在尝试边界上增长，所以每帧重算不会让截止线漂移。
+//
+// 它刻意**不过** anthropicHoldbackObserver.effectiveHoldCap：长思考放宽的对象是「攥多久才判定」
+// 那三条线，而这一条管的是「客户端还愿意等多久」，长思考并不会让客户端变得更耐心。
+// 2026-09-11 11:51:16 那一发正是把三条线全抬到 360 秒之后，唯一还能兜住的就只剩这一条。
+func anthropicDiscardBudgetDeadline(c *gin.Context, now time.Time, budget time.Duration) time.Time {
+	if c == nil || budget <= 0 {
+		return time.Time{}
+	}
+	v, ok := c.Get(anthropicDiscardBudgetStartKey)
+	if !ok {
+		return time.Time{}
+	}
+	if start, ok := v.(time.Time); !ok || start.IsZero() {
+		return time.Time{}
+	}
+	remaining := budget - anthropicDiscardBudgetElapsed(c, now)
+	if remaining <= 0 {
+		return now
+	}
+	return now.Add(remaining)
 }
 
 // noteAnthropicDiscardBudgetStart 在第一次尝试时钉下锚点，之后的重试不得改写它 ——
@@ -2387,6 +2468,52 @@ func (s *GatewayService) handleStreamingResponseAnthropicAPIKeyPassthrough(
 		holdbackElapsedBefore: anthropicHoldbackElapsedBefore(c),
 		longThinkingHoldFloor: holdbackLongThinkingFloor,
 	}
+	// 第四条放行线：丢弃代价预算的剩余额度。
+	//
+	// 前三条线量的都是「还要攥多久才判定」，锚在本次尝试的 SSE 帧上，而且全都受长思考放宽
+	// （effectiveHoldCap）影响；这一条量的是「客户端还愿意等多久」，锚在跨 failover 的累计
+	// 墙钟上，刻意不受放宽 —— 上游想得久并不会让客户端变得更耐心。
+	//
+	// 2026-09-11 11:51:16 那一发就是这么丢的（client_request_id 54ffcb1c）：
+	//
+	//	11:50:59.143  账号 13 prose=1077 out=402 -> discarded（此刻仅 17.4s，预算没到点，判定正确）
+	//	11:50:59.147  换到账号 7 重来
+	//	11:51:16.020  客户端断开，累计 34.3 秒零字节，45 秒预算永远等不到
+	//
+	// 账号 7 那一发全程没走到 stop_reason。旧实现里预算只在「stop_reason 已到」那个分支被读
+	// 一次，于是判定一路返回 Keep、缓冲区一路攥着；持流期 !streamCommitted 又让 keepalive
+	// 分支直接 continue 不发 ping，客户端收到的是绝对零字节，只能自己放弃 —— 结果比放行那条
+	// 短回答更差：用户什么都没拿到。所以预算必须同时是尝试**内**的实时放行线。
+	//
+	// 只在已经丢弃过内容之后才参与，与 anthropicHoldbackVerdict 里「首次内容丢弃豁免时间
+	// 预算」同一个口径：一次都还没丢的时候这段墙钟不是丢弃代价，长思考首发不该被它打断。
+	releaseBudgetDeadline := func(now time.Time) time.Time {
+		if !holdbackActive || holdbackDiscardBudget <= 0 {
+			return time.Time{}
+		}
+		if holdbackDiscardsUsed+blockOrderDiscardsUsed == 0 {
+			return time.Time{}
+		}
+		return anthropicDiscardBudgetDeadline(c, now, holdbackDiscardBudget)
+	}
+	// holdbackDeadline 把四条放行线合成一个时刻：观察器持有的三条 + 预算那一条，取先到者。
+	// 定时器与判定都只认这一个口径，不会出现「定时器认为到点、判定认为没到」的分歧。
+	holdbackDeadline := func(now time.Time) time.Time {
+		deadline := holdback.holdbackReleaseDeadline(holdbackWindow, holdbackMaxHold, holdbackDeadAir)
+		budget := releaseBudgetDeadline(now)
+		if budget.IsZero() {
+			return deadline
+		}
+		if deadline.IsZero() || budget.Before(deadline) {
+			return budget
+		}
+		return deadline
+	}
+	// budgetReleaseElapsed 是第四条线的判定侧，与 holdbackDeadline 由同一个函数导出。
+	budgetReleaseElapsed := func(now time.Time) bool {
+		deadline := releaseBudgetDeadline(now)
+		return !deadline.IsZero() && !now.Before(deadline)
+	}
 	// 独立定时器，不复用 keepalive：窗口是毫秒级而 keepalive 默认 10 秒，靠它兜底会让
 	// 「上游吐了两句就长时间静默」的流白等十秒。
 	//
@@ -2395,19 +2522,22 @@ func (s *GatewayService) handleStreamingResponseAnthropicAPIKeyPassthrough(
 	// 一旦 arm 就按当时的固定时长走，帧还在到达时它照样会开火。所以开火之后必须复核，复核
 	// 不通过就按剩余时间续期，见 case <-holdbackCh。
 	//
-	// 定时器的时长直接取 holdbackReleaseDeadline（三条截止线里先到的那个）到现在的差值，不再
+	// 定时器的时长直接取 holdbackDeadline（四条截止线里先到的那个）到现在的差值，不再
 	// 自己 min 一遍：口径只留一处，免得定时器与判定各算一套。
 	//
 	// 刻意不再要求 firstCommitPointAt 已就位：配了死气预算时，「上游只发了 message_start /
 	// ping 这类不提交的帧然后彻底卡住」也必须能被唤醒。2026-08-25 14:10:30 那一发正是这个
 	// 形态——out=0、客户端零字节 420 秒，前两条线全都没起算，唯一兜得住的是死气那一条。
+	//
+	// 预算那一条尤其需要定时器：上游彻底不出帧时判定分支压根不会被执行到，只有定时器能把
+	// 缓冲区放出去。9/11 那一发若停在思考中途不动，就是这个形态。
 	var holdbackTimer *time.Timer
 	var holdbackCh <-chan time.Time
 	armHoldbackTimer := func() {
 		if !holdbackActive {
 			return
 		}
-		deadline := holdback.holdbackReleaseDeadline(holdbackWindow, holdbackMaxHold, holdbackDeadAir)
+		deadline := holdbackDeadline(time.Now())
 		if deadline.IsZero() {
 			return
 		}
@@ -2679,7 +2809,8 @@ func (s *GatewayService) handleStreamingResponseAnthropicAPIKeyPassthrough(
 					holdback.observe(holdFrame, commitPrelude, now)
 					armHoldbackTimer()
 					switch anthropicHoldbackVerdict(
-						holdback.releaseDeadlineElapsed(now, holdbackWindow, holdbackMaxHold, holdbackDeadAir),
+						holdback.releaseDeadlineElapsed(now, holdbackWindow, holdbackMaxHold, holdbackDeadAir) ||
+							budgetReleaseElapsed(now),
 						holdback.deadAirElapsed(now, holdbackDeadAir),
 						holdback.stopReason, holdback.proseRunes, holdback.outputTokens,
 						holdback.sawToolUseBlock, holdbackDiscardsUsed, blockOrderDiscardsUsed, holdback.thinkingRunes,
@@ -2739,15 +2870,16 @@ func (s *GatewayService) handleStreamingResponseAnthropicAPIKeyPassthrough(
 			processLine(line)
 
 		case <-holdbackCh:
-			// 定时器只是唤醒器，判据在 holdback.holdbackReleaseDeadline 手里：静默窗口量的
+			// 定时器只是唤醒器，判据在 holdbackDeadline 手里：静默窗口量的
 			// 是**静默**时长、会随新帧续期，而定时器 arm 之后按固定时长走，帧还在源源到达时
-			// 它照样开火。所以开火先复核，三条截止线都没到就按剩余时间续期、继续持流；只有
+			// 它照样开火。所以开火先复核，四条截止线都没到就按剩余时间续期、继续持流；只有
 			// 静默真的满了一个窗口（判定要的 stop_reason 始终没来）、持流总时长撞到上限
-			// （上游一直在吐但客户端一个字节都还没拿到）、或者首帧后的累计持流预算吃满（跨
-			// failover 累加，见 deadAirElapsed），才认定等不起，原样放行。
+			// （上游一直在吐但客户端一个字节都还没拿到）、首帧后的累计持流预算吃满（跨
+			// failover 累加，见 deadAirElapsed），或者丢弃代价预算的剩余额度用尽
+			// （见 releaseBudgetDeadline），才认定等不起，原样放行。
 			holdbackCh = nil
 			now := time.Now()
-			deadline := holdback.holdbackReleaseDeadline(holdbackWindow, holdbackMaxHold, holdbackDeadAir)
+			deadline := holdbackDeadline(now)
 			switch {
 			case streamCommitted:
 				// 已经提交过，窗口没有可做的事。
