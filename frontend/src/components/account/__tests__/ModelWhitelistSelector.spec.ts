@@ -291,7 +291,7 @@ describe('ModelWhitelistSelector', () => {
   })
 
   it('shows success and a partial warning when some capabilities were saved', async () => {
-    syncUpstreamModels.mockResolvedValue({
+    adminAccountSyncMock.mockResolvedValue({
       models: ['gpt-6-astra', 'gpt-image-2'],
       warnings: [
         {
