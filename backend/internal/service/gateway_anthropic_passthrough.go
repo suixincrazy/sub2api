@@ -53,7 +53,22 @@ func (s *GatewayService) forwardAnthropicAPIKeyPassthrough(
 	})
 }
 
+// forwardAnthropicAPIKeyPassthroughWithInput 是持流同号重试的包装层：判定丢弃后先在
+// 同一账号上重试，用尽 anthropicHoldbackMaxSameAccountRetries 次才把错误交回 handler 换号。
+// 包在这里而不是 Forward 那一层，是为了让重试与丢弃判定共处同一个作用域——
+// 判定所需的 gin.Context 计数器、丢弃代价预算锚点都在本函数内维护。
 func (s *GatewayService) forwardAnthropicAPIKeyPassthroughWithInput(
+	ctx context.Context,
+	c *gin.Context,
+	account *Account,
+	input anthropicPassthroughForwardInput,
+) (*ForwardResult, error) {
+	return retryAnthropicHoldback(ctx, c, account, func(ctx context.Context) (*ForwardResult, error) {
+		return s.forwardAnthropicAPIKeyPassthroughOnce(ctx, c, account, input)
+	})
+}
+
+func (s *GatewayService) forwardAnthropicAPIKeyPassthroughOnce(
 	ctx context.Context,
 	c *gin.Context,
 	account *Account,
@@ -1949,6 +1964,33 @@ func noteAnthropicBlockOrderDiscard(c *gin.Context) {
 	}
 }
 
+// refundAnthropicHoldbackDiscard 把一次丢弃的计数退回去，供同号重试使用。
+//
+// 为什么需要退款：两档计数额度按各自注释管的都是「换几次号」——
+// anthropicShortTurnDiscardBudget 的理由是「不设上限会把池子重试穿」，
+// anthropicBlockOrderDiscardBudget 的理由是「跨过连续两个坏号」，两者的计量对象都是账号。
+// 同号重试不换号、不消耗池子，因此不该记在这两个额度上。不退款的话 6 次同号重试会在
+// 第 4 发就把短回合额度打穿，anthropicHoldbackVerdict 退化成无条件放行，正好复现
+// COUNT-BUDGET-EXHAUSTED 那 5 次断流。
+//
+// 墙钟预算（AnthropicHoldbackDiscardBudgetMs）刻意**不**退款：那条线量的是客户端等了多久，
+// 同号重试一样让客户端在等，必须照常记账，否则 6 次重试能把客户端零字节拖到分钟级。
+func refundAnthropicHoldbackDiscard(c *gin.Context, reason GatewayFailureReason) {
+	if c == nil {
+		return
+	}
+	switch reason {
+	case GatewayFailureReason("anthropic_short_turn_holdback"):
+		if used := anthropicHoldbackDiscardsUsed(c); used > 0 {
+			c.Set(anthropicHoldbackDiscardsKey, used-1)
+		}
+	case GatewayFailureReason("anthropic_block_order_violation"):
+		if used := anthropicBlockOrderDiscardsUsed(c); used > 0 {
+			c.Set(anthropicBlockOrderDiscardsKey, used-1)
+		}
+	}
+}
+
 // anthropicHoldbackElapsedKey 记录本次客户端请求在此前 failover 尝试中实际扣住可提交帧的
 // 累计时长。放在 gin.Context 上，跨账号重试共享同一个值，与丢弃计数使用相同的作用域。
 const anthropicHoldbackElapsedKey = "anthropic_holdback_elapsed"
@@ -2107,10 +2149,10 @@ func anthropicShortTurnHoldbackErrorBody() []byte {
 //
 // 刻意不罚账号：判据是启发式的，Scope=Request + RequestScopedTransient 是这个仓库里
 // 「故障与账号健康无关」的既有标记，会让 TempUnscheduleRetryableError 直接 return，
-// 也让 ShouldReportAccountScheduleFailure 不把它算进调度健康度。换号本身由
-// FailedAccountIDs 保证——本次请求不会再选回这个账号。
+// 也让 ShouldReportAccountScheduleFailure 不把它算进调度健康度。
 //
-// 不设 RetryableOnSameAccount：同一个坏中转上重试只会再截断一次。
+// 同号重试：由 retryAnthropicHoldback 服务层循环实现（anthropic_holdback_retry.go），
+// 与 upstream429MaxRetries 同机制、同预算（6 次），不走 handler 的账号级 pool_mode_retry_count。
 func (s *GatewayService) newAnthropicShortTurnFailoverError(
 	c *gin.Context, resp *http.Response, account *Account, model string, proseRunes, outputTokens int, stopReason string,
 ) *UpstreamFailoverError {
@@ -2165,8 +2207,8 @@ func anthropicBlockOrderHoldbackErrorBody() []byte {
 // 上游异常，让这条响应在写给客户端之前就被换号重试掉。
 //
 // 与 newAnthropicShortTurnFailoverError 同一套语义（请求域瞬时失败、带上游响应头、
-// 记一次 holdback discard），只在 Kind / code / 文案上区分，好让 ops 看板能把「伪造回合」
-// 这一类单独统计出来——它和短回合的根因不同，混在一起就看不出某个上游是不是在拼错块序。
+// 记一次 holdback discard、同号重试 6 次），只在 Kind / code / 文案上区分，好让 ops 看板
+// 能把「伪造回合」这一类单独统计出来——它和短回合的根因不同，混在一起就看不出某个上游是不是在拼错块序。
 func (s *GatewayService) newAnthropicBlockOrderFailoverError(
 	c *gin.Context, resp *http.Response, account *Account, model string, proseRunes, outputTokens int, stopReason string,
 ) *UpstreamFailoverError {
