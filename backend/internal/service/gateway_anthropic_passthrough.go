@@ -2699,15 +2699,20 @@ func (s *GatewayService) handleStreamingResponseAnthropicAPIKeyPassthrough(
 			// 三态：可疑 -> 累计连击；有正面证据 -> 清零；其余（典型是 tool_use 中间回合）
 			// -> 不表态，保留连击。见 anthropicTurnProvesUpstreamHealthy。
 			if anthropicTurnLooksSuspiciouslyShort(sawStopReason, proseRunes, usage.OutputTokens, sawToolUseBlock, thinkingRunes) {
-				unbound := s.noteAnthropicShortTurnStreak(ctx, account, model, proseRunes, usage.OutputTokens)
 				// 走到这里说明这一发没被持流拦住（窗口配 0、窗口耗尽、或本请求的重试额度
 				// 已经用掉），客户端已经吃到一个残缺的 200。解绑只管下一发落在哪，账号本身
 				// 还在池子里，所以要额外冷却账号。两个报告器只能二选一，避免同一次故障重复计数。
-				switch {
-				case anthropicTurnIsEmptyAnswer(sawStopReason, proseRunes, usage.OutputTokens, sawToolUseBlock):
+				//
+				// 2026-09-12 修正：原先 `case unbound:` 依赖解绑是否成功，当解绑失败
+				// （noteAnthropicShortTurnStreak 返回 false）时进入隐式 default 静默不报告，
+				// 丢失诊断信息。既然 anthropicTurnLooksSuspiciouslyShort 已判定为可疑，
+				// 就应该始终报告，不依赖 unbound 返回值。unbound 只影响下一发落在哪，
+				// 不影响这一发的报告。
+				_ = s.noteAnthropicShortTurnStreak(ctx, account, model, proseRunes, usage.OutputTokens)
+				if anthropicTurnIsEmptyAnswer(sawStopReason, proseRunes, usage.OutputTokens, sawToolUseBlock) {
 					s.reportAnthropicEmptyAnswerTurn(ctx, c, resp, account, model,
 						usage.OutputTokens, sawStopReason, "delivered")
-				case unbound:
+				} else {
 					s.reportAnthropicShortTurnUnbind(ctx, c, resp, account, model,
 						proseRunes, usage.OutputTokens, sawStopReason, "delivered")
 				}
@@ -3247,12 +3252,14 @@ func (s *GatewayService) discardNonStreamTurnIfSuspicious(
 			shape.proseRunes, shape.outputTokens, shape.stopReason)
 	}
 	// 丢弃只治这一发；粘性绑定还指着这个坏号，所以照样要主动解绑 + 冷却。
+	// unbound 只影响解绑是否成功，不影响报告。2026-09-12：与流式路径同理，
+	// 移除 `case unbound:` 条件，始终报告可疑回合。
 	unbound := s.noteAnthropicShortTurnStreak(ctx, account, model, shape.proseRunes, shape.outputTokens)
-	switch {
-	case anthropicTurnIsEmptyAnswer(shape.stopReason, shape.proseRunes, shape.outputTokens, shape.sawToolUseBlock):
+	_ = unbound // 保留调用以触发解绑逻辑，但不再依赖返回值决定是否报告
+	if anthropicTurnIsEmptyAnswer(shape.stopReason, shape.proseRunes, shape.outputTokens, shape.sawToolUseBlock) {
 		s.reportAnthropicEmptyAnswerTurn(ctx, c, resp, account, model,
 			shape.outputTokens, shape.stopReason, "discarded")
-	case unbound:
+	} else {
 		s.reportAnthropicShortTurnUnbind(ctx, c, resp, account, model,
 			shape.proseRunes, shape.outputTokens, shape.stopReason, "discarded")
 	}
