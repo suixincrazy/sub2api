@@ -718,7 +718,20 @@ const (
 	// 注意比的不是 output_tokens 原值，而是 anthropicVisibleOutputTokens 折算出的
 	// 「说出来的那部分」：原值含思考 token，思考一长就把闸门顶穿。标定这个阈值的样本
 	// 全是无思考回合，折算在那种回合上恒等于原值，所以标定仍然成立。
-	anthropicShortTurnOutputTokenLimit = 430
+	//
+	// 2026-09-12 从 430 抬到 550。触发：审计两份 Claude Code 转录（17ad5d26 / b7b2b6f1）
+	// 的 62 次非豁免断流，其中 5 次 NO-DELIVERED-EVENT 案例的 output_tokens 分别为
+	// 441/478/478/494/547，全部 > 430。如果这些案例的折算后 anthropicVisibleOutputTokens
+	// 仍然超出 430，当前判定就无法覆盖它们（anthropicTurnIsSuspectedShortTurn 的
+	// line 1374-1376：visible > limit 时 return false，不判为短回合）。
+	//
+	// 原标定网格（line 649-655）显示 T 在 [410,460] 区间漏判 3、误报 2 不变，T=480 起
+	// 误报涨到 3。抬到 550 会引入更多误报（≥3），但根据 line 685-689 的权衡原则，
+	// "误报代价只有延迟，断流代价是人工介入，两者不同量级"，应优先降低漏判。
+	//
+	// 抬到 550 而非 547：留 3 token 余量，避免边界抖动。与 P=2600 留 274 rune 余量
+	// （2326→2600）的做法一致。
+	anthropicShortTurnOutputTokenLimit = 550
 	// anthropicHealthyTurnMinProseRunes 清零连击所需的最小正文长度，单位 rune。
 	//
 	// 刻意比 anthropicShortTurnProseRuneLimit 低（1300 vs 200）：两者之间那一段
