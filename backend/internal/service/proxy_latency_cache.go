@@ -20,7 +20,14 @@ type ProxyLatencyInfo struct {
 	QualitySummary   string    `json:"quality_summary,omitempty"`
 	QualityCheckedAt *int64    `json:"quality_checked_at,omitempty"`
 	QualityCFRay     string    `json:"quality_cf_ray,omitempty"`
+	QualityEngine    string    `json:"quality_engine,omitempty"`
 	UpdatedAt        time.Time `json:"updated_at"`
+}
+
+const proxyQualityEngineVersion = "runtime-v2"
+
+func hasCurrentProxyQuality(info *ProxyLatencyInfo) bool {
+	return info != nil && info.QualityCheckedAt != nil && info.QualityEngine == proxyQualityEngineVersion
 }
 
 type ProxyLatencyCache interface {

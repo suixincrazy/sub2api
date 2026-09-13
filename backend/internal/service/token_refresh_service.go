@@ -152,6 +152,15 @@ func (s *TokenRefreshService) eligiblePlatforms() []string {
 	return platforms
 }
 
+func (s *TokenRefreshService) matchRefresher(platform string) (TokenRefresher, OAuthRefreshExecutor) {
+	for _, reg := range s.registrations {
+		if reg.platform == platform {
+			return reg.refresher, reg.executor
+		}
+	}
+	return nil, nil
+}
+
 func (s *TokenRefreshService) candidateAfterID() int64 {
 	s.candidateMu.Lock()
 	defer s.candidateMu.Unlock()
@@ -826,6 +835,31 @@ func (s *TokenRefreshService) maxRetries() int {
 // refreshWithRetry 带重试的刷新
 func (s *TokenRefreshService) refreshWithRetry(ctx context.Context, account *Account, refresher TokenRefresher, executor OAuthRefreshExecutor, refreshWindow time.Duration) error {
 	return s.refreshWithRetryWithRateGate(ctx, account, refresher, executor, refreshWindow, nil)
+}
+
+func (s *TokenRefreshService) RefreshAccountNow(ctx context.Context, accountID int64) (*Account, error) {
+	if s == nil || s.accountRepo == nil {
+		return nil, infraerrors.ServiceUnavailable("TOKEN_REFRESH_UNAVAILABLE", "token refresh service is unavailable")
+	}
+	account, err := s.accountRepo.GetByID(ctx, accountID)
+	if err != nil {
+		return nil, err
+	}
+	if account == nil {
+		return nil, infraerrors.NotFound("ACCOUNT_NOT_FOUND", "account not found")
+	}
+	refresher, executor := s.matchRefresher(account.Platform)
+	if refresher == nil || executor == nil {
+		return nil, infraerrors.BadRequest("ACCOUNT_NOT_REFRESHABLE", "account platform does not support token refresh")
+	}
+	if err := s.refreshWithRetry(ctx, account, refresher, executor, 0); err != nil {
+		return nil, err
+	}
+	refreshed, err := s.accountRepo.GetByID(ctx, accountID)
+	if err != nil {
+		return nil, err
+	}
+	return refreshed, nil
 }
 
 func (s *TokenRefreshService) refreshWithRetryWithRateGate(

@@ -22,6 +22,7 @@ import (
 
 type Account struct {
 	ID                      int64
+	OwnerUserID             *int64
 	Name                    string
 	Notes                   *string
 	Platform                string

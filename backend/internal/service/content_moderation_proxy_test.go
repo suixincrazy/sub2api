@@ -97,6 +97,10 @@ func (r *contentModerationTestProxyRepo) CountExpiringSoon(ctx context.Context, 
 	panic("not implemented")
 }
 
+func (r *contentModerationTestProxyRepo) CountFallbackReferencesByProxyID(ctx context.Context, proxyID int64) (int64, error) {
+	panic("not implemented")
+}
+
 func moderationProxyIDPtr(v int64) *int64 { return &v }
 
 // 审计请求必须真正经过配置的代理发出（#2646 核心行为）。

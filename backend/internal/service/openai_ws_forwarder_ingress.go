@@ -913,7 +913,7 @@ func (s *OpenAIGatewayService) ProxyResponsesWebSocketFromClient(
 				failure := s.newOpenAIWSRateLimitFailoverError(account, dialErr.ResponseHeaders, nil, acquireErr.Error())
 				again, finalErr := rateLimitRetry.retry(ctx, nil, account, failure)
 				if again {
-					return acquireTurnLease(turn, preferred, forcePreferredConn)
+					return acquireTurnLease(turn, preferred, forcePreferredConn, forceNewConn)
 				}
 				return nil, finalErr
 			}

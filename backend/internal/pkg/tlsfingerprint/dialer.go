@@ -11,10 +11,32 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"time"
 
 	utls "github.com/refraction-networking/utls"
 	"golang.org/x/net/proxy"
 )
+
+// TCP 建连超时与 keepalive 间隔。
+//
+// 必须显式设置：零值 net.Dialer 没有任何建连上限，只能等内核 TCP 重传耗尽
+// （Linux 约 130 秒）。指纹路径走 DialTLSContext，绕过了 repository 层
+// buildUpstreamTransport 里那个带超时的 DialContext，所以要在这里自带。
+// 数值与 repository.defaultUpstreamDialTimeout / defaultUpstreamDialKeepAlive 对齐。
+const (
+	fingerprintDialTimeout   = 10 * time.Second
+	fingerprintDialKeepAlive = 30 * time.Second
+)
+
+// newFingerprintDialer 返回指纹路径统一使用的 TCP dialer。
+// 三个 dialer（直连 / HTTP CONNECT / SOCKS5）都必须经由此处取，
+// 避免任何一条路径退回零值 net.Dialer。
+func newFingerprintDialer() *net.Dialer {
+	return &net.Dialer{
+		Timeout:   fingerprintDialTimeout,
+		KeepAlive: fingerprintDialKeepAlive,
+	}
+}
 
 // Profile contains TLS fingerprint configuration.
 // All slice fields use built-in defaults when empty.
@@ -118,10 +140,10 @@ var (
 
 // NewDialer creates a new TLS fingerprint dialer.
 // baseDialer is used for TCP connection establishment (supports proxy scenarios).
-// If baseDialer is nil, direct TCP dial is used.
+// If baseDialer is nil, direct TCP dial with 10s timeout is used.
 func NewDialer(profile *Profile, baseDialer func(ctx context.Context, network, addr string) (net.Conn, error)) *Dialer {
 	if baseDialer == nil {
-		baseDialer = (&net.Dialer{}).DialContext
+		baseDialer = newFingerprintDialer().DialContext
 	}
 	return &Dialer{profile: profile, baseDialer: baseDialer}
 }
@@ -160,7 +182,8 @@ func (d *SOCKS5ProxyDialer) DialTLSContext(ctx context.Context, network, addr st
 		proxyAddr = net.JoinHostPort(d.proxyURL.Hostname(), "1080") // Default SOCKS5 port
 	}
 
-	socksDialer, err := proxy.SOCKS5("tcp", proxyAddr, auth, proxy.Direct)
+	// proxy.Direct 是零值 dialer（无建连超时），必须换成带超时的 base dialer
+	socksDialer, err := proxy.SOCKS5("tcp", proxyAddr, auth, newFingerprintDialer())
 	if err != nil {
 		slog.Debug("tls_fingerprint_socks5_dialer_failed", "error", err)
 		return nil, fmt.Errorf("create SOCKS5 dialer: %w", err)
@@ -197,8 +220,7 @@ func (d *HTTPProxyDialer) DialTLSContext(ctx context.Context, network, addr stri
 		}
 	}
 
-	dialer := &net.Dialer{}
-	conn, err := dialer.DialContext(ctx, "tcp", proxyAddr)
+	conn, err := newFingerprintDialer().DialContext(ctx, "tcp", proxyAddr)
 	if err != nil {
 		slog.Debug("tls_fingerprint_http_proxy_connect_failed", "error", err)
 		return nil, fmt.Errorf("connect to proxy: %w", err)

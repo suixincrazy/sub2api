@@ -843,6 +843,11 @@ const startTest = async () => {
 
   abortController = new AbortController()
 
+  // Set up timeout: abort after 25 seconds to prevent indefinite hang
+  const timeoutId = setTimeout(() => {
+    abortController?.abort()
+  }, 25000)
+
   try {
     const requestBody: {
       model_id: string
@@ -892,6 +897,8 @@ const startTest = async () => {
       signal: abortController.signal
     })
 
+    clearTimeout(timeoutId)
+
     if (!response.ok) {
       throw new Error(`HTTP error! status: ${response.status}`)
     }
@@ -927,8 +934,11 @@ const startTest = async () => {
       }
     }
   } catch (error: unknown) {
+    clearTimeout(timeoutId)
     if (error instanceof DOMException && error.name === 'AbortError') {
       status.value = 'idle'
+      errorMessage.value = ''
+      addLine(t('admin.accounts.testCancelled'), 'text-yellow-400')
       return
     }
     status.value = 'error'

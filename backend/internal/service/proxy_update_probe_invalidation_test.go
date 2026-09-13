@@ -27,6 +27,10 @@ func (s *updatingProxyRepoStub) Update(_ context.Context, proxy *Proxy) error {
 	return nil
 }
 
+func (s *updatingProxyRepoStub) CountFallbackReferencesByProxyID(ctx context.Context, proxyID int64) (int64, error) {
+	return 0, nil
+}
+
 func TestBothProxyUpdateServicesUseRepositoryUpdateBoundary(t *testing.T) {
 	t.Run("ProxyService", func(t *testing.T) {
 		repo := &updatingProxyRepoStub{

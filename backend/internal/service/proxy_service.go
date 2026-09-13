@@ -29,6 +29,7 @@ type ProxyRepository interface {
 
 	ExistsByHostPortAuth(ctx context.Context, host string, port int, username, password string) (bool, error)
 	CountAccountsByProxyID(ctx context.Context, proxyID int64) (int64, error)
+	CountFallbackReferencesByProxyID(ctx context.Context, proxyID int64) (int64, error)
 	ListAccountSummariesByProxyID(ctx context.Context, proxyID int64) ([]ProxyAccountSummary, error)
 
 	SweepExpiredProxies(ctx context.Context, now time.Time) (changed int64, err error)

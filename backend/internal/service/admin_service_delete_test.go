@@ -409,6 +409,9 @@ func (s *proxyRepoStub) CountExpired(_ context.Context) (int64, error) {
 func (s *proxyRepoStub) CountExpiringSoon(_ context.Context, _ time.Time) (int64, error) {
 	return 0, nil
 }
+func (s *proxyRepoStub) CountFallbackReferencesByProxyID(ctx context.Context, proxyID int64) (int64, error) {
+	return 0, nil
+}
 
 type redeemRepoStub struct {
 	deleteErrByID map[int64]error

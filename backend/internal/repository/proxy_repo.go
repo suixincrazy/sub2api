@@ -808,3 +808,11 @@ func (r *proxyRepository) CountExpiringSoon(ctx context.Context, now time.Time) 
 		[]any{service.StatusActive, now}, &c)
 	return c, err
 }
+
+func (r *proxyRepository) CountFallbackReferencesByProxyID(ctx context.Context, proxyID int64) (int64, error) {
+	var count int64
+	err := scanSingleRow(ctx, r.sql,
+		`SELECT COUNT(*) FROM proxies WHERE deleted_at IS NULL AND backup_proxy_id = $1`,
+		[]any{proxyID}, &count)
+	return count, err
+}
