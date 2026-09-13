@@ -11,6 +11,8 @@
 # No Setup Wizard needed - the system auto-initializes on first run.
 # =============================================================================
 
+name: sub2api
+
 services:
   # ===========================================================================
   # Sub2API Application
@@ -313,13 +315,22 @@ services:
 # =============================================================================
 # Volumes
 # =============================================================================
+# 预防措施 #5: 使用外部命名卷防止数据丢失
+# 使用 external: true 确保卷在 docker compose down 后仍然保留
+# 首次部署前需要手动创建卷：
+#   docker volume create sub2api_data
+#   docker volume create sub2api_postgres_data
+#   docker volume create sub2api_redis_data
 volumes:
   sub2api_data:
-    driver: local
+    name: sub2api_data
+    external: true
   postgres_data:
-    driver: local
+    name: sub2api_postgres_data
+    external: true
   redis_data:
-    driver: local
+    name: sub2api_redis_data
+    external: true
 
 # =============================================================================
 # Networks
