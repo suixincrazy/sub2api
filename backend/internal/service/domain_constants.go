@@ -545,6 +545,10 @@ const (
 	// admin "site billing mode" selector. Defaults to true (opt-out feature).
 	SettingKeySubscriptionEnabled = "subscription_enabled"
 
+	// SettingKeyEnableUserResources enables user-owned groups/accounts/proxies/redeem codes.
+	// Defaults to false because it exposes self-service resource management.
+	SettingKeyEnableUserResources = "enable_user_resources"
+
 	// SettingKeyModelPlazaEnabled is a DB-backed soft switch for the Model Plaza page
 	// (public group/model pricing showcase). When false: the plaza endpoint returns 404
 	// and the header entry is hidden. Defaults to false (opt-in feature).

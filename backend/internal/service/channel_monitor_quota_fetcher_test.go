@@ -110,6 +110,21 @@ func newQuotaFetcherTestSetup(t *testing.T) (*ChannelMonitorQuotaFetcher, *stubM
 	return fetcher, usage, cnQuota, cnBalance, accounts
 }
 
+func TestQuotaFetcher_RejectsUserOwnedAccount(t *testing.T) {
+	fetcher, usage, _, _, accounts := newQuotaFetcherTestSetup(t)
+	ownerID := int64(42)
+	accounts.accounts[7] = &Account{ID: 7, OwnerUserID: &ownerID, Platform: domain.PlatformAnthropic}
+
+	account, err := fetcher.LoadAccount(context.Background(), 7)
+	require.Nil(t, account)
+	require.EqualError(t, err, "linked account must be a system account")
+
+	snapshot := fetcher.Fetch(context.Background(), 7)
+	require.False(t, snapshot.Success)
+	require.Contains(t, snapshot.Error, "linked account not found")
+	require.Equal(t, 0, usage.getCalls())
+}
+
 // --- 分派 ---
 
 func TestQuotaFetcher_OverseasAccountUsesUsageService(t *testing.T) {

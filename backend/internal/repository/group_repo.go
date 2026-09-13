@@ -96,6 +96,7 @@ func createGroupRecord(ctx context.Context, client *dbent.Client, groupIn *servi
 	}
 	builder := client.Group.Create().
 		SetName(groupIn.Name).
+		SetNillableOwnerUserID(groupIn.OwnerUserID).
 		SetDescription(groupIn.Description).
 		SetPlatform(groupIn.Platform).
 		SetRateMultiplier(groupIn.RateMultiplier).
@@ -284,6 +285,7 @@ func (r *groupRepository) Update(ctx context.Context, groupIn *service.Group) er
 	}
 	builder := r.client.Group.UpdateOneID(groupIn.ID).
 		SetName(groupIn.Name).
+		SetNillableOwnerUserID(groupIn.OwnerUserID).
 		SetDescription(groupIn.Description).
 		SetPlatform(groupIn.Platform).
 		SetRateMultiplier(groupIn.RateMultiplier).
@@ -458,7 +460,21 @@ func (r *groupRepository) List(ctx context.Context, params pagination.Pagination
 }
 
 func (r *groupRepository) ListWithFilters(ctx context.Context, params pagination.PaginationParams, platform, status, search string, isExclusive *bool) ([]service.Group, *pagination.PaginationResult, error) {
+	return r.listWithFiltersAndOwnerScope(ctx, params, platform, status, search, isExclusive, "")
+}
+
+func (r *groupRepository) ListWithOwnerScope(ctx context.Context, params pagination.PaginationParams, platform, status, search string, isExclusive *bool, ownerScope string) ([]service.Group, *pagination.PaginationResult, error) {
+	return r.listWithFiltersAndOwnerScope(ctx, params, platform, status, search, isExclusive, ownerScope)
+}
+
+func (r *groupRepository) listWithFiltersAndOwnerScope(ctx context.Context, params pagination.PaginationParams, platform, status, search string, isExclusive *bool, ownerScope string) ([]service.Group, *pagination.PaginationResult, error) {
 	q := r.client.Group.Query()
+	switch ownerScope {
+	case service.ResourceOwnerScopeSystem:
+		q = q.Where(group.OwnerUserIDIsNil())
+	case service.ResourceOwnerScopeUser:
+		q = q.Where(group.OwnerUserIDNotNil())
+	}
 	return r.listWithFiltersQuery(ctx, q, params, platform, status, search, isExclusive)
 }
 

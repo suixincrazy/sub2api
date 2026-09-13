@@ -73,6 +73,8 @@ const (
 	EdgeSubscriptions = "subscriptions"
 	// EdgeAssignedSubscriptions holds the string denoting the assigned_subscriptions edge name in mutations.
 	EdgeAssignedSubscriptions = "assigned_subscriptions"
+	// EdgeRevokedSubscriptions holds the string denoting the revoked_subscriptions edge name in mutations.
+	EdgeRevokedSubscriptions = "revoked_subscriptions"
 	// EdgeAnnouncementReads holds the string denoting the announcement_reads edge name in mutations.
 	EdgeAnnouncementReads = "announcement_reads"
 	// EdgeAllowedGroups holds the string denoting the allowed_groups edge name in mutations.
@@ -83,6 +85,8 @@ const (
 	EdgeAttributeValues = "attribute_values"
 	// EdgePromoCodeUsages holds the string denoting the promo_code_usages edge name in mutations.
 	EdgePromoCodeUsages = "promo_code_usages"
+	// EdgeRedeemCodeUsages holds the string denoting the redeem_code_usages edge name in mutations.
+	EdgeRedeemCodeUsages = "redeem_code_usages"
 	// EdgePaymentOrders holds the string denoting the payment_orders edge name in mutations.
 	EdgePaymentOrders = "payment_orders"
 	// EdgeAuthIdentities holds the string denoting the auth_identities edge name in mutations.
@@ -123,6 +127,13 @@ const (
 	AssignedSubscriptionsInverseTable = "user_subscriptions"
 	// AssignedSubscriptionsColumn is the table column denoting the assigned_subscriptions relation/edge.
 	AssignedSubscriptionsColumn = "assigned_by"
+	// RevokedSubscriptionsTable is the table that holds the revoked_subscriptions relation/edge.
+	RevokedSubscriptionsTable = "user_subscriptions"
+	// RevokedSubscriptionsInverseTable is the table name for the UserSubscription entity.
+	// It exists in this package in order to avoid circular dependency with the "usersubscription" package.
+	RevokedSubscriptionsInverseTable = "user_subscriptions"
+	// RevokedSubscriptionsColumn is the table column denoting the revoked_subscriptions relation/edge.
+	RevokedSubscriptionsColumn = "revoked_by_user_id"
 	// AnnouncementReadsTable is the table that holds the announcement_reads relation/edge.
 	AnnouncementReadsTable = "announcement_reads"
 	// AnnouncementReadsInverseTable is the table name for the AnnouncementRead entity.
@@ -156,6 +167,13 @@ const (
 	PromoCodeUsagesInverseTable = "promo_code_usages"
 	// PromoCodeUsagesColumn is the table column denoting the promo_code_usages relation/edge.
 	PromoCodeUsagesColumn = "user_id"
+	// RedeemCodeUsagesTable is the table that holds the redeem_code_usages relation/edge.
+	RedeemCodeUsagesTable = "redeem_code_usages"
+	// RedeemCodeUsagesInverseTable is the table name for the RedeemCodeUsage entity.
+	// It exists in this package in order to avoid circular dependency with the "redeemcodeusage" package.
+	RedeemCodeUsagesInverseTable = "redeem_code_usages"
+	// RedeemCodeUsagesColumn is the table column denoting the redeem_code_usages relation/edge.
+	RedeemCodeUsagesColumn = "user_id"
 	// PaymentOrdersTable is the table that holds the payment_orders relation/edge.
 	PaymentOrdersTable = "payment_orders"
 	// PaymentOrdersInverseTable is the table name for the PaymentOrder entity.
@@ -486,6 +504,20 @@ func ByAssignedSubscriptions(term sql.OrderTerm, terms ...sql.OrderTerm) OrderOp
 	}
 }
 
+// ByRevokedSubscriptionsCount orders the results by revoked_subscriptions count.
+func ByRevokedSubscriptionsCount(opts ...sql.OrderTermOption) OrderOption {
+	return func(s *sql.Selector) {
+		sqlgraph.OrderByNeighborsCount(s, newRevokedSubscriptionsStep(), opts...)
+	}
+}
+
+// ByRevokedSubscriptions orders the results by revoked_subscriptions terms.
+func ByRevokedSubscriptions(term sql.OrderTerm, terms ...sql.OrderTerm) OrderOption {
+	return func(s *sql.Selector) {
+		sqlgraph.OrderByNeighborTerms(s, newRevokedSubscriptionsStep(), append([]sql.OrderTerm{term}, terms...)...)
+	}
+}
+
 // ByAnnouncementReadsCount orders the results by announcement_reads count.
 func ByAnnouncementReadsCount(opts ...sql.OrderTermOption) OrderOption {
 	return func(s *sql.Selector) {
@@ -553,6 +585,20 @@ func ByPromoCodeUsagesCount(opts ...sql.OrderTermOption) OrderOption {
 func ByPromoCodeUsages(term sql.OrderTerm, terms ...sql.OrderTerm) OrderOption {
 	return func(s *sql.Selector) {
 		sqlgraph.OrderByNeighborTerms(s, newPromoCodeUsagesStep(), append([]sql.OrderTerm{term}, terms...)...)
+	}
+}
+
+// ByRedeemCodeUsagesCount orders the results by redeem_code_usages count.
+func ByRedeemCodeUsagesCount(opts ...sql.OrderTermOption) OrderOption {
+	return func(s *sql.Selector) {
+		sqlgraph.OrderByNeighborsCount(s, newRedeemCodeUsagesStep(), opts...)
+	}
+}
+
+// ByRedeemCodeUsages orders the results by redeem_code_usages terms.
+func ByRedeemCodeUsages(term sql.OrderTerm, terms ...sql.OrderTerm) OrderOption {
+	return func(s *sql.Selector) {
+		sqlgraph.OrderByNeighborTerms(s, newRedeemCodeUsagesStep(), append([]sql.OrderTerm{term}, terms...)...)
 	}
 }
 
@@ -653,6 +699,13 @@ func newAssignedSubscriptionsStep() *sqlgraph.Step {
 		sqlgraph.Edge(sqlgraph.O2M, false, AssignedSubscriptionsTable, AssignedSubscriptionsColumn),
 	)
 }
+func newRevokedSubscriptionsStep() *sqlgraph.Step {
+	return sqlgraph.NewStep(
+		sqlgraph.From(Table, FieldID),
+		sqlgraph.To(RevokedSubscriptionsInverseTable, FieldID),
+		sqlgraph.Edge(sqlgraph.O2M, false, RevokedSubscriptionsTable, RevokedSubscriptionsColumn),
+	)
+}
 func newAnnouncementReadsStep() *sqlgraph.Step {
 	return sqlgraph.NewStep(
 		sqlgraph.From(Table, FieldID),
@@ -686,6 +739,13 @@ func newPromoCodeUsagesStep() *sqlgraph.Step {
 		sqlgraph.From(Table, FieldID),
 		sqlgraph.To(PromoCodeUsagesInverseTable, FieldID),
 		sqlgraph.Edge(sqlgraph.O2M, false, PromoCodeUsagesTable, PromoCodeUsagesColumn),
+	)
+}
+func newRedeemCodeUsagesStep() *sqlgraph.Step {
+	return sqlgraph.NewStep(
+		sqlgraph.From(Table, FieldID),
+		sqlgraph.To(RedeemCodeUsagesInverseTable, FieldID),
+		sqlgraph.Edge(sqlgraph.O2M, false, RedeemCodeUsagesTable, RedeemCodeUsagesColumn),
 	)
 }
 func newPaymentOrdersStep() *sqlgraph.Step {

@@ -118,7 +118,7 @@ export default {
   keyUsage: {
     title: 'API Key 用量查询',
     subtitle: '输入您的 API Key 以查看实时消费金额与使用状态',
-    placeholder: 'sk-ant-mirror-xxxxxxxxxxxx',
+    placeholder: '<API_KEY>',
     query: '查询',
     querying: '查询中...',
     privacyNote: '您的 Key 仅在浏览器本地处理，不会被存储',

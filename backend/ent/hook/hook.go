@@ -321,6 +321,18 @@ func (f ProxyFunc) Mutate(ctx context.Context, m ent.Mutation) (ent.Value, error
 	return nil, fmt.Errorf("unexpected mutation type %T. expect *ent.ProxyMutation", m)
 }
 
+// The ProxySourceFunc type is an adapter to allow the use of ordinary
+// function as ProxySource mutator.
+type ProxySourceFunc func(context.Context, *ent.ProxySourceMutation) (ent.Value, error)
+
+// Mutate calls f(ctx, m).
+func (f ProxySourceFunc) Mutate(ctx context.Context, m ent.Mutation) (ent.Value, error) {
+	if mv, ok := m.(*ent.ProxySourceMutation); ok {
+		return f(ctx, mv)
+	}
+	return nil, fmt.Errorf("unexpected mutation type %T. expect *ent.ProxySourceMutation", m)
+}
+
 // The RedeemCodeFunc type is an adapter to allow the use of ordinary
 // function as RedeemCode mutator.
 type RedeemCodeFunc func(context.Context, *ent.RedeemCodeMutation) (ent.Value, error)
@@ -331,6 +343,18 @@ func (f RedeemCodeFunc) Mutate(ctx context.Context, m ent.Mutation) (ent.Value, 
 		return f(ctx, mv)
 	}
 	return nil, fmt.Errorf("unexpected mutation type %T. expect *ent.RedeemCodeMutation", m)
+}
+
+// The RedeemCodeUsageFunc type is an adapter to allow the use of ordinary
+// function as RedeemCodeUsage mutator.
+type RedeemCodeUsageFunc func(context.Context, *ent.RedeemCodeUsageMutation) (ent.Value, error)
+
+// Mutate calls f(ctx, m).
+func (f RedeemCodeUsageFunc) Mutate(ctx context.Context, m ent.Mutation) (ent.Value, error) {
+	if mv, ok := m.(*ent.RedeemCodeUsageMutation); ok {
+		return f(ctx, mv)
+	}
+	return nil, fmt.Errorf("unexpected mutation type %T. expect *ent.RedeemCodeUsageMutation", m)
 }
 
 // The SecuritySecretFunc type is an adapter to allow the use of ordinary

@@ -222,6 +222,14 @@
           <template #cell-id="{ value }">
             <span class="font-mono text-xs text-gray-500 dark:text-gray-400">#{{ value }}</span>
           </template>
+          <template #cell-owner_user_id="{ row }">
+            <span v-if="row.owner_user_id" class="font-mono text-xs text-primary-600 dark:text-primary-400">
+              {{ t('admin.accounts.userResourceOwner', { id: row.owner_user_id }) }}
+            </span>
+            <span v-else class="text-xs text-gray-500 dark:text-gray-400">
+              {{ t('admin.accounts.systemResource') }}
+            </span>
+          </template>
           <template #cell-name="{ row, value }">
             <div class="flex flex-col">
               <HelpTooltip
@@ -1084,6 +1092,7 @@ const {
     status: '',
     privacy_mode: '',
     group: '',
+    owner_scope: '',
     search: '',
     lite: '1',
     include_scheduler_score: shouldIncludeSchedulerScore() ? '1' : '0',
@@ -1784,6 +1793,7 @@ const allColumns = computed(() => {
     { key: 'select', label: '', sortable: false },
     { key: 'name', label: t('admin.accounts.columns.name'), sortable: true },
     { key: 'id', label: t('admin.accounts.columns.id'), sortable: true },
+    { key: 'owner_user_id', label: t('admin.accounts.columns.owner'), sortable: false },
     { key: 'platform_type', label: t('admin.accounts.columns.platformType'), sortable: false },
     { key: 'capacity', label: t('admin.accounts.columns.capacity'), sortable: false },
     { key: 'status', label: t('admin.accounts.columns.status'), sortable: true },

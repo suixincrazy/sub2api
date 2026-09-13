@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"net/http"
@@ -162,6 +163,25 @@ type contentModerationTestHashCache struct {
 type contentModerationTestUserRepo struct {
 	user    *User
 	updated []User
+}
+
+type contentModerationTestDeprovisioner struct {
+	repo  *contentModerationTestUserRepo
+	err   error
+	calls []int64
+}
+
+func (d *contentModerationTestDeprovisioner) DisableUserAndOwnedResources(_ context.Context, userID int64) error {
+	d.calls = append(d.calls, userID)
+	if d.err != nil {
+		return d.err
+	}
+	if d.repo != nil && d.repo.user != nil {
+		clone := *d.repo.user
+		clone.Status = StatusDisabled
+		d.repo.user = &clone
+	}
+	return nil
 }
 
 func (r *contentModerationTestUserRepo) Create(ctx context.Context, user *User) error {
@@ -1545,6 +1565,8 @@ func TestContentModerationAutoBanSkipsAdminAccount(t *testing.T) {
 	userRepo := &contentModerationTestUserRepo{user: &User{ID: userID, Role: RoleAdmin, Status: StatusActive}}
 	invalidator := &contentModerationTestAuthCacheInvalidator{}
 	svc := NewContentModerationService(nil, repo, nil, nil, userRepo, nil, invalidator, nil)
+	deprovisioner := &contentModerationTestDeprovisioner{repo: userRepo}
+	svc.SetUserResourceDeprovisioner(deprovisioner)
 
 	svc.persistContentModerationLog(context.Background(), cfg, newContentModerationFlaggedLog(userID), "", false, true)
 
@@ -1572,15 +1594,37 @@ func TestContentModerationAutoBanDisablesRegularUserAtThreshold(t *testing.T) {
 	userRepo := &contentModerationTestUserRepo{user: &User{ID: userID, Role: RoleUser, Status: StatusActive}}
 	invalidator := &contentModerationTestAuthCacheInvalidator{}
 	svc := NewContentModerationService(nil, repo, nil, nil, userRepo, nil, invalidator, nil)
+	deprovisioner := &contentModerationTestDeprovisioner{repo: userRepo}
+	svc.SetUserResourceDeprovisioner(deprovisioner)
 
 	svc.persistContentModerationLog(context.Background(), cfg, newContentModerationFlaggedLog(userID), "", false, true)
 
 	logs := requireContentModerationLogCount(t, repo, 2)
 	require.Equal(t, 2, logs[1].ViolationCount)
 	require.True(t, logs[1].AutoBanned)
-	require.Len(t, userRepo.updated, 1)
+	require.Empty(t, userRepo.updated, "auto-ban must not perform a second non-transactional user update")
 	require.Equal(t, StatusDisabled, userRepo.user.Status)
+	require.Equal(t, []int64{userID}, deprovisioner.calls)
 	require.Equal(t, []int64{userID}, invalidator.userIDs)
+}
+
+func TestContentModerationAutoBanKeepsUserActiveWhenAtomicLifecycleFails(t *testing.T) {
+	cfg := defaultContentModerationConfig()
+	cfg.BanThreshold = 1
+	userID := int64(1002)
+	repo := &contentModerationTestRepo{}
+	userRepo := &contentModerationTestUserRepo{user: &User{ID: userID, Role: RoleUser, Status: StatusActive}}
+	svc := NewContentModerationService(nil, repo, nil, nil, userRepo, nil, nil, nil)
+	deprovisioner := &contentModerationTestDeprovisioner{repo: userRepo, err: errors.New("transaction failed")}
+	svc.SetUserResourceDeprovisioner(deprovisioner)
+
+	svc.persistContentModerationLog(context.Background(), cfg, newContentModerationFlaggedLog(userID), "", false, true)
+
+	logs := requireContentModerationLogCount(t, repo, 1)
+	require.False(t, logs[0].AutoBanned)
+	require.Equal(t, StatusActive, userRepo.user.Status)
+	require.Empty(t, userRepo.updated)
+	require.Equal(t, []int64{userID}, deprovisioner.calls)
 }
 
 func TestContentModerationAdminBelowBanThresholdRecordsViolationOnly(t *testing.T) {

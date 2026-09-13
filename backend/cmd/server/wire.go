@@ -111,6 +111,7 @@ func provideCleanup(
 	billingCache *service.BillingCacheService,
 	usageRecordWorkerPool *service.UsageRecordWorkerPool,
 	subscriptionService *service.SubscriptionService,
+	userResourceService *service.UserResourceService,
 	oauth *service.OAuthService,
 	openaiOAuth *service.OpenAIOAuthService,
 	geminiOAuth *service.GeminiOAuthService,
@@ -133,6 +134,11 @@ func provideCleanup(
 	return func() {
 		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cancel()
+		if userResourceService != nil {
+			if err := userResourceService.Close(); err != nil {
+				log.Printf("cleanup UserResourceService failed: %v", err)
+			}
+		}
 
 		type cleanupStep struct {
 			name string
@@ -141,6 +147,9 @@ func provideCleanup(
 
 		// 应用层清理步骤可并行执行，基础设施资源（Redis/Ent）最后按顺序关闭。
 		parallelSteps := []cleanupStep{
+			{"XrayRuntimeManager", func() error {
+				return service.DefaultXrayRuntimeManager().Close()
+			}},
 			{"PluginManager", func() error {
 				if pluginManager != nil {
 					pluginManager.Stop()

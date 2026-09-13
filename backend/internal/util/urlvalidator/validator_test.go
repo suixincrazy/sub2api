@@ -2,6 +2,15 @@ package urlvalidator
 
 import "testing"
 
+func TestPublicOnlyDialerRejectsPrivateAndCGNATAddresses(t *testing.T) {
+	dialer := NewPublicOnlyDialer(nil)
+	for _, address := range []string{"127.0.0.1:80", "10.0.0.1:80", "100.64.0.1:80", "[::1]:80"} {
+		if _, err := dialer.Dial("tcp", address); err == nil {
+			t.Fatalf("expected %s to be blocked", address)
+		}
+	}
+}
+
 func TestValidateURLFormat(t *testing.T) {
 	if _, err := ValidateURLFormat("", false); err == nil {
 		t.Fatalf("expected empty url to fail")

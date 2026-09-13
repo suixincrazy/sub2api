@@ -99,6 +99,7 @@ func TestAccountTestService_AdaptiveChatOnlyProvidersTestChatAndAnthropicEndpoin
 	require.Equal(t, "http://anthropic.example/v1/messages", upstream.requests[1].URL.String())
 	require.Equal(t, "Bearer sk-adaptive-test", upstream.requests[0].Header.Get("Authorization"))
 	require.Equal(t, "sk-adaptive-test", upstream.requests[1].Header.Get("x-api-key"))
+	require.Equal(t, "hello", gjson.GetBytes(upstream.bodies[1], "messages.0.content.0.text").String())
 	require.Equal(t, 1, strings.Count(recorder.Body.String(), `"type":"test_start"`))
 	require.Equal(t, 1, strings.Count(recorder.Body.String(), `"type":"test_complete"`))
 	require.Contains(t, recorder.Body.String(), "已通过原生 /v1/messages 验证")
@@ -114,7 +115,7 @@ func TestAccountTestService_AdaptiveDeepSeekAlsoTestsResponsesEndpoint(t *testin
 	)
 	c, recorder := newTestContext()
 
-	err := svc.TestAccountConnection(c, account.ID, "deepseek-chat", "", AccountTestModeDefault)
+	err := svc.TestAccountConnection(c, account.ID, "deepseek-chat", "check responses", AccountTestModeDefault)
 
 	require.NoError(t, err)
 	require.Len(t, upstream.requests, 3)
@@ -124,6 +125,7 @@ func TestAccountTestService_AdaptiveDeepSeekAlsoTestsResponsesEndpoint(t *testin
 	require.True(t, gjson.GetBytes(upstream.bodies[2], "stream").Bool())
 	require.False(t, gjson.GetBytes(upstream.bodies[2], "store").Bool())
 	require.False(t, gjson.GetBytes(upstream.bodies[2], "instructions").Exists())
+	require.Equal(t, "check responses", gjson.GetBytes(upstream.bodies[2], "input.0.content.0.text").String())
 	require.Equal(t, 1, strings.Count(recorder.Body.String(), `"type":"test_complete"`))
 	require.Contains(t, recorder.Body.String(), "已通过原生 /responses 验证")
 }
@@ -195,7 +197,7 @@ func TestAccountTestService_FixedCNChatProtocolStillTestsOnlyChatEndpoint(t *tes
 	svc, upstream := adaptiveCNAccountTestService(account, adaptiveCNChatTestResponse())
 	c, recorder := newTestContext()
 
-	err := svc.TestAccountConnection(c, account.ID, "glm-4.7", "", AccountTestModeDefault)
+	err := svc.TestAccountConnection(c, account.ID, "glm-4.7", "check anthropic", AccountTestModeDefault)
 
 	require.NoError(t, err)
 	require.Len(t, upstream.requests, 1)
@@ -229,7 +231,7 @@ func TestAccountTestService_AnthropicProtocolProbesNativeEndpointWithoutBetaQuer
 	svc, upstream := adaptiveCNAccountTestService(account, adaptiveCNAnthropicTestResponse())
 	c, recorder := newTestContext()
 
-	err := svc.TestAccountConnection(c, account.ID, "glm-4.7", "", AccountTestModeDefault)
+	err := svc.TestAccountConnection(c, account.ID, "glm-4.7", "check anthropic", AccountTestModeDefault)
 
 	require.NoError(t, err)
 	require.Len(t, upstream.requests, 1)
@@ -239,6 +241,7 @@ func TestAccountTestService_AnthropicProtocolProbesNativeEndpointWithoutBetaQuer
 	require.Empty(t, req.URL.RawQuery)
 	require.Equal(t, "sk-anthropic-test", req.Header.Get("x-api-key"))
 	require.Equal(t, "2023-06-01", req.Header.Get("anthropic-version"))
+	require.Equal(t, "check anthropic", gjson.GetBytes(upstream.bodies[0], "messages.0.content.0.text").String())
 	require.Contains(t, recorder.Body.String(), `"type":"test_complete"`)
 }
 

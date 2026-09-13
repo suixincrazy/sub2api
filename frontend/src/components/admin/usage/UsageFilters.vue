@@ -190,7 +190,7 @@
             {{ t('admin.usage.cleanup.button') }}
           </button>
           <button type="button" @click="$emit('export')" :disabled="exporting" class="btn btn-primary">
-            {{ t('usage.exportExcel') }}
+            {{ t('usage.exportCsv') }}
           </button>
         </template>
       </div>

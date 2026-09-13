@@ -39,6 +39,10 @@ func (RedeemCode) Fields() []ent.Field {
 			MaxLen(32).
 			NotEmpty().
 			Unique(),
+		field.Int64("owner_user_id").
+			Optional().
+			Nillable().
+			Comment("NULL means system/admin code; non-NULL means user-generated private subscription code."),
 		field.String("type").
 			MaxLen(20).
 			Default(domain.RedeemTypeBalance),
@@ -72,6 +76,12 @@ func (RedeemCode) Fields() []ent.Field {
 			Nillable(),
 		field.Int("validity_days").
 			Default(30),
+		field.Int("max_uses").
+			Default(1).
+			Comment("Maximum successful redemptions; each user can redeem once."),
+		field.Int("used_count").
+			Default(0).
+			Comment("Number of successful redemptions."),
 	}
 }
 
@@ -85,6 +95,7 @@ func (RedeemCode) Edges() []ent.Edge {
 			Ref("redeem_codes").
 			Field("group_id").
 			Unique(),
+		edge.To("usage_records", RedeemCodeUsage.Type),
 	}
 }
 
@@ -92,8 +103,10 @@ func (RedeemCode) Indexes() []ent.Index {
 	return []ent.Index{
 		// code 字段已在 Fields() 中声明 Unique()，无需重复索引
 		index.Fields("status"),
+		index.Fields("owner_user_id"),
 		index.Fields("used_by"),
 		index.Fields("group_id"),
 		index.Fields("expires_at"),
+		index.Fields("owner_user_id", "used_count"),
 	}
 }

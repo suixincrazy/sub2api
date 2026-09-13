@@ -218,6 +218,9 @@ type SystemSettings struct {
 	// to form the admin-facing "site billing mode" selector.
 	SubscriptionEnabled bool `json:"subscription_enabled"`
 
+	// User-owned resource workspace feature.
+	EnableUserResources bool `json:"enable_user_resources"`
+
 	// Model Plaza feature (public group/model pricing showcase)
 	ModelPlazaEnabled       bool   `json:"model_plaza_enabled"`
 	ModelPlazaRequireAuth   bool   `json:"model_plaza_require_auth"`
@@ -402,6 +405,9 @@ type PublicSettings struct {
 
 	// Subscription feature switch (see SystemSettings.SubscriptionEnabled)
 	SubscriptionEnabled bool `json:"subscription_enabled"`
+
+	// User-owned resource workspace feature.
+	EnableUserResources bool `json:"enable_user_resources"`
 
 	// Model Plaza feature (public group/model pricing showcase)
 	ModelPlazaEnabled       bool `json:"model_plaza_enabled"`

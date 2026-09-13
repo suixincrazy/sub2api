@@ -41,15 +41,17 @@ func Parse(raw string) (trimmed string, parsed *url.URL, err error) {
 
 	parsed, err = url.Parse(trimmed)
 	if err != nil {
-		// 不使用 %w 包装，避免 url.Parse 的底层错误消息泄漏原始 URL（可能含凭据）
-		return "", nil, fmt.Errorf("invalid proxy URL: %v", err)
+		return "", nil, fmt.Errorf("invalid proxy URL")
 	}
 
 	if parsed.Host == "" || parsed.Hostname() == "" {
-		return "", nil, fmt.Errorf("proxy URL missing host: %s", parsed.Redacted())
+		return "", nil, fmt.Errorf("proxy URL missing host")
 	}
 
 	scheme := strings.ToLower(parsed.Scheme)
+	if (scheme == "xray" || scheme == "sing-box") && strings.EqualFold(parsed.Hostname(), "unavailable") {
+		return "", nil, fmt.Errorf("%s proxy runtime is unavailable", scheme)
+	}
 	if !allowedSchemes[scheme] {
 		return "", nil, fmt.Errorf("unsupported proxy scheme %q (allowed: http, https, socks5, socks5h)", scheme)
 	}
@@ -63,4 +65,17 @@ func Parse(raw string) (trimmed string, parsed *url.URL, err error) {
 	}
 
 	return trimmed, parsed, nil
+}
+
+// SafeForLog returns only the proxy scheme and endpoint. Userinfo, path,
+// query parameters and fragments are never included.
+func SafeForLog(raw string) string {
+	_, parsed, err := Parse(raw)
+	if err != nil {
+		return "<invalid-proxy>"
+	}
+	if parsed == nil {
+		return "direct"
+	}
+	return strings.ToLower(parsed.Scheme) + "://" + strings.ToLower(parsed.Host)
 }

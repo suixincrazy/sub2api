@@ -71,6 +71,48 @@ func (_c *ProxyCreate) SetName(v string) *ProxyCreate {
 	return _c
 }
 
+// SetOwnerUserID sets the "owner_user_id" field.
+func (_c *ProxyCreate) SetOwnerUserID(v int64) *ProxyCreate {
+	_c.mutation.SetOwnerUserID(v)
+	return _c
+}
+
+// SetNillableOwnerUserID sets the "owner_user_id" field if the given value is not nil.
+func (_c *ProxyCreate) SetNillableOwnerUserID(v *int64) *ProxyCreate {
+	if v != nil {
+		_c.SetOwnerUserID(*v)
+	}
+	return _c
+}
+
+// SetIsPublic sets the "is_public" field.
+func (_c *ProxyCreate) SetIsPublic(v bool) *ProxyCreate {
+	_c.mutation.SetIsPublic(v)
+	return _c
+}
+
+// SetNillableIsPublic sets the "is_public" field if the given value is not nil.
+func (_c *ProxyCreate) SetNillableIsPublic(v *bool) *ProxyCreate {
+	if v != nil {
+		_c.SetIsPublic(*v)
+	}
+	return _c
+}
+
+// SetKind sets the "kind" field.
+func (_c *ProxyCreate) SetKind(v string) *ProxyCreate {
+	_c.mutation.SetKind(v)
+	return _c
+}
+
+// SetNillableKind sets the "kind" field if the given value is not nil.
+func (_c *ProxyCreate) SetNillableKind(v *string) *ProxyCreate {
+	if v != nil {
+		_c.SetKind(*v)
+	}
+	return _c
+}
+
 // SetProtocol sets the "protocol" field.
 func (_c *ProxyCreate) SetProtocol(v string) *ProxyCreate {
 	_c.mutation.SetProtocol(v)
@@ -187,6 +229,12 @@ func (_c *ProxyCreate) SetNillableExpiryWarnDays(v *int) *ProxyCreate {
 	return _c
 }
 
+// SetExtra sets the "extra" field.
+func (_c *ProxyCreate) SetExtra(v map[string]interface{}) *ProxyCreate {
+	_c.mutation.SetExtra(v)
+	return _c
+}
+
 // AddAccountIDs adds the "accounts" edge to the Account entity by IDs.
 func (_c *ProxyCreate) AddAccountIDs(ids ...int64) *ProxyCreate {
 	_c.mutation.AddAccountIDs(ids...)
@@ -273,6 +321,14 @@ func (_c *ProxyCreate) defaults() error {
 		v := proxy.DefaultUpdatedAt()
 		_c.mutation.SetUpdatedAt(v)
 	}
+	if _, ok := _c.mutation.IsPublic(); !ok {
+		v := proxy.DefaultIsPublic
+		_c.mutation.SetIsPublic(v)
+	}
+	if _, ok := _c.mutation.Kind(); !ok {
+		v := proxy.DefaultKind
+		_c.mutation.SetKind(v)
+	}
 	if _, ok := _c.mutation.Status(); !ok {
 		v := proxy.DefaultStatus
 		_c.mutation.SetStatus(v)
@@ -284,6 +340,13 @@ func (_c *ProxyCreate) defaults() error {
 	if _, ok := _c.mutation.ExpiryWarnDays(); !ok {
 		v := proxy.DefaultExpiryWarnDays
 		_c.mutation.SetExpiryWarnDays(v)
+	}
+	if _, ok := _c.mutation.Extra(); !ok {
+		if proxy.DefaultExtra == nil {
+			return fmt.Errorf("ent: uninitialized proxy.DefaultExtra (forgotten import ent/runtime?)")
+		}
+		v := proxy.DefaultExtra()
+		_c.mutation.SetExtra(v)
 	}
 	return nil
 }
@@ -302,6 +365,17 @@ func (_c *ProxyCreate) check() error {
 	if v, ok := _c.mutation.Name(); ok {
 		if err := proxy.NameValidator(v); err != nil {
 			return &ValidationError{Name: "name", err: fmt.Errorf(`ent: validator failed for field "Proxy.name": %w`, err)}
+		}
+	}
+	if _, ok := _c.mutation.IsPublic(); !ok {
+		return &ValidationError{Name: "is_public", err: errors.New(`ent: missing required field "Proxy.is_public"`)}
+	}
+	if _, ok := _c.mutation.Kind(); !ok {
+		return &ValidationError{Name: "kind", err: errors.New(`ent: missing required field "Proxy.kind"`)}
+	}
+	if v, ok := _c.mutation.Kind(); ok {
+		if err := proxy.KindValidator(v); err != nil {
+			return &ValidationError{Name: "kind", err: fmt.Errorf(`ent: validator failed for field "Proxy.kind": %w`, err)}
 		}
 	}
 	if _, ok := _c.mutation.Protocol(); !ok {
@@ -352,6 +426,9 @@ func (_c *ProxyCreate) check() error {
 	if _, ok := _c.mutation.ExpiryWarnDays(); !ok {
 		return &ValidationError{Name: "expiry_warn_days", err: errors.New(`ent: missing required field "Proxy.expiry_warn_days"`)}
 	}
+	if _, ok := _c.mutation.Extra(); !ok {
+		return &ValidationError{Name: "extra", err: errors.New(`ent: missing required field "Proxy.extra"`)}
+	}
 	return nil
 }
 
@@ -395,6 +472,18 @@ func (_c *ProxyCreate) createSpec() (*Proxy, *sqlgraph.CreateSpec) {
 		_spec.SetField(proxy.FieldName, field.TypeString, value)
 		_node.Name = value
 	}
+	if value, ok := _c.mutation.OwnerUserID(); ok {
+		_spec.SetField(proxy.FieldOwnerUserID, field.TypeInt64, value)
+		_node.OwnerUserID = &value
+	}
+	if value, ok := _c.mutation.IsPublic(); ok {
+		_spec.SetField(proxy.FieldIsPublic, field.TypeBool, value)
+		_node.IsPublic = value
+	}
+	if value, ok := _c.mutation.Kind(); ok {
+		_spec.SetField(proxy.FieldKind, field.TypeString, value)
+		_node.Kind = value
+	}
 	if value, ok := _c.mutation.Protocol(); ok {
 		_spec.SetField(proxy.FieldProtocol, field.TypeString, value)
 		_node.Protocol = value
@@ -430,6 +519,10 @@ func (_c *ProxyCreate) createSpec() (*Proxy, *sqlgraph.CreateSpec) {
 	if value, ok := _c.mutation.ExpiryWarnDays(); ok {
 		_spec.SetField(proxy.FieldExpiryWarnDays, field.TypeInt, value)
 		_node.ExpiryWarnDays = value
+	}
+	if value, ok := _c.mutation.Extra(); ok {
+		_spec.SetField(proxy.FieldExtra, field.TypeJSON, value)
+		_node.Extra = value
 	}
 	if nodes := _c.mutation.AccountsIDs(); len(nodes) > 0 {
 		edge := &sqlgraph.EdgeSpec{
@@ -571,6 +664,54 @@ func (u *ProxyUpsert) SetName(v string) *ProxyUpsert {
 // UpdateName sets the "name" field to the value that was provided on create.
 func (u *ProxyUpsert) UpdateName() *ProxyUpsert {
 	u.SetExcluded(proxy.FieldName)
+	return u
+}
+
+// SetOwnerUserID sets the "owner_user_id" field.
+func (u *ProxyUpsert) SetOwnerUserID(v int64) *ProxyUpsert {
+	u.Set(proxy.FieldOwnerUserID, v)
+	return u
+}
+
+// UpdateOwnerUserID sets the "owner_user_id" field to the value that was provided on create.
+func (u *ProxyUpsert) UpdateOwnerUserID() *ProxyUpsert {
+	u.SetExcluded(proxy.FieldOwnerUserID)
+	return u
+}
+
+// AddOwnerUserID adds v to the "owner_user_id" field.
+func (u *ProxyUpsert) AddOwnerUserID(v int64) *ProxyUpsert {
+	u.Add(proxy.FieldOwnerUserID, v)
+	return u
+}
+
+// ClearOwnerUserID clears the value of the "owner_user_id" field.
+func (u *ProxyUpsert) ClearOwnerUserID() *ProxyUpsert {
+	u.SetNull(proxy.FieldOwnerUserID)
+	return u
+}
+
+// SetIsPublic sets the "is_public" field.
+func (u *ProxyUpsert) SetIsPublic(v bool) *ProxyUpsert {
+	u.Set(proxy.FieldIsPublic, v)
+	return u
+}
+
+// UpdateIsPublic sets the "is_public" field to the value that was provided on create.
+func (u *ProxyUpsert) UpdateIsPublic() *ProxyUpsert {
+	u.SetExcluded(proxy.FieldIsPublic)
+	return u
+}
+
+// SetKind sets the "kind" field.
+func (u *ProxyUpsert) SetKind(v string) *ProxyUpsert {
+	u.Set(proxy.FieldKind, v)
+	return u
+}
+
+// UpdateKind sets the "kind" field to the value that was provided on create.
+func (u *ProxyUpsert) UpdateKind() *ProxyUpsert {
+	u.SetExcluded(proxy.FieldKind)
 	return u
 }
 
@@ -730,6 +871,18 @@ func (u *ProxyUpsert) AddExpiryWarnDays(v int) *ProxyUpsert {
 	return u
 }
 
+// SetExtra sets the "extra" field.
+func (u *ProxyUpsert) SetExtra(v map[string]interface{}) *ProxyUpsert {
+	u.Set(proxy.FieldExtra, v)
+	return u
+}
+
+// UpdateExtra sets the "extra" field to the value that was provided on create.
+func (u *ProxyUpsert) UpdateExtra() *ProxyUpsert {
+	u.SetExcluded(proxy.FieldExtra)
+	return u
+}
+
 // UpdateNewValues updates the mutable fields using the new values that were set on create.
 // Using this option is equivalent to using:
 //
@@ -821,6 +974,62 @@ func (u *ProxyUpsertOne) SetName(v string) *ProxyUpsertOne {
 func (u *ProxyUpsertOne) UpdateName() *ProxyUpsertOne {
 	return u.Update(func(s *ProxyUpsert) {
 		s.UpdateName()
+	})
+}
+
+// SetOwnerUserID sets the "owner_user_id" field.
+func (u *ProxyUpsertOne) SetOwnerUserID(v int64) *ProxyUpsertOne {
+	return u.Update(func(s *ProxyUpsert) {
+		s.SetOwnerUserID(v)
+	})
+}
+
+// AddOwnerUserID adds v to the "owner_user_id" field.
+func (u *ProxyUpsertOne) AddOwnerUserID(v int64) *ProxyUpsertOne {
+	return u.Update(func(s *ProxyUpsert) {
+		s.AddOwnerUserID(v)
+	})
+}
+
+// UpdateOwnerUserID sets the "owner_user_id" field to the value that was provided on create.
+func (u *ProxyUpsertOne) UpdateOwnerUserID() *ProxyUpsertOne {
+	return u.Update(func(s *ProxyUpsert) {
+		s.UpdateOwnerUserID()
+	})
+}
+
+// ClearOwnerUserID clears the value of the "owner_user_id" field.
+func (u *ProxyUpsertOne) ClearOwnerUserID() *ProxyUpsertOne {
+	return u.Update(func(s *ProxyUpsert) {
+		s.ClearOwnerUserID()
+	})
+}
+
+// SetIsPublic sets the "is_public" field.
+func (u *ProxyUpsertOne) SetIsPublic(v bool) *ProxyUpsertOne {
+	return u.Update(func(s *ProxyUpsert) {
+		s.SetIsPublic(v)
+	})
+}
+
+// UpdateIsPublic sets the "is_public" field to the value that was provided on create.
+func (u *ProxyUpsertOne) UpdateIsPublic() *ProxyUpsertOne {
+	return u.Update(func(s *ProxyUpsert) {
+		s.UpdateIsPublic()
+	})
+}
+
+// SetKind sets the "kind" field.
+func (u *ProxyUpsertOne) SetKind(v string) *ProxyUpsertOne {
+	return u.Update(func(s *ProxyUpsert) {
+		s.SetKind(v)
+	})
+}
+
+// UpdateKind sets the "kind" field to the value that was provided on create.
+func (u *ProxyUpsertOne) UpdateKind() *ProxyUpsertOne {
+	return u.Update(func(s *ProxyUpsert) {
+		s.UpdateKind()
 	})
 }
 
@@ -1003,6 +1212,20 @@ func (u *ProxyUpsertOne) AddExpiryWarnDays(v int) *ProxyUpsertOne {
 func (u *ProxyUpsertOne) UpdateExpiryWarnDays() *ProxyUpsertOne {
 	return u.Update(func(s *ProxyUpsert) {
 		s.UpdateExpiryWarnDays()
+	})
+}
+
+// SetExtra sets the "extra" field.
+func (u *ProxyUpsertOne) SetExtra(v map[string]interface{}) *ProxyUpsertOne {
+	return u.Update(func(s *ProxyUpsert) {
+		s.SetExtra(v)
+	})
+}
+
+// UpdateExtra sets the "extra" field to the value that was provided on create.
+func (u *ProxyUpsertOne) UpdateExtra() *ProxyUpsertOne {
+	return u.Update(func(s *ProxyUpsert) {
+		s.UpdateExtra()
 	})
 }
 
@@ -1266,6 +1489,62 @@ func (u *ProxyUpsertBulk) UpdateName() *ProxyUpsertBulk {
 	})
 }
 
+// SetOwnerUserID sets the "owner_user_id" field.
+func (u *ProxyUpsertBulk) SetOwnerUserID(v int64) *ProxyUpsertBulk {
+	return u.Update(func(s *ProxyUpsert) {
+		s.SetOwnerUserID(v)
+	})
+}
+
+// AddOwnerUserID adds v to the "owner_user_id" field.
+func (u *ProxyUpsertBulk) AddOwnerUserID(v int64) *ProxyUpsertBulk {
+	return u.Update(func(s *ProxyUpsert) {
+		s.AddOwnerUserID(v)
+	})
+}
+
+// UpdateOwnerUserID sets the "owner_user_id" field to the value that was provided on create.
+func (u *ProxyUpsertBulk) UpdateOwnerUserID() *ProxyUpsertBulk {
+	return u.Update(func(s *ProxyUpsert) {
+		s.UpdateOwnerUserID()
+	})
+}
+
+// ClearOwnerUserID clears the value of the "owner_user_id" field.
+func (u *ProxyUpsertBulk) ClearOwnerUserID() *ProxyUpsertBulk {
+	return u.Update(func(s *ProxyUpsert) {
+		s.ClearOwnerUserID()
+	})
+}
+
+// SetIsPublic sets the "is_public" field.
+func (u *ProxyUpsertBulk) SetIsPublic(v bool) *ProxyUpsertBulk {
+	return u.Update(func(s *ProxyUpsert) {
+		s.SetIsPublic(v)
+	})
+}
+
+// UpdateIsPublic sets the "is_public" field to the value that was provided on create.
+func (u *ProxyUpsertBulk) UpdateIsPublic() *ProxyUpsertBulk {
+	return u.Update(func(s *ProxyUpsert) {
+		s.UpdateIsPublic()
+	})
+}
+
+// SetKind sets the "kind" field.
+func (u *ProxyUpsertBulk) SetKind(v string) *ProxyUpsertBulk {
+	return u.Update(func(s *ProxyUpsert) {
+		s.SetKind(v)
+	})
+}
+
+// UpdateKind sets the "kind" field to the value that was provided on create.
+func (u *ProxyUpsertBulk) UpdateKind() *ProxyUpsertBulk {
+	return u.Update(func(s *ProxyUpsert) {
+		s.UpdateKind()
+	})
+}
+
 // SetProtocol sets the "protocol" field.
 func (u *ProxyUpsertBulk) SetProtocol(v string) *ProxyUpsertBulk {
 	return u.Update(func(s *ProxyUpsert) {
@@ -1445,6 +1724,20 @@ func (u *ProxyUpsertBulk) AddExpiryWarnDays(v int) *ProxyUpsertBulk {
 func (u *ProxyUpsertBulk) UpdateExpiryWarnDays() *ProxyUpsertBulk {
 	return u.Update(func(s *ProxyUpsert) {
 		s.UpdateExpiryWarnDays()
+	})
+}
+
+// SetExtra sets the "extra" field.
+func (u *ProxyUpsertBulk) SetExtra(v map[string]interface{}) *ProxyUpsertBulk {
+	return u.Update(func(s *ProxyUpsert) {
+		s.SetExtra(v)
+	})
+}
+
+// UpdateExtra sets the "extra" field to the value that was provided on create.
+func (u *ProxyUpsertBulk) UpdateExtra() *ProxyUpsertBulk {
+	return u.Update(func(s *ProxyUpsert) {
+		s.UpdateExtra()
 	})
 }
 

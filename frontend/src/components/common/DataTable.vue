@@ -90,15 +90,15 @@
     </template>
   </div>
 
-  <div
-    v-else
-    ref="tableWrapperRef"
-    class="table-wrapper"
-    :class="{
-      'actions-expanded': actionsExpanded,
-      'is-scrollable': isScrollable
-    }"
-  >
+  <div v-else class="data-table-shell">
+    <div
+      ref="tableWrapperRef"
+      class="table-wrapper"
+      :class="{
+        'actions-expanded': actionsExpanded,
+        'is-scrollable': isScrollable
+      }"
+    >
     <table class="w-full min-w-max divide-y divide-gray-200 dark:divide-dark-700">
       <thead class="table-header bg-gray-50 dark:bg-dark-800">
         <tr>
@@ -259,6 +259,35 @@
         </template>
       </tbody>
     </table>
+    </div>
+
+    <div
+      v-if="showHorizontalScrollbarFallback"
+      ref="scrollbarTrackRef"
+      class="table-horizontal-scrollbar"
+      role="scrollbar"
+      aria-label="Table horizontal scroll"
+      aria-orientation="horizontal"
+      aria-valuemin="0"
+      :aria-valuemax="Math.round(maxScrollLeft)"
+      :aria-valuenow="Math.round(horizontalScrollLeft)"
+      tabindex="0"
+      data-test="table-horizontal-scrollbar"
+      @pointerdown="handleScrollbarTrackPointerDown"
+      @keydown="handleScrollbarKeydown"
+    >
+      <div
+        ref="scrollbarThumbRef"
+        class="table-horizontal-scrollbar-thumb"
+        :class="{ 'is-dragging': isScrollbarDragging }"
+        :style="{
+          width: `${scrollbarThumbWidth}px`,
+          transform: `translateX(${scrollbarThumbOffset}px)`
+        }"
+        data-test="table-horizontal-scrollbar-thumb"
+        @pointerdown.stop="handleScrollbarThumbPointerDown"
+      ></div>
+    </div>
   </div>
 </template>
 
@@ -285,8 +314,42 @@ const emit = defineEmits<{
 
 // 表格容器引用
 const tableWrapperRef = ref<HTMLElement | null>(null)
+const scrollbarTrackRef = ref<HTMLElement | null>(null)
+const scrollbarThumbRef = ref<HTMLElement | null>(null)
 const isScrollable = ref(false)
 const actionsColumnNeedsExpanding = ref(false)
+const horizontalScrollLeft = ref(0)
+const horizontalClientWidth = ref(0)
+const horizontalScrollWidth = ref(0)
+const nativeHorizontalScrollbarHeight = ref(0)
+const scrollbarTrackWidth = ref(0)
+const isScrollbarDragging = ref(false)
+
+const scrollbarTrackPadding = 4
+const maxScrollLeft = computed(() =>
+  Math.max(0, horizontalScrollWidth.value - horizontalClientWidth.value)
+)
+const showHorizontalScrollbarFallback = computed(() =>
+  isScrollable.value && nativeHorizontalScrollbarHeight.value <= 1
+)
+const scrollbarRailWidth = computed(() =>
+  Math.max(0, scrollbarTrackWidth.value - scrollbarTrackPadding * 2)
+)
+const scrollbarThumbWidth = computed(() => {
+  if (!isScrollable.value || horizontalScrollWidth.value <= 0) return 0
+  return Math.min(
+    scrollbarRailWidth.value,
+    Math.max(
+      44,
+      scrollbarRailWidth.value * horizontalClientWidth.value / horizontalScrollWidth.value
+    )
+  )
+})
+const scrollbarThumbOffset = computed(() => {
+  const travel = Math.max(0, scrollbarRailWidth.value - scrollbarThumbWidth.value)
+  if (travel === 0 || maxScrollLeft.value === 0) return 0
+  return travel * horizontalScrollLeft.value / maxScrollLeft.value
+})
 
 // --- 虚拟滚动「整表空白」根治 ---
 // 根因:本组件根 .table-wrapper 为 flex:1 / min-h-0,高度由父级 flex 链决定。@tanstack 虚拟化器
@@ -311,9 +374,105 @@ const observeElementRectNonZero = (
 
 // 检查是否可滚动
 const checkScrollable = () => {
-  if (tableWrapperRef.value) {
-    isScrollable.value = tableWrapperRef.value.scrollWidth > tableWrapperRef.value.clientWidth
+  const element = tableWrapperRef.value
+  if (!element) return
+
+  horizontalClientWidth.value = element.clientWidth
+  horizontalScrollWidth.value = element.scrollWidth
+  horizontalScrollLeft.value = element.scrollLeft
+  nativeHorizontalScrollbarHeight.value = Math.max(0, element.offsetHeight - element.clientHeight)
+  scrollbarTrackWidth.value = scrollbarTrackRef.value?.clientWidth || element.offsetWidth || element.clientWidth
+  isScrollable.value = element.scrollWidth > element.clientWidth + 1
+
+  if (showHorizontalScrollbarFallback.value && !scrollbarTrackRef.value) {
+    void nextTick(() => {
+      scrollbarTrackWidth.value = scrollbarTrackRef.value?.clientWidth || element.offsetWidth || element.clientWidth
+    })
   }
+}
+
+const syncHorizontalScroll = () => {
+  if (!tableWrapperRef.value) return
+  horizontalScrollLeft.value = tableWrapperRef.value.scrollLeft
+}
+
+const setHorizontalScrollLeft = (value: number) => {
+  const element = tableWrapperRef.value
+  if (!element) return
+  element.scrollLeft = Math.max(0, Math.min(maxScrollLeft.value, value))
+  horizontalScrollLeft.value = element.scrollLeft
+}
+
+let scrollbarDragStartX = 0
+let scrollbarDragStartLeft = 0
+
+const finishScrollbarDrag = () => {
+  if (!isScrollbarDragging.value) return
+  isScrollbarDragging.value = false
+  window.removeEventListener('pointermove', handleScrollbarPointerMove)
+  window.removeEventListener('pointerup', finishScrollbarDrag)
+  window.removeEventListener('pointercancel', finishScrollbarDrag)
+}
+
+const handleScrollbarPointerMove = (event: PointerEvent) => {
+  if (!isScrollbarDragging.value) return
+  event.preventDefault()
+  const travel = Math.max(0, scrollbarRailWidth.value - scrollbarThumbWidth.value)
+  if (travel === 0 || maxScrollLeft.value === 0) return
+  const delta = event.clientX - scrollbarDragStartX
+  setHorizontalScrollLeft(scrollbarDragStartLeft + delta / travel * maxScrollLeft.value)
+}
+
+const handleScrollbarThumbPointerDown = (event: PointerEvent) => {
+  if (event.button !== 0) return
+  event.preventDefault()
+  scrollbarDragStartX = event.clientX
+  scrollbarDragStartLeft = horizontalScrollLeft.value
+  isScrollbarDragging.value = true
+  window.addEventListener('pointermove', handleScrollbarPointerMove)
+  window.addEventListener('pointerup', finishScrollbarDrag)
+  window.addEventListener('pointercancel', finishScrollbarDrag)
+}
+
+const handleScrollbarTrackPointerDown = (event: PointerEvent) => {
+  if (event.button !== 0 || event.target !== event.currentTarget) return
+  event.preventDefault()
+  const track = scrollbarTrackRef.value
+  if (!track) return
+  const rect = track.getBoundingClientRect()
+  const travel = Math.max(0, scrollbarRailWidth.value - scrollbarThumbWidth.value)
+  if (travel === 0 || maxScrollLeft.value === 0) return
+  const targetOffset = event.clientX - rect.left - scrollbarTrackPadding - scrollbarThumbWidth.value / 2
+  setHorizontalScrollLeft(targetOffset / travel * maxScrollLeft.value)
+}
+
+const handleScrollbarKeydown = (event: KeyboardEvent) => {
+  const pageStep = Math.max(80, horizontalClientWidth.value * 0.8)
+  let target: number | null = null
+  switch (event.key) {
+    case 'ArrowLeft':
+      target = horizontalScrollLeft.value - 80
+      break
+    case 'ArrowRight':
+      target = horizontalScrollLeft.value + 80
+      break
+    case 'PageUp':
+      target = horizontalScrollLeft.value - pageStep
+      break
+    case 'PageDown':
+      target = horizontalScrollLeft.value + pageStep
+      break
+    case 'Home':
+      target = 0
+      break
+    case 'End':
+      target = maxScrollLeft.value
+      break
+    default:
+      return
+  }
+  event.preventDefault()
+  setHorizontalScrollLeft(target)
 }
 
 // 检查操作列是否需要展开
@@ -372,8 +531,11 @@ let resizeObserver: ResizeObserver | null = null
 let resizeHandler: (() => void) | null = null
 let desktopViewportMediaQuery: MediaQueryList | null = null
 let desktopViewportListener: ((event: MediaQueryListEvent) => void) | null = null
+let trackedScrollElement: HTMLElement | null = null
 
 const detachDesktopTableTracking = () => {
+  trackedScrollElement?.removeEventListener('scroll', syncHorizontalScroll)
+  trackedScrollElement = null
   resizeObserver?.disconnect()
   resizeObserver = null
   if (resizeHandler) {
@@ -385,6 +547,8 @@ const detachDesktopTableTracking = () => {
 const attachDesktopTableTracking = () => {
   checkScrollable()
   checkActionsColumnWidth()
+  trackedScrollElement = tableWrapperRef.value
+  trackedScrollElement?.addEventListener('scroll', syncHorizontalScroll, { passive: true })
   if (tableWrapperRef.value && typeof ResizeObserver !== 'undefined') {
     resizeObserver = new ResizeObserver(() => {
       checkScrollable()
@@ -417,6 +581,7 @@ onMounted(() => {
 })
 
 onUnmounted(() => {
+  finishScrollbarDrag()
   detachDesktopTableTracking()
   if (desktopViewportMediaQuery && desktopViewportListener) {
     if (typeof desktopViewportMediaQuery.removeEventListener === 'function') {
@@ -951,15 +1116,71 @@ defineExpose({
 </script>
 
 <style scoped>
-/* 表格横向滚动 */
+.data-table-shell {
+  display: flex;
+  flex: 1;
+  min-width: 0;
+  min-height: 0;
+  flex-direction: column;
+}
+
 .table-wrapper {
-  --select-col-width: 52px; /* 勾选列宽度：px-6 (24px*2) + checkbox (16px) */
+  --select-col-width: 52px;
   position: relative;
   overflow-x: auto;
   overflow-y: auto;
   flex: 1;
   min-height: 0;
   isolation: isolate;
+}
+
+.table-horizontal-scrollbar {
+  position: relative;
+  height: 12px;
+  flex: 0 0 12px;
+  border-radius: 6px;
+  background-color: rgba(0, 0, 0, 0.03);
+  cursor: pointer;
+  outline: none;
+}
+
+.table-horizontal-scrollbar:focus-visible {
+  box-shadow: inset 0 0 0 2px rgba(14, 165, 233, 0.5);
+}
+
+.dark .table-horizontal-scrollbar {
+  background-color: rgba(255, 255, 255, 0.05);
+}
+
+.table-horizontal-scrollbar-thumb {
+  position: absolute;
+  top: 2px;
+  left: 4px;
+  height: 8px;
+  border-radius: 6px;
+  background-color: rgba(107, 114, 128, 0.75);
+  cursor: grab;
+  touch-action: none;
+  user-select: none;
+  will-change: transform;
+}
+
+.table-horizontal-scrollbar-thumb:hover,
+.table-horizontal-scrollbar-thumb.is-dragging {
+  background-color: rgba(75, 85, 99, 0.9);
+}
+
+.table-horizontal-scrollbar-thumb.is-dragging {
+  cursor: grabbing;
+}
+
+.dark .table-horizontal-scrollbar-thumb {
+  background-color: rgba(156, 163, 175, 0.75);
+}
+
+.dark .table-horizontal-scrollbar-thumb:hover,
+.dark .table-horizontal-scrollbar-thumb.is-dragging {
+  background-color: rgba(209, 213, 219, 0.9);
 }
 
 /* 表头容器，确保在滚动时覆盖表体内容 */

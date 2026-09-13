@@ -1492,6 +1492,29 @@ func HasAssignedSubscriptionsWith(preds ...predicate.UserSubscription) predicate
 	})
 }
 
+// HasRevokedSubscriptions applies the HasEdge predicate on the "revoked_subscriptions" edge.
+func HasRevokedSubscriptions() predicate.User {
+	return predicate.User(func(s *sql.Selector) {
+		step := sqlgraph.NewStep(
+			sqlgraph.From(Table, FieldID),
+			sqlgraph.Edge(sqlgraph.O2M, false, RevokedSubscriptionsTable, RevokedSubscriptionsColumn),
+		)
+		sqlgraph.HasNeighbors(s, step)
+	})
+}
+
+// HasRevokedSubscriptionsWith applies the HasEdge predicate on the "revoked_subscriptions" edge with a given conditions (other predicates).
+func HasRevokedSubscriptionsWith(preds ...predicate.UserSubscription) predicate.User {
+	return predicate.User(func(s *sql.Selector) {
+		step := newRevokedSubscriptionsStep()
+		sqlgraph.HasNeighborsWith(s, step, func(s *sql.Selector) {
+			for _, p := range preds {
+				p(s)
+			}
+		})
+	})
+}
+
 // HasAnnouncementReads applies the HasEdge predicate on the "announcement_reads" edge.
 func HasAnnouncementReads() predicate.User {
 	return predicate.User(func(s *sql.Selector) {
@@ -1599,6 +1622,29 @@ func HasPromoCodeUsages() predicate.User {
 func HasPromoCodeUsagesWith(preds ...predicate.PromoCodeUsage) predicate.User {
 	return predicate.User(func(s *sql.Selector) {
 		step := newPromoCodeUsagesStep()
+		sqlgraph.HasNeighborsWith(s, step, func(s *sql.Selector) {
+			for _, p := range preds {
+				p(s)
+			}
+		})
+	})
+}
+
+// HasRedeemCodeUsages applies the HasEdge predicate on the "redeem_code_usages" edge.
+func HasRedeemCodeUsages() predicate.User {
+	return predicate.User(func(s *sql.Selector) {
+		step := sqlgraph.NewStep(
+			sqlgraph.From(Table, FieldID),
+			sqlgraph.Edge(sqlgraph.O2M, false, RedeemCodeUsagesTable, RedeemCodeUsagesColumn),
+		)
+		sqlgraph.HasNeighbors(s, step)
+	})
+}
+
+// HasRedeemCodeUsagesWith applies the HasEdge predicate on the "redeem_code_usages" edge with a given conditions (other predicates).
+func HasRedeemCodeUsagesWith(preds ...predicate.RedeemCodeUsage) predicate.User {
+	return predicate.User(func(s *sql.Selector) {
+		step := newRedeemCodeUsagesStep()
 		sqlgraph.HasNeighborsWith(s, step, func(s *sql.Selector) {
 			for _, p := range preds {
 				p(s)

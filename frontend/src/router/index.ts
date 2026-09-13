@@ -302,6 +302,83 @@ const routes: RouteRecordRaw[] = [
     }
   },
   {
+    path: '/my/groups',
+    name: 'MyGroups',
+    component: () => import('@/views/user/MyResourcesView.vue'),
+    meta: {
+      requiresAuth: true,
+      requiresAdmin: false,
+      title: '我的分组',
+      resource: 'groups'
+    }
+  },
+  {
+    path: '/my/accounts',
+    name: 'MyAccounts',
+    component: () => import('@/views/user/UserAccountsView.vue'),
+    meta: {
+      requiresAuth: true,
+      requiresAdmin: false,
+      title: '我的账号',
+      resource: 'accounts'
+    }
+  },
+  {
+    path: '/my/proxies',
+    name: 'MyProxies',
+    component: () => import('@/views/user/MyResourcesView.vue'),
+    meta: {
+      requiresAuth: true,
+      requiresAdmin: false,
+      title: '我的代理',
+      resource: 'proxies'
+    }
+  },
+  {
+    path: '/my/assigned-subscriptions',
+    name: 'MyAssignedSubscriptions',
+    component: () => import('@/views/user/MyResourcesView.vue'),
+    meta: {
+      requiresAuth: true,
+      requiresAdmin: false,
+      title: '分配订阅',
+      resource: 'assigned-subscriptions'
+    }
+  },
+  {
+    path: '/my/redeem-codes',
+    name: 'MyRedeemCodes',
+    component: () => import('@/views/user/MyResourcesView.vue'),
+    meta: {
+      requiresAuth: true,
+      requiresAdmin: false,
+      title: '我的兑换码',
+      resource: 'redeem-codes'
+    }
+  },
+  {
+    path: '/my/usage/account-logs',
+    name: 'MyAccountUsageLogs',
+    component: () => import('@/views/user/MyResourcesView.vue'),
+    meta: {
+      requiresAuth: true,
+      requiresAdmin: false,
+      title: '我的账号使用记录',
+      resource: 'account-logs'
+    }
+  },
+  {
+    path: '/my/usage/upstream-errors',
+    name: 'MyUpstreamErrors',
+    component: () => import('@/views/user/MyResourcesView.vue'),
+    meta: {
+      requiresAuth: true,
+      requiresAdmin: false,
+      title: '我的上游错误',
+      resource: 'upstream-errors'
+    }
+  },
+  {
     path: '/purchase',
     name: 'PurchaseSubscription',
     component: () => import('@/views/user/PaymentView.vue'),

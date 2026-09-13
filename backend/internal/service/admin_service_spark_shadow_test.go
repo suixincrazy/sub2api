@@ -102,6 +102,19 @@ func (s *sparkShadowRepoStub) Update(_ context.Context, account *Account) error 
 	return nil
 }
 
+func (s *sparkShadowRepoStub) UpdateAccountWithGroupsAtomically(_ context.Context, account *Account, groupIDs []int64, _ *bool) error {
+	if _, ok := s.accounts[account.ID]; !ok {
+		return ErrAccountNotFound
+	}
+	cp := *account
+	cp.GroupIDs = append([]int64(nil), groupIDs...)
+	cp.AccountGroups = accountGroupsFromIDs(groupIDs)
+	s.accounts[account.ID] = &cp
+	s.mockAccountRepoForGemini.accountsByID[account.ID] = &cp
+	s.groupsOf[account.ID] = append([]int64(nil), groupIDs...)
+	return nil
+}
+
 func (s *sparkShadowRepoStub) Delete(_ context.Context, id int64) error {
 	delete(s.accounts, id)
 	delete(s.mockAccountRepoForGemini.accountsByID, id)
@@ -616,7 +629,10 @@ func TestDeleteAccount_CascadeToShadow(t *testing.T) {
 func TestUpdateAccount_PropagatesProxyToShadow(t *testing.T) {
 	ctx := context.Background()
 	repo := newSparkShadowRepoStub()
-	svc := &adminServiceImpl{accountRepo: repo}
+	svc := &adminServiceImpl{
+		accountRepo: repo,
+		proxyRepo:   proxyRepoReturning(&Proxy{}),
+	}
 
 	oldProxy := int64(7)
 	parent := &Account{
@@ -694,7 +710,10 @@ func TestUpdateAccount_RejectsCredentialWriteToShadow(t *testing.T) {
 func TestBulkUpdateAccounts_PropagatesProxyToShadow(t *testing.T) {
 	ctx := context.Background()
 	repo := newSparkShadowRepoStub()
-	svc := &adminServiceImpl{accountRepo: repo}
+	svc := &adminServiceImpl{
+		accountRepo: repo,
+		proxyRepo:   proxyRepoReturning(&Proxy{}),
+	}
 
 	oldProxy := int64(7)
 	parent := &Account{
@@ -760,6 +779,13 @@ func (s *bindFailRepoStub) BindGroups(_ context.Context, _ int64, _ []int64) err
 type sparkShadowValidatingGroupRepoStub struct {
 	groupRepoStub
 	existing map[int64]bool
+}
+
+func (s *sparkShadowValidatingGroupRepoStub) GetByID(_ context.Context, id int64) (*Group, error) {
+	if !s.existing[id] {
+		return nil, ErrGroupNotFound
+	}
+	return &Group{ID: id}, nil
 }
 
 func (s *sparkShadowValidatingGroupRepoStub) ExistsByIDs(_ context.Context, ids []int64) (map[int64]bool, error) {

@@ -53,6 +53,30 @@ var socks5ForwardDialer = &net.Dialer{
 // 返回：
 //   - error: 代理配置错误（协议不支持或 dialer 创建失败）
 func ConfigureTransportProxy(transport *http.Transport, proxyURL *url.URL) error {
+	return ConfigureTransportProxyWithDialer(transport, proxyURL, nil)
+}
+
+type contextForwardDialer struct {
+	dialContext func(context.Context, string, string) (net.Conn, error)
+}
+
+func (d contextForwardDialer) Dial(network, address string) (net.Conn, error) {
+	return d.dialContext(context.Background(), network, address)
+}
+
+func (d contextForwardDialer) DialContext(ctx context.Context, network, address string) (net.Conn, error) {
+	return d.dialContext(ctx, network, address)
+}
+
+// ConfigureTransportProxyWithDialer configures a proxy while preserving a
+// caller-supplied socket policy for direct and proxy endpoint connections.
+func ConfigureTransportProxyWithDialer(transport *http.Transport, proxyURL *url.URL, baseDialContext func(context.Context, string, string) (net.Conn, error)) error {
+	if transport == nil {
+		return fmt.Errorf("transport is required")
+	}
+	if baseDialContext != nil {
+		transport.DialContext = baseDialContext
+	}
 	if proxyURL == nil {
 		return nil
 	}
@@ -64,7 +88,11 @@ func ConfigureTransportProxy(transport *http.Transport, proxyURL *url.URL) error
 		return nil
 
 	case "socks5", "socks5h":
-		dialer, err := proxy.FromURL(proxyURL, socks5ForwardDialer)
+		forward := proxy.Dialer(socks5ForwardDialer)
+		if baseDialContext != nil {
+			forward = contextForwardDialer{dialContext: baseDialContext}
+		}
+		dialer, err := proxy.FromURL(proxyURL, forward)
 		if err != nil {
 			return fmt.Errorf("create socks5 dialer: %w", err)
 		}

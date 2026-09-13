@@ -3,6 +3,7 @@
   "private": true,
   "version": "1.0.0",
   "type": "module",
+  "packageManager": "pnpm@9.15.9",
   "scripts": {
     "dev": "vite",
     "check:i18n": "vitest run src/i18n/__tests__/localeKeyCompleteness.spec.ts",
@@ -52,7 +53,7 @@
     "eslint": "^8.57.0",
     "eslint-plugin-vue": "^9.25.0",
     "jsdom": "^24.1.3",
-    "postcss": "^8.4.32",
+    "postcss": "^8.5.10",
     "tailwindcss": "^3.4.0",
     "typescript": "~5.6.0",
     "vite": "^5.0.10",

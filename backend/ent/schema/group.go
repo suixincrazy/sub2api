@@ -40,6 +40,10 @@ func (Group) Fields() []ent.Field {
 		field.String("name").
 			MaxLen(100).
 			NotEmpty(),
+		field.Int64("owner_user_id").
+			Optional().
+			Nillable().
+			Comment("NULL means system/admin resource; non-NULL means user-owned private resource."),
 		field.String("description").
 			Optional().
 			Nillable().
@@ -327,6 +331,8 @@ func (Group) Indexes() []ent.Index {
 	return []ent.Index{
 		// name 字段已在 Fields() 中声明 Unique()，无需重复索引
 		index.Fields("status"),
+		index.Fields("owner_user_id"),
+		index.Fields("owner_user_id", "deleted_at"),
 		index.Fields("platform"),
 		index.Fields("subscription_type"),
 		index.Fields("is_exclusive"),

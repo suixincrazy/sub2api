@@ -84,7 +84,7 @@
           >
             <div class="min-w-0 flex-1">
               <div class="flex items-center gap-2">
-                <span class="truncate font-medium">{{ proxy.name }}</span>
+                <span class="truncate font-medium">{{ proxyDisplayName(proxy) }}</span>
                 <!-- Account count badge -->
                 <span
                   v-if="proxy.account_count !== undefined"
@@ -114,7 +114,7 @@
                 </template>
               </div>
               <div class="truncate text-xs text-gray-500 dark:text-gray-400">
-                {{ proxy.protocol }}://{{ proxy.host }}:{{ proxy.port }}
+                {{ proxyEndpointLabel(proxy) }}
               </div>
             </div>
 
@@ -190,6 +190,7 @@ interface Props {
   modelValue: number | null
   proxies: Proxy[]
   disabled?: boolean
+  testProxy?: (id: number) => Promise<ProxyTestResult>
 }
 
 const props = withDefaults(defineProps<Props>(), {
@@ -209,6 +210,13 @@ const searchInputRef = ref<HTMLInputElement | null>(null)
 const testResults = reactive<Record<number, ProxyTestResult>>({})
 const testingProxyIds = reactive(new Set<number>())
 const batchTesting = ref(false)
+const BATCH_TEST_CONCURRENCY = 4
+
+const normalizedText = (value: unknown): string => String(value ?? '').trim()
+
+const proxyDisplayName = (proxy: Proxy): string => {
+  return normalizedText(proxy.name) || `#${proxy.id}`
+}
 
 const selectedProxy = computed(() => {
   if (props.modelValue === null) return null
@@ -220,8 +228,22 @@ const selectedLabel = computed(() => {
     return t('admin.accounts.noProxy')
   }
   const proxy = selectedProxy.value
-  return `${proxy.name} (${proxy.protocol}://${proxy.host}:${proxy.port})`
+  return `${proxyDisplayName(proxy)} (${proxyEndpointLabel(proxy)})`
 })
+
+const proxyEndpointLabel = (proxy: Proxy): string => {
+  const protocol = normalizedText(proxy.protocol)
+  const host = normalizedText(proxy.host)
+  const port = normalizedText(proxy.port)
+
+  if (proxy.details_hidden || (proxy.is_public === true && (!host || !port))) {
+    return t('myResources.states.publicDetailsHidden')
+  }
+  if (!protocol || !host || !port || port === '0') {
+    return t('common.notAvailable')
+  }
+  return `${protocol}://${host}:${port}`
+}
 
 const filteredProxies = computed(() => {
   if (!searchQuery.value) {
@@ -229,9 +251,15 @@ const filteredProxies = computed(() => {
   }
   const query = searchQuery.value.toLowerCase()
   return props.proxies.filter((proxy) => {
-    const name = proxy.name.toLowerCase()
-    const host = proxy.host.toLowerCase()
-    return name.includes(query) || host.includes(query)
+    const searchableValues = [
+      proxy.name,
+      proxy.protocol,
+      proxy.host,
+      proxy.port,
+      proxy.username,
+      proxyEndpointLabel(proxy)
+    ]
+    return searchableValues.some(value => normalizedText(value).toLowerCase().includes(query))
   })
 })
 
@@ -256,7 +284,9 @@ const handleTestProxy = async (proxy: Proxy) => {
 
   testingProxyIds.add(proxy.id)
   try {
-    const result = await adminAPI.proxies.testProxy(proxy.id)
+    const result = props.testProxy
+      ? await props.testProxy(proxy.id)
+      : await adminAPI.proxies.testProxy(proxy.id)
     testResults[proxy.id] = result
   } catch (error: any) {
     testResults[proxy.id] = {
@@ -273,24 +303,22 @@ const handleBatchTest = async () => {
 
   batchTesting.value = true
 
-  // Test all proxies in parallel
-  const testPromises = props.proxies.map(async (proxy) => {
-    testingProxyIds.add(proxy.id)
-    try {
-      const result = await adminAPI.proxies.testProxy(proxy.id)
-      testResults[proxy.id] = result
-    } catch (error: any) {
-      testResults[proxy.id] = {
-        success: false,
-        message: error.response?.data?.detail || 'Test failed'
+  try {
+    const queue = [...props.proxies]
+    let nextIndex = 0
+    const worker = async () => {
+      while (nextIndex < queue.length) {
+        const proxy = queue[nextIndex]
+        nextIndex += 1
+        await handleTestProxy(proxy)
       }
-    } finally {
-      testingProxyIds.delete(proxy.id)
     }
-  })
 
-  await Promise.all(testPromises)
-  batchTesting.value = false
+    const workerCount = Math.min(BATCH_TEST_CONCURRENCY, queue.length)
+    await Promise.all(Array.from({ length: workerCount }, () => worker()))
+  } finally {
+    batchTesting.value = false
+  }
 }
 
 const handleClickOutside = (event: MouseEvent) => {

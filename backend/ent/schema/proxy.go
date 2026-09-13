@@ -4,6 +4,7 @@ import (
 	"github.com/Wei-Shaw/sub2api/ent/schema/mixins"
 
 	"entgo.io/ent"
+	"entgo.io/ent/dialect"
 	"entgo.io/ent/dialect/entsql"
 	"entgo.io/ent/schema"
 	"entgo.io/ent/schema/edge"
@@ -34,6 +35,17 @@ func (Proxy) Fields() []ent.Field {
 		field.String("name").
 			MaxLen(100).
 			NotEmpty(),
+		field.Int64("owner_user_id").
+			Optional().
+			Nillable().
+			Comment("NULL means system/admin resource; non-NULL means user-owned private resource."),
+		field.Bool("is_public").
+			Default(false).
+			Comment("A proxy exposed as a selectable read-only proxy to other users."),
+		field.String("kind").
+			MaxLen(20).
+			Default("standard").
+			Comment("standard | xray"),
 		field.String("protocol").
 			MaxLen(20).
 			NotEmpty(),
@@ -64,6 +76,10 @@ func (Proxy) Fields() []ent.Field {
 		field.Int("expiry_warn_days").
 			Default(7).
 			Comment("Days before expiry to flag as expiring-soon (per proxy)."),
+		field.JSON("extra", map[string]any{}).
+			Default(func() map[string]any { return map[string]any{} }).
+			SchemaType(map[string]string{dialect.Postgres: "jsonb"}).
+			Comment("Provider-specific proxy metadata such as xray node config or quality check details."),
 	}
 }
 
@@ -86,6 +102,10 @@ func (Proxy) Edges() []ent.Edge {
 func (Proxy) Indexes() []ent.Index {
 	return []ent.Index{
 		index.Fields("status"),
+		index.Fields("owner_user_id"),
+		index.Fields("owner_user_id", "deleted_at"),
+		index.Fields("is_public"),
+		index.Fields("kind"),
 		index.Fields("deleted_at"),
 		index.Fields("expires_at"),
 		index.Fields("backup_proxy_id"),

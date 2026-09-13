@@ -384,6 +384,72 @@ func TestAPIKeyAuthRejectsExclusiveGroupWhenUserNoLongerAllowed(t *testing.T) {
 	require.Contains(t, w.Body.String(), "GROUP_NOT_ALLOWED")
 }
 
+func TestAPIKeyAuthRejectsForeignUserOwnedStandardGroup(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	ownerID := int64(99)
+	group := &service.Group{
+		ID:          203,
+		Name:        "foreign-private-standard",
+		Status:      service.StatusActive,
+		OwnerUserID: &ownerID,
+		Hydrated:    true,
+	}
+	user := &service.User{
+		ID:          7,
+		Role:        service.RoleUser,
+		Status:      service.StatusActive,
+		Balance:     10,
+		Concurrency: 3,
+	}
+	apiKey := &service.APIKey{
+		ID:     100,
+		UserID: user.ID,
+		Key:    "foreign-private-group-key",
+		Status: service.StatusActive,
+		User:   user,
+		Group:  group,
+	}
+	apiKey.GroupID = &group.ID
+
+	apiKeyRepo := &stubApiKeyRepo{
+		getByKey: func(ctx context.Context, key string) (*service.APIKey, error) {
+			if key != apiKey.Key {
+				return nil, service.ErrAPIKeyNotFound
+			}
+			clone := *apiKey
+			return &clone, nil
+		},
+	}
+
+	cfg := &config.Config{RunMode: config.RunModeSimple}
+	apiKeyService := service.NewAPIKeyService(apiKeyRepo, nil, nil, nil, nil, nil, cfg)
+	router := newAuthTestRouter(apiKeyService, nil, cfg)
+
+	w := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/t", nil)
+	req.Header.Set("x-api-key", apiKey.Key)
+	router.ServeHTTP(w, req)
+
+	require.Equal(t, http.StatusForbidden, w.Code)
+	require.Contains(t, w.Body.String(), "GROUP_NOT_ALLOWED")
+}
+
+func TestAPIKeyAuthAllowsOwnerUserOwnedStandardGroup(t *testing.T) {
+	ownerID := int64(7)
+	groupID := int64(203)
+	apiKey := &service.APIKey{
+		GroupID: &groupID,
+		User:    &service.User{ID: ownerID},
+		Group: &service.Group{
+			ID:          203,
+			OwnerUserID: &ownerID,
+		},
+	}
+
+	require.True(t, validateAPIKeyGroupAllowed(apiKey))
+}
+
 func TestAPIKeyAuthOverwritesInvalidContextGroup(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 

@@ -1258,6 +1258,7 @@ func firstQuery(q url.Values, keys ...string) string {
 	return ""
 }
 
+<<<<<<< HEAD
 func intQuery(q url.Values, keys ...string) int {
 	raw := firstQuery(q, keys...)
 	if raw == "" {
@@ -1267,6 +1268,8 @@ func intQuery(q url.Values, keys ...string) int {
 	return value
 }
 
+=======
+>>>>>>> xray/main
 func copyValue(q url.Values, key, value string) {
 	value = strings.TrimSpace(value)
 	if value != "" {

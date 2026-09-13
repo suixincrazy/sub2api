@@ -132,7 +132,9 @@ func (s *OpenAIGatewayService) forwardGrokResponses(
 			_ = resp.Body.Close()
 		}
 		invalidEncryptedContent := isGrokInvalidEncryptedContentResponse(resp.StatusCode, respBody)
-		if !invalidEncryptedContent && !isGrokCompactionReplayDecodeError(resp.StatusCode, respBody) {
+		compactionReplayDecodeError := isGrokCompactionReplayDecodeError(resp.StatusCode, respBody)
+		opaqueEncryptedContent := isGrokOpaqueBadRequest(resp.StatusCode, respBody) && requestHasGrokEncryptedReasoning(patchedBody)
+		if !invalidEncryptedContent && !compactionReplayDecodeError && !opaqueEncryptedContent {
 			resp.Body = io.NopCloser(bytes.NewReader(respBody))
 			break
 		}
@@ -140,7 +142,7 @@ func (s *OpenAIGatewayService) forwardGrokResponses(
 		var retryBody []byte
 		var changed bool
 		var trimErr error
-		if invalidEncryptedContent {
+		if invalidEncryptedContent || opaqueEncryptedContent {
 			retryBody, changed, trimErr = trimGrokInvalidEncryptedContentRetryBody(patchedBody)
 		} else {
 			retryBody, changed, trimErr = sanitizeGrokCompactionReplayBody(patchedBody)
@@ -394,6 +396,23 @@ func dropEmptyGrokReplayReasoning(requestBody map[string]any) bool {
 		requestBody["input"] = filtered
 	}
 	return changed
+}
+
+func isGrokOpaqueBadRequest(statusCode int, body []byte) bool {
+	if statusCode != http.StatusBadRequest {
+		return false
+	}
+	trimmed := bytes.TrimSpace(body)
+	if len(trimmed) == 0 {
+		return true
+	}
+	if !json.Valid(trimmed) {
+		message := strings.ToLower(strings.TrimSpace(string(trimmed)))
+		return message == "bad request" || message == "400 bad request"
+	}
+	return !gjson.GetBytes(trimmed, "code").Exists() &&
+		!gjson.GetBytes(trimmed, "error").Exists() &&
+		!gjson.GetBytes(trimmed, "message").Exists()
 }
 
 // requestHasGrokEncryptedReasoning reports whether the outbound Responses body

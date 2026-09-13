@@ -52,6 +52,7 @@ func TestBothProxyUpdateServicesUseRepositoryUpdateBoundary(t *testing.T) {
 			proxyRepoStub: &proxyRepoStub{},
 			proxy: &Proxy{
 				ID:             9,
+				Kind:           "standard",
 				Protocol:       "http",
 				Host:           "old.example",
 				Port:           8080,

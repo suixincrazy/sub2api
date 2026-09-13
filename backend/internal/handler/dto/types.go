@@ -92,6 +92,7 @@ type APIKey struct {
 
 type Group struct {
 	ID             int64   `json:"id"`
+	OwnerUserID    *int64  `json:"owner_user_id,omitempty"`
 	Name           string  `json:"name"`
 	Description    string  `json:"description"`
 	Platform       string  `json:"platform"`
@@ -205,11 +206,12 @@ type AdminGroup struct {
 }
 
 type Account struct {
-	ID       int64   `json:"id"`
-	Name     string  `json:"name"`
-	Notes    *string `json:"notes"`
-	Platform string  `json:"platform"`
-	Type     string  `json:"type"`
+	ID          int64   `json:"id"`
+	OwnerUserID *int64  `json:"owner_user_id,omitempty"`
+	Name        string  `json:"name"`
+	Notes       *string `json:"notes"`
+	Platform    string  `json:"platform"`
+	Type        string  `json:"type"`
 	// Credentials 经 RedactCredentials 处理后只含非敏感子键；敏感 token / api_key / 私钥
 	// 的存在性通过 CredentialsStatus（has_<key>）暴露，原始值不返回前端。
 	Credentials             map[string]any                 `json:"credentials"`
@@ -433,6 +435,8 @@ type AccountGroup struct {
 type Proxy struct {
 	ID        int64     `json:"id"`
 	Name      string    `json:"name"`
+	Kind      string    `json:"kind"`
+	IsPublic  bool      `json:"is_public"`
 	Protocol  string    `json:"protocol"`
 	Host      string    `json:"host"`
 	Port      int       `json:"port"`
@@ -470,7 +474,9 @@ type ProxyWithAccountCount struct {
 // 注意：普通接口不得使用此 DTO。
 type AdminProxy struct {
 	Proxy
-	Password string `json:"password,omitempty"`
+	OwnerUserID *int64         `json:"owner_user_id,omitempty"`
+	Password    string         `json:"password,omitempty"`
+	Extra       map[string]any `json:"extra,omitempty"`
 }
 
 // AdminProxyWithAccountCount 是管理员接口使用的带账号统计的 proxy DTO。
@@ -513,6 +519,8 @@ type RedeemCode struct {
 
 	GroupID      *int64 `json:"group_id"`
 	ValidityDays int    `json:"validity_days"`
+	MaxUses      int    `json:"max_uses"`
+	UsedCount    int    `json:"used_count"`
 
 	// Notes is only populated for admin_balance/admin_concurrency types
 	// so users can see why they were charged or credited
@@ -527,7 +535,16 @@ type RedeemCode struct {
 type AdminRedeemCode struct {
 	RedeemCode
 
-	Notes string `json:"notes"`
+	OwnerUserID *int64 `json:"owner_user_id,omitempty"`
+	Notes       string `json:"notes"`
+}
+
+type RedeemCodeUsage struct {
+	ID           int64     `json:"id"`
+	RedeemCodeID int64     `json:"redeem_code_id"`
+	UserID       int64     `json:"user_id"`
+	UsedAt       time.Time `json:"used_at"`
+	User         *User     `json:"user,omitempty"`
 }
 
 type NullableTimeField struct {
@@ -761,6 +778,8 @@ type UserSubscription struct {
 	DailyUsageUSD   float64 `json:"daily_usage_usd"`
 	WeeklyUsageUSD  float64 `json:"weekly_usage_usd"`
 	MonthlyUsageUSD float64 `json:"monthly_usage_usd"`
+	ManagedByUserID *int64  `json:"managed_by_user_id,omitempty"`
+	SourceType      string  `json:"source_type,omitempty"`
 
 	CreatedAt time.Time  `json:"created_at"`
 	UpdatedAt time.Time  `json:"updated_at"`

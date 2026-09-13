@@ -133,9 +133,110 @@ func RegisterUserRoutes(
 			subscriptions.GET("/active", h.Subscription.GetActive)
 			subscriptions.GET("/progress", h.Subscription.GetProgress)
 			subscriptions.GET("/summary", h.Subscription.GetSummary)
+			subscriptions.POST("/:id/unsubscribe", h.Subscription.Unsubscribe)
 		}
 
 		// 渠道监控（用户只读）
+		my := authenticated.Group("/my")
+		{
+			my.GET("/feature-status", h.MyResources.FeatureStatus)
+
+			groups := my.Group("/groups")
+			{
+				groups.GET("", h.MyResources.ListGroups)
+				groups.POST("", h.MyResources.CreateGroup)
+				groups.GET("/live-capability", h.MyResources.GetGroupLiveCapability)
+				groups.GET("/usage-summary", h.MyResources.GetGroupUsageSummary)
+				groups.GET("/capacity-summary", h.MyResources.GetGroupCapacitySummary)
+				groups.GET("/:id", h.MyResources.GetGroup)
+				groups.PUT("/:id", h.MyResources.UpdateGroup)
+				groups.DELETE("/:id", h.MyResources.DeleteGroup)
+				groups.GET("/:id/pool-health", h.MyResources.GetGroupPoolHealth)
+				groups.GET("/:id/models-list-candidates", h.MyResources.GetGroupModelsListCandidates)
+				groups.GET("/:id/user-overrides", h.MyResources.GetGroupUserOverrides)
+				groups.PUT("/:id/rate-multipliers", h.MyResources.SetGroupRateMultipliers)
+				groups.DELETE("/:id/rate-multipliers", h.MyResources.ClearGroupRateMultipliers)
+				groups.PUT("/:id/rpm-overrides", h.MyResources.SetGroupRPMOverrides)
+				groups.DELETE("/:id/rpm-overrides", h.MyResources.ClearGroupRPMOverrides)
+			}
+
+			accounts := my.Group("/accounts")
+			{
+				accounts.GET("", h.MyResources.ListAccounts)
+				accounts.POST("", h.MyResources.CreateAccount)
+				registerMyAccountModelCapabilityRoutes(accounts, h.MyResources)
+				accounts.GET("/export", h.MyResources.ExportAccounts)
+				accounts.POST("/import", h.MyResources.ImportAccounts)
+				accounts.POST("/import/codex-session", h.MyResources.ImportCodexSessions)
+				accounts.POST("/import/codex-pat", h.MyResources.ImportCodexPAT)
+				accounts.POST("/batch-update", h.MyResources.BatchUpdateAccounts)
+				accounts.POST("/oauth/auth-url", h.MyResources.GenerateAccountOAuthURL)
+				accounts.POST("/oauth/exchange", h.MyResources.ExchangeAccountOAuthCode)
+				accounts.POST("/oauth/cookie", h.MyResources.ExchangeAccountOAuthCookie)
+				accounts.GET("/:id/models", h.MyResources.GetAccountTestModels)
+				accounts.POST("/:id/test/stream", h.MyResources.StreamAccountTest)
+				accounts.GET("/:id", h.MyResources.GetAccount)
+				accounts.PUT("/:id", h.MyResources.UpdateAccount)
+				accounts.DELETE("/:id", h.MyResources.DeleteAccount)
+				accounts.POST("/:id/test", h.MyResources.TestAccount)
+				accounts.POST("/:id/refresh", h.MyResources.RefreshAccount)
+				accounts.POST("/:id/clear-error", h.MyResources.ClearAccountError)
+				accounts.POST("/:id/schedulable", h.MyResources.SetAccountSchedulable)
+			}
+
+			proxies := my.Group("/proxies")
+			{
+				proxies.GET("", h.MyResources.ListProxies)
+				proxies.POST("", h.MyResources.CreateProxy)
+				proxies.GET("/export", h.MyResources.ExportProxies)
+				proxies.POST("/import", h.MyResources.ImportProxyNodes)
+				proxies.GET("/sources", h.MyResources.ListProxySources)
+				proxies.POST("/sources", h.MyResources.CreateProxySource)
+				proxies.POST("/sources/sync-all", h.MyResources.SyncAllProxySources)
+				proxies.PUT("/sources/:id", h.MyResources.UpdateProxySource)
+				proxies.DELETE("/sources/:id", h.MyResources.DeleteProxySource)
+				proxies.POST("/sources/:id/sync", h.MyResources.SyncProxySource)
+				proxies.GET("/:id", h.MyResources.GetProxy)
+				proxies.PUT("/:id", h.MyResources.UpdateProxy)
+				proxies.DELETE("/:id", h.MyResources.DeleteProxy)
+				proxies.POST("/:id/test", h.MyResources.TestProxy)
+				proxies.POST("/:id/quality-check", h.MyResources.QualityCheckProxy)
+			}
+
+			assigned := my.Group("/assigned-subscriptions")
+			{
+				assigned.GET("", h.MyResources.ListAssignedSubscriptions)
+				assigned.POST("", h.MyResources.AssignSubscription)
+				assigned.POST("/bulk", h.MyResources.BulkAssignSubscription)
+				assigned.POST("/:id/extend", h.MyResources.ExtendAssignedSubscription)
+				assigned.POST("/:id/revoke", h.MyResources.RevokeAssignedSubscription)
+				assigned.POST("/:id/restore", h.MyResources.RestoreAssignedSubscription)
+				assigned.POST("/:id/reset-usage", h.MyResources.ResetAssignedSubscriptionUsage)
+			}
+
+			redeemCodes := my.Group("/redeem-codes")
+			{
+				redeemCodes.GET("", h.MyResources.ListRedeemCodes)
+				redeemCodes.POST("", h.MyResources.GenerateRedeemCodes)
+				redeemCodes.GET("/stats", h.MyResources.RedeemCodeStats)
+				redeemCodes.GET("/export", h.MyResources.ExportRedeemCodes)
+				redeemCodes.POST("/batch-update", h.MyResources.BatchUpdateRedeemCodes)
+				redeemCodes.DELETE("", h.MyResources.BatchDeleteRedeemCodes)
+				redeemCodes.POST("/batch-expire", h.MyResources.BatchExpireRedeemCodes)
+				redeemCodes.GET("/:id/usages", h.MyResources.ListRedeemCodeUsages)
+				redeemCodes.DELETE("/:id", h.MyResources.DeleteRedeemCode)
+				redeemCodes.POST("/:id/expire", h.MyResources.ExpireRedeemCode)
+			}
+
+			usage := my.Group("/usage")
+			{
+				usage.GET("/account-logs", h.MyResources.ListAccountUsageLogs)
+				usage.GET("/account-logs/stats", h.MyResources.GetAccountUsageStats)
+				usage.GET("/account-logs/export", h.MyResources.ExportAccountUsageLogs)
+				usage.GET("/upstream-errors", h.MyResources.ListUpstreamErrors)
+			}
+		}
+
 		monitors := authenticated.Group("/channel-monitors")
 		{
 			monitors.GET("", h.ChannelMonitor.List)
@@ -155,4 +256,11 @@ func RegisterUserRoutes(
 			monitorV2.GET("/users", h.ChannelMonitorV2.Users)
 		}
 	}
+}
+
+func registerMyAccountModelCapabilityRoutes(accounts *gin.RouterGroup, h *handler.MyResourceHandler) {
+	accounts.POST("/models/sync-upstream-preview", h.SyncAccountUpstreamModelsPreview)
+	accounts.GET("/oauth/gemini/capabilities", h.GetGeminiOAuthCapabilities)
+	accounts.GET("/antigravity/default-model-mapping", h.GetAntigravityDefaultModelMapping)
+	accounts.POST("/:id/models/sync-upstream", h.SyncAccountUpstreamModels)
 }

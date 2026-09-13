@@ -5,11 +5,26 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"net/netip"
 	"net/url"
 	"strconv"
 	"strings"
 	"time"
 )
+
+var blockedOutboundPrefixes = []netip.Prefix{
+	netip.MustParsePrefix("0.0.0.0/8"),
+	netip.MustParsePrefix("100.64.0.0/10"),
+	netip.MustParsePrefix("127.0.0.0/8"),
+	netip.MustParsePrefix("169.254.0.0/16"),
+	netip.MustParsePrefix("224.0.0.0/4"),
+	netip.MustParsePrefix("240.0.0.0/4"),
+	netip.MustParsePrefix("::/128"),
+	netip.MustParsePrefix("::1/128"),
+	netip.MustParsePrefix("fc00::/7"),
+	netip.MustParsePrefix("fe80::/10"),
+	netip.MustParsePrefix("ff00::/8"),
+}
 
 type ValidationOptions struct {
 	AllowedHosts     []string
@@ -117,12 +132,99 @@ func ValidateResolvedIP(host string) error {
 	}
 
 	for _, ip := range ips {
-		if ip.IsLoopback() || ip.IsPrivate() || ip.IsLinkLocalUnicast() ||
-			ip.IsLinkLocalMulticast() || ip.IsUnspecified() {
+		if isBlockedOutboundIP(ip) {
 			return fmt.Errorf("resolved ip %s is not allowed", ip.String())
 		}
 	}
 	return nil
+}
+
+type PublicOnlyDialer struct {
+	dialer  *net.Dialer
+	allowed map[string]struct{}
+}
+
+func NewPublicOnlyDialer(allowedAddresses []string) *PublicOnlyDialer {
+	allowed := make(map[string]struct{}, len(allowedAddresses))
+	for _, address := range allowedAddresses {
+		if normalized := normalizeDialAddress(address); normalized != "" {
+			allowed[normalized] = struct{}{}
+		}
+	}
+	return &PublicOnlyDialer{
+		dialer:  &net.Dialer{Timeout: 30 * time.Second, KeepAlive: 30 * time.Second},
+		allowed: allowed,
+	}
+}
+
+func (d *PublicOnlyDialer) Dial(network, address string) (net.Conn, error) {
+	return d.DialContext(context.Background(), network, address)
+}
+
+func (d *PublicOnlyDialer) DialContext(ctx context.Context, network, address string) (net.Conn, error) {
+	if d == nil {
+		return nil, errors.New("public-only dialer is nil")
+	}
+	if _, ok := d.allowed[normalizeDialAddress(address)]; ok {
+		return d.dialer.DialContext(ctx, network, address)
+	}
+	host, port, err := net.SplitHostPort(address)
+	if err != nil {
+		return nil, fmt.Errorf("invalid dial address: %w", err)
+	}
+	if ip := net.ParseIP(host); ip != nil {
+		if isBlockedOutboundIP(ip) {
+			return nil, fmt.Errorf("dial address %s is blocked by outbound policy", address)
+		}
+		return d.dialer.DialContext(ctx, network, address)
+	}
+	addrs, err := net.DefaultResolver.LookupIPAddr(ctx, host)
+	if err != nil {
+		return nil, fmt.Errorf("dns resolution failed: %w", err)
+	}
+	if len(addrs) == 0 {
+		return nil, fmt.Errorf("dns resolution returned no addresses for %s", host)
+	}
+	for _, addr := range addrs {
+		if isBlockedOutboundIP(addr.IP) {
+			return nil, fmt.Errorf("resolved ip %s is blocked by outbound policy", addr.IP.String())
+		}
+	}
+	var lastErr error
+	for _, addr := range addrs {
+		conn, dialErr := d.dialer.DialContext(ctx, network, net.JoinHostPort(addr.IP.String(), port))
+		if dialErr == nil {
+			return conn, nil
+		}
+		lastErr = dialErr
+	}
+	return nil, lastErr
+}
+
+func normalizeDialAddress(address string) string {
+	host, port, err := net.SplitHostPort(strings.TrimSpace(address))
+	if err != nil || host == "" || port == "" {
+		return ""
+	}
+	return strings.ToLower(net.JoinHostPort(strings.TrimSuffix(host, "."), port))
+}
+
+func isBlockedOutboundIP(ip net.IP) bool {
+	if ip == nil || ip.IsLoopback() || ip.IsPrivate() || ip.IsLinkLocalUnicast() ||
+		ip.IsLinkLocalMulticast() || ip.IsUnspecified() || ip.IsMulticast() {
+		return true
+	}
+	addr, ok := netip.AddrFromSlice(ip)
+	if !ok {
+		return true
+	}
+	addr = addr.Unmap()
+	for _, prefix := range blockedOutboundPrefixes {
+		if prefix.Contains(addr) {
+			return true
+		}
+	}
+	return false
 }
 
 func normalizeAllowlist(values []string) []string {

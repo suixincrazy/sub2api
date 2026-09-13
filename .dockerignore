@@ -34,6 +34,7 @@ build/
 # Node modules (will be installed in container)
 frontend/node_modules/
 node_modules/
+/.pnpm-store/
 
 # Go build cache (will be built in container)
 backend/vendor/

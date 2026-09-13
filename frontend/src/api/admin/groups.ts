@@ -35,6 +35,7 @@ export async function list(
     platform?: GroupPlatform
     status?: 'active' | 'inactive'
     is_exclusive?: boolean
+    owner_scope?: 'system' | 'user'
     search?: string
     sort_by?: string
     sort_order?: 'asc' | 'desc'

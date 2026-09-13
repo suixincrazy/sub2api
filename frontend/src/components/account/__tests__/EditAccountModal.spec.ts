@@ -2,10 +2,17 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { defineComponent } from 'vue'
 import { mount } from '@vue/test-utils'
 
-const { updateAccountMock, checkMixedChannelRiskMock, authIsSimpleMode } = vi.hoisted(() => ({
+const { updateAccountMock, checkMixedChannelRiskMock, authIsSimpleMode, userApiPutMock } = vi.hoisted(() => ({
   updateAccountMock: vi.fn(),
   checkMixedChannelRiskMock: vi.fn(),
-  authIsSimpleMode: { value: true }
+  authIsSimpleMode: { value: true },
+  userApiPutMock: vi.fn()
+}))
+
+vi.mock('@/api/client', () => ({
+  apiClient: {
+    put: userApiPutMock,
+  },
 }))
 
 vi.mock('@/stores/app', () => ({
@@ -124,7 +131,9 @@ const GroupSelectorStub = defineComponent({
     modelValue: {
       type: Array,
       default: () => []
-    }
+    },
+    ownerUserId: Number,
+    enforceOwner: Boolean
   },
   emits: ['update:modelValue'],
   template: `
@@ -302,13 +311,14 @@ function buildOpenAIOAuthParentAccount() {
   } as any
 }
 
-function mountModal(account = buildAccount(), renderGroupSelector = false) {
+function mountModal(account = buildAccount(), renderGroupSelector = false, scope: 'admin' | 'user' = 'admin') {
   return mount(EditAccountModal, {
     props: {
       show: true,
       account,
       proxies: [],
-      groups: []
+      groups: [],
+      scope
     },
     global: {
       stubs: {
@@ -326,6 +336,30 @@ function mountModal(account = buildAccount(), renderGroupSelector = false) {
 describe('EditAccountModal', () => {
   beforeEach(() => {
     authIsSimpleMode.value = true
+    userApiPutMock.mockReset().mockResolvedValue({ data: buildAccount() })
+  })
+
+  it('passes the normalized system owner scope to GroupSelector for an admin account', () => {
+    authIsSimpleMode.value = false
+    const wrapper = mountModal(buildAccount(), false, 'admin')
+    const selector = wrapper.getComponent(GroupSelectorStub)
+
+    expect(selector.props('enforceOwner')).toBe(true)
+    expect(selector.props('ownerUserId')).toBe(null)
+  })
+
+  it('preserves the disabled status when a user-scoped account is edited', async () => {
+    const account = { ...buildAccount(), status: 'disabled' } as any
+    const wrapper = mountModal(account, false, 'user')
+
+    expect(wrapper.get('[data-testid="account-status"]').element.value).toBe('disabled')
+    await wrapper.get('form#edit-account-form').trigger('submit.prevent')
+
+    expect(userApiPutMock).toHaveBeenCalledWith(
+      '/my/accounts/1',
+      expect.objectContaining({ status: 'disabled' }),
+    )
+    expect(updateAccountMock).not.toHaveBeenCalled()
   })
 
   afterEach(() => vi.useRealTimers())

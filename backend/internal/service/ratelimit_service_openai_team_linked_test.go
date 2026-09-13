@@ -127,17 +127,95 @@ func TestTeamLinkedError_GenericPaymentErrorDoesNotFanout(t *testing.T) {
 }
 
 func TestTeamLinkedError_DedupWithinTTL(t *testing.T) {
-	repo := &teamLinkedAccountRepoStub{teamAccounts: newTeamLinkedFixture()}
-	rl, _ := newTeamLinkedTestService(repo)
+	ownerID := int64(101)
 	first := newTeamLinkedAccount(1, "team-A")
+	first.OwnerUserID = &ownerID
 	second := newTeamLinkedAccount(2, "team-A")
+	second.OwnerUserID = &ownerID
+	repo := &teamLinkedAccountRepoStub{teamAccounts: []Account{first, second}}
+	rl, _ := newTeamLinkedTestService(repo)
 
 	rl.HandleUpstreamError(context.Background(), &first, http.StatusPaymentRequired, http.Header{}, []byte(teamLinkedDeactivatedBody))
 	rl.HandleUpstreamError(context.Background(), &second, http.StatusPaymentRequired, http.Header{}, []byte(teamLinkedDeactivatedBody))
 
 	// 第二次触发被去重：只有 #2 自身经 case 402 标记，未再次 fan-out
-	require.Equal(t, []int64{2, 6, 1, 2}, repo.setErrorIDs)
+	require.Equal(t, []int64{2, 1, 2}, repo.setErrorIDs)
 	require.Equal(t, 1, repo.listCalls)
+}
+
+func TestTeamLinkedError_SystemTriggerDoesNotFanoutToUserAccount(t *testing.T) {
+	ownerID := int64(101)
+	userAccount := newTeamLinkedAccount(3, "team-A")
+	userAccount.OwnerUserID = &ownerID
+	repo := &teamLinkedAccountRepoStub{teamAccounts: []Account{
+		newTeamLinkedAccount(1, "team-A"),
+		newTeamLinkedAccount(2, "team-A"),
+		userAccount,
+	}}
+	rl, blocker := newTeamLinkedTestService(repo)
+	trigger := newTeamLinkedAccount(1, "team-A")
+
+	rl.maybeHandleOpenAITeamLinkedError(context.Background(), &trigger, http.StatusPaymentRequired, []byte(teamLinkedDeactivatedBody))
+
+	require.Equal(t, []int64{2}, repo.setErrorIDs)
+	require.Len(t, blocker.accounts, 1)
+	require.Equal(t, int64(2), blocker.accounts[0].ID)
+}
+
+func TestTeamLinkedError_UserTriggerOnlyFansOutToSameOwner(t *testing.T) {
+	ownerA := int64(101)
+	ownerB := int64(202)
+	trigger := newTeamLinkedAccount(1, "team-A")
+	trigger.OwnerUserID = &ownerA
+	sameOwner := newTeamLinkedAccount(2, "team-A")
+	sameOwner.OwnerUserID = &ownerA
+	otherOwner := newTeamLinkedAccount(3, "team-A")
+	otherOwner.OwnerUserID = &ownerB
+	repo := &teamLinkedAccountRepoStub{teamAccounts: []Account{
+		trigger,
+		sameOwner,
+		otherOwner,
+		newTeamLinkedAccount(4, "team-A"),
+	}}
+	rl, blocker := newTeamLinkedTestService(repo)
+
+	rl.maybeHandleOpenAITeamLinkedError(context.Background(), &trigger, http.StatusPaymentRequired, []byte(teamLinkedDeactivatedBody))
+
+	require.Equal(t, []int64{2}, repo.setErrorIDs)
+	require.Len(t, blocker.accounts, 1)
+	require.Equal(t, int64(2), blocker.accounts[0].ID)
+}
+
+func TestTeamLinkedError_DedupIsIndependentAcrossOwners(t *testing.T) {
+	ownerA := int64(101)
+	ownerB := int64(202)
+	first := newTeamLinkedAccount(1, "team-A")
+	first.OwnerUserID = &ownerA
+	firstSibling := newTeamLinkedAccount(2, "team-A")
+	firstSibling.OwnerUserID = &ownerA
+	second := newTeamLinkedAccount(3, "team-A")
+	second.OwnerUserID = &ownerB
+	secondSibling := newTeamLinkedAccount(4, "team-A")
+	secondSibling.OwnerUserID = &ownerB
+	repo := &teamLinkedAccountRepoStub{teamAccounts: []Account{first, firstSibling, second, secondSibling}}
+	rl, _ := newTeamLinkedTestService(repo)
+
+	rl.HandleUpstreamError(context.Background(), &first, http.StatusPaymentRequired, http.Header{}, []byte(teamLinkedDeactivatedBody))
+	rl.HandleUpstreamError(context.Background(), &second, http.StatusPaymentRequired, http.Header{}, []byte(teamLinkedDeactivatedBody))
+
+	require.Equal(t, []int64{2, 1, 4, 3}, repo.setErrorIDs)
+	require.Equal(t, 2, repo.listCalls)
+}
+
+func TestOpenAITeamIDFingerprint(t *testing.T) {
+	teamID := "acct-sensitive-team-id"
+	fingerprint := openAITeamIDFingerprint(teamID)
+
+	require.NotEmpty(t, fingerprint)
+	require.Equal(t, fingerprint, openAITeamIDFingerprint("  ACCT-SENSITIVE-TEAM-ID  "))
+	require.NotEqual(t, teamID, fingerprint)
+	require.NotContains(t, fingerprint, teamID)
+	require.NotEqual(t, fingerprint, openAITeamIDFingerprint("acct-other-team-id"))
 }
 
 func TestTeamLinkedError_APIKeyTriggerDoesNotFanout(t *testing.T) {

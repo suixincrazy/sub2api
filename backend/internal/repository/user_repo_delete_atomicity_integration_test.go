@@ -93,3 +93,24 @@ func TestUserRepository_DeleteUser_AtomicWithAPIKeys(t *testing.T) {
 		`SELECT COUNT(*) FROM deleted_api_key_audits WHERE user_id = $1`, user.ID).Scan(&auditCount))
 	require.Zero(t, auditCount, "提交后也不得保留被删 Key 的凭据材料")
 }
+
+func TestUserRepository_UpdateReusesOuterTransaction(t *testing.T) {
+	ctx := context.Background()
+	client := testEntClient(t)
+	userRepo := NewUserRepository(client, integrationDB)
+	user := mustCreateUser(t, client, &service.User{})
+	t.Cleanup(func() {
+		_, _ = integrationDB.Exec(`DELETE FROM users WHERE id = $1`, user.ID)
+	})
+
+	tx, err := client.Tx(ctx)
+	require.NoError(t, err)
+	opCtx := dbent.NewTxContext(ctx, tx)
+	user.Status = service.StatusDisabled
+	require.NoError(t, userRepo.Update(opCtx, user, service.UserUpdateFields{Status: true}))
+	require.NoError(t, tx.Rollback())
+
+	stored, err := userRepo.GetByID(ctx, user.ID)
+	require.NoError(t, err)
+	require.NotEqual(t, service.StatusDisabled, stored.Status, "outer rollback must undo the repository update")
+}

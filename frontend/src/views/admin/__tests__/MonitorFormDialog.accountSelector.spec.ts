@@ -183,7 +183,7 @@ describe('MonitorFormDialog linked account selector', () => {
     expect(accountsList).toHaveBeenCalledWith(
       1,
       50,
-      { platform: 'anthropic' },
+      { platform: 'anthropic', owner_scope: 'system' },
       { signal: expect.any(AbortSignal) },
     )
   })
@@ -202,7 +202,7 @@ describe('MonitorFormDialog linked account selector', () => {
 
     expect(accountsList).toHaveBeenCalledTimes(2)
     const lastCall = accountsList.mock.calls[accountsList.mock.calls.length - 1]
-    expect(lastCall[2]).toMatchObject({ platform: 'anthropic', search: 'hidden' })
+    expect(lastCall[2]).toMatchObject({ platform: 'anthropic', owner_scope: 'system', search: 'hidden' })
     const firstSignal = (accountsList.mock.calls[0][3] as { signal: AbortSignal }).signal
     expect(firstSignal.aborted).toBe(true)
   })
@@ -241,6 +241,29 @@ describe('MonitorFormDialog linked account selector', () => {
     expect(wrapper.text()).toContain('admin.channelMonitor.form.linkedAccountMissing')
     expect(accountTrigger(wrapper).text()).not.toContain('hidden gem')
 
+    await wrapper.get('#channel-monitor-form').trigger('submit')
+    await flushPromises()
+    expect(monitorUpdate).not.toHaveBeenCalled()
+  })
+
+  it('rejects a user-owned account returned while hydrating an existing binding', async () => {
+    accountsList.mockResolvedValue({ items: [] })
+    accountsGetById.mockResolvedValue({
+      id: 999,
+      name: 'private account',
+      platform: 'anthropic',
+      owner_user_id: 42,
+    })
+    const wrapper = mountDialog(makeMonitor({
+      provider: 'anthropic',
+      check_mode: 'quota',
+      account_id: 999,
+      endpoint: '',
+      primary_model: 'quota',
+    }))
+    await flushPromises()
+
+    expect(wrapper.text()).toContain('admin.channelMonitor.form.linkedAccountMissing')
     await wrapper.get('#channel-monitor-form').trigger('submit')
     await flushPromises()
     expect(monitorUpdate).not.toHaveBeenCalled()

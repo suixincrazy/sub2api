@@ -2,7 +2,20 @@ import { ref } from 'vue'
 import { useI18n } from 'vue-i18n'
 import { useAppStore } from '@/stores/app'
 import { adminAPI } from '@/api/admin'
-import type { GeminiOAuthCapabilities } from '@/api/admin/gemini'
+import { myResourcesApi, type GeminiOAuthCapabilities } from '@/api/myResources'
+
+export type GeminiOAuthScope = 'admin' | 'user'
+
+export interface GeminiOAuthClient {
+  generateAuthUrl: (payload: Record<string, unknown>) => Promise<{ auth_url: string; session_id: string; state: string }>
+  exchangeCode: (payload: Record<string, unknown>) => Promise<GeminiTokenInfo>
+  getCapabilities: () => Promise<GeminiOAuthCapabilities>
+}
+
+export interface UseGeminiOAuthOptions {
+  scope?: GeminiOAuthScope
+  client?: GeminiOAuthClient
+}
 
 export interface GeminiTokenInfo {
   access_token?: string
@@ -17,7 +30,7 @@ export interface GeminiTokenInfo {
   [key: string]: unknown
 }
 
-export function useGeminiOAuth() {
+export function useGeminiOAuth(options: UseGeminiOAuthOptions = {}) {
   const appStore = useAppStore()
   const { t } = useI18n()
 
@@ -26,6 +39,24 @@ export function useGeminiOAuth() {
   const state = ref('')
   const loading = ref(false)
   const error = ref('')
+
+  const client: GeminiOAuthClient = options.client || (options.scope === 'user'
+    ? {
+        generateAuthUrl: async payload => myResourcesApi.accounts.oauth.authURL({ ...payload, platform: 'gemini' } as any) as any,
+        exchangeCode: async payload => {
+          const result = await myResourcesApi.accounts.oauth.exchange({ ...payload, platform: 'gemini' } as any)
+          return {
+            ...result.credentials,
+            ...(result.extra ? { extra: result.extra } : {})
+          } as GeminiTokenInfo
+        },
+        getCapabilities: () => myResourcesApi.accounts.oauth.geminiCapabilities()
+      }
+    : {
+        generateAuthUrl: payload => adminAPI.gemini.generateAuthUrl(payload as any),
+        exchangeCode: payload => adminAPI.gemini.exchangeCode(payload as any) as Promise<GeminiTokenInfo>,
+        getCapabilities: () => adminAPI.gemini.getCapabilities()
+      })
 
   const resetState = () => {
     authUrl.value = ''
@@ -56,7 +87,7 @@ export function useGeminiOAuth() {
       const trimmedTierID = tierId?.trim()
       if (trimmedTierID) payload.tier_id = trimmedTierID
 
-      const response = await adminAPI.gemini.generateAuthUrl(payload as any)
+      const response = await client.generateAuthUrl(payload)
       authUrl.value = response.auth_url
       sessionId.value = response.session_id
       state.value = response.state
@@ -98,7 +129,7 @@ export function useGeminiOAuth() {
       const trimmedTierID = params.tierId?.trim()
       if (trimmedTierID) payload.tier_id = trimmedTierID
 
-      const tokenInfo = await adminAPI.gemini.exchangeCode(payload as any)
+      const tokenInfo = await client.exchangeCode(payload)
       return tokenInfo as GeminiTokenInfo
     } catch (err: any) {
       // Check for specific missing project_id error
@@ -142,7 +173,7 @@ export function useGeminiOAuth() {
 
   const getCapabilities = async (): Promise<GeminiOAuthCapabilities | null> => {
     try {
-      return await adminAPI.gemini.getCapabilities()
+      return await client.getCapabilities()
     } catch (err: any) {
       // Capabilities are optional for older servers; don't block the UI.
       return null

@@ -137,7 +137,13 @@ export default {
     resetIn: 'Resets in {time}',
     quotaEndsIn: 'Quota ends in {time}',
     windowNotActive: 'Awaiting first use',
-    usageOf: '{used} of {limit}'
+    usageOf: '{used} of {limit}',
+    creator: 'Creator #{id}',
+    unsubscribe: 'Unsubscribe',
+    poolHealth: 'Pool health',
+    unsubscribeConfirm: 'Unsubscribe from this subscription? The current API key will no longer be able to use this subscription group.',
+    unsubscribeSuccess: 'Unsubscribed',
+    unsubscribeFailed: 'Failed to unsubscribe'
   },
 
   // Onboarding Tour

@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/require"
 	"github.com/stretchr/testify/suite"
@@ -46,6 +47,13 @@ func newTestGitHubReleaseClient() *githubReleaseClient {
 		httpClient:         &http.Client{},
 		downloadHTTPClient: &http.Client{},
 	}
+}
+
+func TestGitHubReleaseClientAllowsSlowReleaseDownloads(t *testing.T) {
+	client, ok := NewGitHubReleaseClient("", false).(*githubReleaseClient)
+	require.True(t, ok)
+	require.Equal(t, githubReleaseDownloadTimeout, client.downloadHTTPClient.Timeout)
+	require.Equal(t, 45*time.Minute, client.downloadHTTPClient.Timeout)
 }
 
 func TestGitHubReleaseClientAPIRequestAuthorization(t *testing.T) {

@@ -111,6 +111,18 @@ func (r *paymentOrderLifecycleRedeemRepo) GetByCode(_ context.Context, code stri
 	return &cloned, nil
 }
 
+func (r *paymentOrderLifecycleRedeemRepo) GetByCodeForUpdate(ctx context.Context, code string) (*RedeemCode, error) {
+	return r.GetByCode(ctx, code)
+}
+
+func (r *paymentOrderLifecycleRedeemRepo) GetUsageByRedeemCodeAndUser(context.Context, int64, int64) (*RedeemCodeUsage, error) {
+	return nil, nil
+}
+
+func (r *paymentOrderLifecycleRedeemRepo) ListUsagesByRedeemCode(context.Context, int64, pagination.PaginationParams) ([]RedeemCodeUsage, *pagination.PaginationResult, error) {
+	panic("unexpected call")
+}
+
 func (r *paymentOrderLifecycleRedeemRepo) Update(context.Context, *RedeemCode) error {
 	panic("unexpected call")
 }

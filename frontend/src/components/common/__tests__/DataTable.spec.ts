@@ -357,4 +357,59 @@ describe('DataTable', () => {
 
     expect(wrapper.emitted('update:selectedKeys')?.at(-1)?.[0]).toEqual([99, 1, 2])
   })
+
+  it('provides a draggable fallback rail when the native horizontal scrollbar has no layout space', async () => {
+    const originalResizeObserver = globalThis.ResizeObserver
+    vi.stubGlobal('ResizeObserver', undefined)
+
+    const wrapper = mount(DataTable, {
+      props: {
+        columns: [{ key: 'name', label: 'Name' }],
+        data: [{ id: 1, name: 'A wide row' }]
+      }
+    })
+
+    await wrapper.vm.$nextTick()
+
+    const tableWrapper = wrapper.get('.table-wrapper').element as HTMLElement
+    let scrollLeft = 0
+    Object.defineProperties(tableWrapper, {
+      clientWidth: { configurable: true, value: 500 },
+      scrollWidth: { configurable: true, value: 1500 },
+      clientHeight: { configurable: true, value: 300 },
+      offsetHeight: { configurable: true, value: 300 },
+      offsetWidth: { configurable: true, value: 500 },
+      scrollLeft: {
+        configurable: true,
+        get: () => scrollLeft,
+        set: (value: number) => { scrollLeft = value }
+      }
+    })
+
+    await wrapper.setProps({
+      data: [
+        { id: 1, name: 'A wide row' },
+        { id: 2, name: 'Another wide row' }
+      ]
+    })
+    window.dispatchEvent(new Event('resize'))
+    await wrapper.vm.$nextTick()
+    await wrapper.vm.$nextTick()
+
+    const track = wrapper.get('[data-test="table-horizontal-scrollbar"]')
+    const thumb = wrapper.get('[data-test="table-horizontal-scrollbar-thumb"]')
+    expect(track.exists()).toBe(true)
+
+    await thumb.trigger('pointerdown', { button: 0, clientX: 50, pointerId: 1 })
+    window.dispatchEvent(new MouseEvent('pointermove', { clientX: 220 }))
+    window.dispatchEvent(new MouseEvent('pointerup', { clientX: 220 }))
+
+    expect(scrollLeft).toBeGreaterThan(0)
+
+    await track.trigger('keydown', { key: 'End' })
+    expect(scrollLeft).toBe(1000)
+
+    wrapper.unmount()
+    vi.stubGlobal('ResizeObserver', originalResizeObserver)
+  })
 })

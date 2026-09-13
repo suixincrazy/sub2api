@@ -611,6 +611,31 @@ func (s *HTTPUpstreamSuite) TestGetOrCreateClient_InvalidURLReturnsError() {
 	require.Error(s.T(), err, "expected error for invalid proxy URL")
 }
 
+func (s *HTTPUpstreamSuite) TestUserOwnedNetworkPolicyRejectsLoopbackEvenWhenGlobalAllowlistIsDisabled() {
+	s.cfg.Security.URLAllowlist.Enabled = false
+	s.cfg.Security.URLAllowlist.AllowPrivateHosts = true
+	svc := s.newService()
+	req, err := http.NewRequest(http.MethodGet, "http://127.0.0.1:1/private", nil)
+	require.NoError(s.T(), err)
+	req = req.WithContext(service.WithHTTPUpstreamNetworkPolicy(req.Context(), service.HTTPUpstreamNetworkPolicy{PublicOnly: true}))
+
+	_, err = svc.Do(req, "", 99, 1)
+	require.Error(s.T(), err)
+	require.Contains(s.T(), err.Error(), "not allowed")
+}
+
+func (s *HTTPUpstreamSuite) TestNetworkPolicyCacheSuffixPreservesDefaultKeys() {
+	require.Empty(s.T(), networkPolicyCacheSuffix(service.HTTPUpstreamNetworkPolicy{}))
+	require.Equal(
+		s.T(),
+		":public-only:127.0.0.1:1080",
+		networkPolicyCacheSuffix(service.HTTPUpstreamNetworkPolicy{
+			PublicOnly:           true,
+			AllowedDialAddresses: []string{"127.0.0.1:1080"},
+		}),
+	)
+}
+
 func (s *HTTPUpstreamSuite) TestOpenAIProfileDefaultsToHTTP2AndNoHeaderTimeout() {
 	s.cfg.Gateway = config.GatewayConfig{
 		ResponseHeaderTimeout: 600,
@@ -757,6 +782,21 @@ func (s *HTTPUpstreamSuite) TestNormalizeProxyURL_Canonicalizes() {
 	key2, _, err2 := normalizeProxyURL("http://proxy.local:8080/")
 	require.NoError(s.T(), err2)
 	require.Equal(s.T(), key1, key2, "expected normalized proxy keys to match")
+}
+
+func (s *HTTPUpstreamSuite) TestNormalizeProxyURL_HashesCredentialsInCacheKey() {
+	key1, parsed1, err := normalizeProxyURL("http://alice:first-secret@proxy.local:8080")
+	require.NoError(s.T(), err)
+	key2, _, err := normalizeProxyURL("http://alice:second-secret@proxy.local:8080")
+	require.NoError(s.T(), err)
+
+	require.NotEqual(s.T(), key1, key2, "different proxy credentials must not share a client")
+	require.NotContains(s.T(), key1, "alice")
+	require.NotContains(s.T(), key1, "first-secret")
+	require.Contains(s.T(), key1, "#auth=")
+	password, ok := parsed1.User.Password()
+	require.True(s.T(), ok)
+	require.Equal(s.T(), "first-secret", password)
 }
 
 // TestAcquireClient_OverLimitReturnsError 测试连接池缓存上限保护

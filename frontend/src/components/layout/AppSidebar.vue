@@ -237,6 +237,10 @@ function applyFeatureFlags(items: NavItem[]): NavItem[] {
 }
 
 const { t } = useI18n()
+const navLabel = (key: string, fallback: string) => {
+  const value = t(key)
+  return value === key ? fallback : value
+}
 
 const route = useRoute()
 const router = useRouter()
@@ -707,6 +711,7 @@ const purchaseNavLabel = computed(() => {
 })
 const flagAffiliate = makeSidebarFlag(FeatureFlags.affiliate)
 const flagRiskControl = makeSidebarFlag(FeatureFlags.riskControl)
+const flagUserResources = makeSidebarFlag(FeatureFlags.userResources)
 const flagPluginManagement = makeSidebarFlag(FeatureFlags.pluginManagement)
 const flagOpsMonitoring = () => adminSettingsStore.opsMonitoringEnabled
 const flagAdminPayment = () => adminSettingsStore.paymentEnabled
@@ -723,9 +728,16 @@ function buildSelfNavItems(withDashboard: boolean): NavItem[] {
     items.push({ path: '/dashboard', label: t('nav.dashboard'), icon: DashboardIcon })
   }
   items.push(
+    { path: '/my/groups', label: navLabel('nav.myGroups', '我的分组'), icon: FolderIcon, hideInSimpleMode: true, featureFlag: flagUserResources },
+    { path: '/my/accounts', label: navLabel('nav.myAccounts', '我的账号'), icon: GlobeIcon, hideInSimpleMode: true, featureFlag: flagUserResources },
+    { path: '/my/proxies', label: navLabel('nav.myProxies', '我的代理'), icon: ServerIcon, hideInSimpleMode: true, featureFlag: flagUserResources },
+    { path: '/my/assigned-subscriptions', label: navLabel('nav.assignSubscriptions', '分配订阅'), icon: CreditCardIcon, hideInSimpleMode: true, featureFlag: flagUserResources },
+    { path: '/my/redeem-codes', label: navLabel('nav.myRedeemCodes', '我的兑换码'), icon: TicketIcon, hideInSimpleMode: true, featureFlag: flagUserResources },
     { path: '/keys', label: t('nav.apiKeys'), icon: KeyIcon },
     { path: '/batch-image', label: t('nav.batchImage'), icon: BatchImageIcon, hideInSimpleMode: true, featureFlag: flagBatchImageAccess },
     { path: '/usage', label: t('nav.usage'), icon: ChartIcon, hideInSimpleMode: true },
+    { path: '/my/usage/account-logs', label: navLabel('nav.myAccountUsage', '账号使用记录'), icon: ChartIcon, hideInSimpleMode: true, featureFlag: flagUserResources },
+    { path: '/my/usage/upstream-errors', label: navLabel('nav.myUpstreamErrors', '上游错误'), icon: ShieldIcon, hideInSimpleMode: true, featureFlag: flagUserResources },
     { path: '/available-channels', label: t('nav.availableChannels'), icon: ChannelIcon, hideInSimpleMode: true, featureFlag: flagAvailableChannels },
     { path: '/monitor', label: t('nav.channelStatus'), icon: SignalIcon, featureFlag: flagChannelMonitor },
     { path: '/subscriptions', label: t('nav.mySubscriptions'), icon: CreditCardIcon, hideInSimpleMode: true, featureFlag: flagSubscription },

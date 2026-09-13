@@ -43,6 +43,13 @@
               class="w-44"
               @change="loadGroups"
             />
+            <Select
+              v-model="filters.owner_scope"
+              :options="ownerScopeOptions"
+              :placeholder="t('admin.groups.allResourceOwners')"
+              class="w-44"
+              @change="loadGroups"
+            />
           </div>
 
           <!-- Right: actions -->
@@ -134,6 +141,15 @@
             <span class="font-mono text-xs text-gray-500 dark:text-gray-400"
               >#{{ value }}</span
             >
+          </template>
+
+          <template #cell-owner_user_id="{ row }">
+            <span v-if="row.owner_user_id" class="font-mono text-xs text-primary-600 dark:text-primary-400">
+              {{ t("admin.groups.userResourceOwner", { id: row.owner_user_id }) }}
+            </span>
+            <span v-else class="text-xs text-gray-500 dark:text-gray-400">
+              {{ t("admin.groups.systemResource") }}
+            </span>
           </template>
 
           <template #cell-platform="{ value }">
@@ -4467,6 +4483,7 @@ const allColumns = computed<Column[]>(() => {
   const basic: Column[] = [
     { key: "name", label: t("admin.groups.columns.name"), sortable: true },
     { key: "id", label: t("admin.groups.columns.id"), sortable: true },
+    { key: "owner_user_id", label: t("admin.groups.columns.owner"), sortable: false },
     { key: "platform", label: t("admin.groups.columns.platform"), sortable: true },
     { key: "account_count", label: t("admin.groups.columns.accounts"), sortable: true },
     { key: "status", label: t("admin.groups.columns.status"), sortable: true },
@@ -4474,14 +4491,14 @@ const allColumns = computed<Column[]>(() => {
   ];
   if (authStore.isSimpleMode) return basic;
   return [
-    ...basic.slice(0, 3),
+    ...basic.slice(0, 4),
     { key: "billing_type", label: t("admin.groups.columns.billingType"), sortable: true },
     { key: "rate_multiplier", label: t("admin.groups.columns.rateMultiplier"), sortable: true },
     { key: "is_exclusive", label: t("admin.groups.columns.type"), sortable: true },
-    basic[3],
+    basic[4],
     { key: "capacity", label: t("admin.groups.columns.capacity"), sortable: false },
     { key: "usage", label: t("admin.groups.columns.usage"), sortable: false },
-    ...basic.slice(4),
+    ...basic.slice(5),
   ];
 });
 
@@ -4602,6 +4619,12 @@ const statusOptions = computed(() => [
   { value: "", label: t("admin.groups.allStatus") },
   { value: "active", label: t("admin.accounts.status.active") },
   { value: "inactive", label: t("admin.accounts.status.inactive") },
+]);
+
+const ownerScopeOptions = computed(() => [
+  { value: "", label: t("admin.groups.allResourceOwners") },
+  { value: "system", label: t("admin.groups.systemResources") },
+  { value: "user", label: t("admin.groups.userResources") },
 ]);
 
 const exclusiveOptions = computed(() => [
@@ -4805,6 +4828,7 @@ const filters = reactive({
   platform: "",
   status: "",
   is_exclusive: "",
+  owner_scope: "",
 });
 const pagination = reactive({
   page: 1,
@@ -5608,6 +5632,7 @@ const loadGroups = async () => {
         is_exclusive: !authStore.isSimpleMode && filters.is_exclusive
           ? filters.is_exclusive === "true"
           : undefined,
+        owner_scope: (filters.owner_scope as "system" | "user") || undefined,
         search: searchQuery.value.trim() || undefined,
         sort_by: sortState.sort_by,
         sort_order: sortState.sort_order,

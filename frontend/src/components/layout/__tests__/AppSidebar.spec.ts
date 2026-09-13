@@ -42,6 +42,40 @@ describe('AppSidebar scroll position persistence', () => {
   })
 })
 
+describe('AppSidebar user resource navigation', () => {
+  it('keeps user resource items in the requested order behind the user-resource feature flag', () => {
+    const expectedOrder = [
+      "'/my/groups'",
+      "'/my/accounts'",
+      "'/my/proxies'",
+      "'/my/assigned-subscriptions'",
+      "'/my/redeem-codes'",
+      "'/keys'",
+      "'/usage'",
+      "'/my/usage/account-logs'",
+      "'/my/usage/upstream-errors'",
+      "'/subscriptions'",
+      "'/redeem'",
+      "'/profile'",
+    ]
+    const positions = expectedOrder.map(item => componentSource.indexOf(`path: ${item}`))
+
+    expect(positions.every(position => position >= 0)).toBe(true)
+    expect([...positions].sort((a, b) => a - b)).toEqual(positions)
+    for (const path of expectedOrder.slice(0, 5)) {
+      const itemStart = componentSource.indexOf(`path: ${path}`)
+      const itemEnd = componentSource.indexOf('}', itemStart)
+      const itemSource = componentSource.slice(itemStart, itemEnd)
+      expect(itemSource).toContain('featureFlag: flagUserResources')
+    }
+    for (const path of ["'/my/usage/account-logs'", "'/my/usage/upstream-errors'"]) {
+      const itemStart = componentSource.indexOf(`path: ${path}`)
+      const itemEnd = componentSource.indexOf('}', itemStart)
+      expect(componentSource.slice(itemStart, itemEnd)).toContain('featureFlag: flagUserResources')
+    }
+  })
+})
+
 describe('AppSidebar collapsible groups', () => {
   it('lets the user collapse a group even while a child route is active', () => {
     // The expand state must come from the user's override first, falling back

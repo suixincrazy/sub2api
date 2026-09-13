@@ -38,6 +38,18 @@ func (r *redeemRejectRepo) GetByCode(ctx context.Context, code string) (*RedeemC
 	return &clone, nil
 }
 
+func (r *redeemRejectRepo) GetByCodeForUpdate(ctx context.Context, code string) (*RedeemCode, error) {
+	return r.GetByCode(ctx, code)
+}
+
+func (r *redeemRejectRepo) GetUsageByRedeemCodeAndUser(context.Context, int64, int64) (*RedeemCodeUsage, error) {
+	return nil, nil
+}
+
+func (r *redeemRejectRepo) ListUsagesByRedeemCode(context.Context, int64, pagination.PaginationParams) ([]RedeemCodeUsage, *pagination.PaginationResult, error) {
+	panic("unexpected ListUsagesByRedeemCode call")
+}
+
 func (r *redeemRejectRepo) Update(ctx context.Context, code *RedeemCode) error {
 	panic("unexpected Update call")
 }

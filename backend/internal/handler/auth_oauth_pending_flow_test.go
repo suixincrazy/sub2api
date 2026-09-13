@@ -2941,7 +2941,21 @@ func (r *oauthPendingFlowRedeemCodeRepo) GetByCode(ctx context.Context, code str
 		CreatedAt:    entity.CreatedAt,
 		GroupID:      entity.GroupID,
 		ValidityDays: entity.ValidityDays,
+		MaxUses:      entity.MaxUses,
+		UsedCount:    entity.UsedCount,
 	}, nil
+}
+
+func (r *oauthPendingFlowRedeemCodeRepo) GetByCodeForUpdate(ctx context.Context, code string) (*service.RedeemCode, error) {
+	return r.GetByCode(ctx, code)
+}
+
+func (r *oauthPendingFlowRedeemCodeRepo) GetUsageByRedeemCodeAndUser(context.Context, int64, int64) (*service.RedeemCodeUsage, error) {
+	return nil, nil
+}
+
+func (r *oauthPendingFlowRedeemCodeRepo) ListUsagesByRedeemCode(context.Context, int64, pagination.PaginationParams) ([]service.RedeemCodeUsage, *pagination.PaginationResult, error) {
+	panic("unexpected ListUsagesByRedeemCode call")
 }
 
 func (r *oauthPendingFlowRedeemCodeRepo) Update(ctx context.Context, code *service.RedeemCode) error {

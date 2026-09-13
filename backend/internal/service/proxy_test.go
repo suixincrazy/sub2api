@@ -34,6 +34,15 @@ func TestProxyURL(t *testing.T) {
 			want: "socks5://user:pass@socks.example.com:1080",
 		},
 		{
+			name: "legacy socks alias uses remote DNS",
+			proxy: Proxy{
+				Protocol: "socks",
+				Host:     "socks.example.com",
+				Port:     1080,
+			},
+			want: "socks5h://socks.example.com:1080",
+		},
+		{
 			name: "username only keeps no auth for compatibility",
 			proxy: Proxy{
 				Protocol: "http",

@@ -77,6 +77,10 @@ func (r *contentModerationTestProxyRepo) CountAccountsByProxyID(ctx context.Cont
 	panic("not implemented")
 }
 
+func (r *contentModerationTestProxyRepo) CountFallbackReferencesByProxyID(ctx context.Context, proxyID int64) (int64, error) {
+	panic("not implemented")
+}
+
 func (r *contentModerationTestProxyRepo) ListAccountSummariesByProxyID(ctx context.Context, proxyID int64) ([]ProxyAccountSummary, error) {
 	panic("not implemented")
 }

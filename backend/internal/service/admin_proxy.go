@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"strings"
 	"time"
 
 	infraerrors "github.com/Wei-Shaw/sub2api/internal/pkg/errors"
@@ -12,6 +13,7 @@ import (
 	"github.com/Wei-Shaw/sub2api/internal/pkg/logger"
 	"github.com/Wei-Shaw/sub2api/internal/pkg/pagination"
 	"github.com/Wei-Shaw/sub2api/internal/util/httputil"
+	"github.com/Wei-Shaw/sub2api/internal/util/logredact"
 )
 
 // Proxy management implementations
@@ -27,6 +29,28 @@ func (s *adminServiceImpl) ListProxies(ctx context.Context, page, pageSize int, 
 func (s *adminServiceImpl) ListProxiesWithAccountCount(ctx context.Context, page, pageSize int, protocol, status, search string, sortBy, sortOrder string) ([]ProxyWithAccountCount, int64, error) {
 	params := pagination.PaginationParams{Page: page, PageSize: pageSize, SortBy: sortBy, SortOrder: sortOrder}
 	proxies, result, err := s.proxyRepo.ListWithFiltersAndAccountCount(ctx, params, protocol, status, search)
+	if err != nil {
+		return nil, 0, err
+	}
+	s.attachProxyLatency(ctx, proxies)
+	return proxies, result.Total, nil
+}
+
+type proxyOwnerScopeRepository interface {
+	ListWithAccountCountAndOwnerScope(ctx context.Context, params pagination.PaginationParams, protocol, status, search, ownerScope string, sourceID int64) ([]ProxyWithAccountCount, *pagination.PaginationResult, error)
+}
+
+type proxyUserOwnedAccountCounter interface {
+	CountUserOwnedAccountsByProxyID(ctx context.Context, proxyID int64) (int64, error)
+}
+
+func (s *adminServiceImpl) ListProxiesWithAccountCountByOwnerScope(ctx context.Context, page, pageSize int, protocol, status, search, ownerScope string, sourceID int64, sortBy, sortOrder string) ([]ProxyWithAccountCount, int64, error) {
+	repo, ok := s.proxyRepo.(proxyOwnerScopeRepository)
+	if !ok {
+		return nil, 0, infraerrors.ServiceUnavailable("RESOURCE_OWNER_FILTER_UNAVAILABLE", "resource owner filter is not available")
+	}
+	params := pagination.PaginationParams{Page: page, PageSize: pageSize, SortBy: sortBy, SortOrder: sortOrder}
+	proxies, result, err := repo.ListWithAccountCountAndOwnerScope(ctx, params, protocol, status, search, ownerScope, sourceID)
 	if err != nil {
 		return nil, 0, err
 	}
@@ -59,6 +83,11 @@ func (s *adminServiceImpl) CreateProxy(ctx context.Context, input *CreateProxyIn
 	if !isJSONTimeInRange(input.ExpiresAt) {
 		return nil, infraerrors.BadRequest("PROXY_EXPIRY_INVALID", "proxy expiry year must be between 0 and 9999")
 	}
+	kind := normalizeAdminProxyKind(input.Kind)
+	protocol := strings.ToLower(strings.TrimSpace(input.Protocol))
+	if err := validateAdminProxyMode(kind, protocol, input.Extra); err != nil {
+		return nil, err
+	}
 	// 规范化 fallback_mode
 	mode := input.FallbackMode
 	if mode == "" {
@@ -74,7 +103,9 @@ func (s *adminServiceImpl) CreateProxy(ctx context.Context, input *CreateProxyIn
 
 	proxy := &Proxy{
 		Name:           input.Name,
-		Protocol:       input.Protocol,
+		IsPublic:       input.IsPublic,
+		Kind:           kind,
+		Protocol:       protocol,
 		Host:           input.Host,
 		Port:           input.Port,
 		Username:       input.Username,
@@ -84,6 +115,10 @@ func (s *adminServiceImpl) CreateProxy(ctx context.Context, input *CreateProxyIn
 		FallbackMode:   mode,
 		BackupProxyID:  input.BackupProxyID,
 		ExpiryWarnDays: input.ExpiryWarnDays,
+		Extra:          input.Extra,
+	}
+	if err := s.validateProxyFallbackOwner(ctx, proxy, input.BackupProxyID); err != nil {
+		return nil, err
 	}
 	if err := s.proxyRepo.Create(ctx, proxy); err != nil {
 		return nil, err
@@ -103,6 +138,45 @@ func (s *adminServiceImpl) UpdateProxy(ctx context.Context, id int64, input *Upd
 	}
 	proxy, err := s.proxyRepo.GetByID(ctx, id)
 	if err != nil {
+		return nil, err
+	}
+	kind := proxy.Kind
+	if strings.TrimSpace(input.Kind) != "" {
+		kind = normalizeAdminProxyKind(input.Kind)
+	}
+	protocol := proxy.Protocol
+	if strings.TrimSpace(input.Protocol) != "" {
+		protocol = strings.ToLower(strings.TrimSpace(input.Protocol))
+	}
+	extra := proxy.Extra
+	if input.Extra != nil {
+		extra = input.Extra
+	}
+	// 官方 v0.2.4 起支持代理「部分更新」（只改名字／状态／到期时间等）。
+	// Xray 独有的模式校验只在本次请求真的带了 kind／protocol／extra 时才重跑，
+	// 否则库里 kind／protocol 为空的历史代理会让任何部分更新都被拒掉。
+	if strings.TrimSpace(input.Kind) != "" || strings.TrimSpace(input.Protocol) != "" || input.Extra != nil {
+		if err := validateAdminProxyMode(kind, protocol, extra); err != nil {
+			return nil, err
+		}
+	}
+	if input.IsPublic != nil && *input.IsPublic && proxy.OwnerUserID != nil {
+		return nil, infraerrors.BadRequest("PROXY_PUBLIC_OWNER_INVALID", "only system proxies can be public")
+	}
+	if input.IsPublic != nil && proxy.OwnerUserID == nil && proxy.IsPublic && !*input.IsPublic {
+		counter, ok := s.proxyRepo.(proxyUserOwnedAccountCounter)
+		if !ok {
+			return nil, infraerrors.ServiceUnavailable("PROXY_PUBLIC_USAGE_CHECK_UNAVAILABLE", "cannot verify public proxy usage")
+		}
+		count, err := counter.CountUserOwnedAccountsByProxyID(ctx, id)
+		if err != nil {
+			return nil, err
+		}
+		if count > 0 {
+			return nil, infraerrors.Conflict("PROXY_PUBLIC_IN_USE", "public proxy is still used by user-owned accounts")
+		}
+	}
+	if err := s.validateProxyFallbackOwner(ctx, proxy, input.BackupProxyID); err != nil {
 		return nil, err
 	}
 
@@ -125,9 +199,12 @@ func (s *adminServiceImpl) UpdateProxy(ctx context.Context, id int64, input *Upd
 	if input.Name != "" {
 		proxy.Name = input.Name
 	}
-	if input.Protocol != "" {
-		proxy.Protocol = input.Protocol
+	if input.IsPublic != nil {
+		proxy.IsPublic = *input.IsPublic
 	}
+	proxy.Kind = kind
+	proxy.Protocol = protocol
+	proxy.Extra = extra
 	if input.Host != "" {
 		proxy.Host = input.Host
 	}
@@ -152,10 +229,81 @@ func (s *adminServiceImpl) UpdateProxy(ctx context.Context, id int64, input *Upd
 		proxy.ExpiryWarnDays = *input.ExpiryWarnDays
 	}
 
+	if err := stopProxyRuntimesWithRetry(id); err != nil {
+		return nil, fmt.Errorf("stop previous proxy runtime: %w", err)
+	}
 	if err := s.proxyRepo.Update(ctx, proxy); err != nil {
 		return nil, err
 	}
 	return proxy, nil
+}
+
+func normalizeAdminProxyKind(kind string) string {
+	normalized := strings.ToLower(strings.TrimSpace(kind))
+	if normalized == "" {
+		return "standard"
+	}
+	return normalized
+}
+
+func validateAdminProxyMode(kind, protocol string, extra map[string]any) error {
+	standardProtocols := map[string]struct{}{"http": {}, "https": {}, "socks5": {}, "socks5h": {}}
+	xrayProtocols := map[string]struct{}{
+		"vmess": {}, "vless": {}, "trojan": {}, "ss": {},
+		"hysteria": {}, "hysteria2": {}, "tuic": {}, "anytls": {}, "naive": {}, "wireguard": {},
+	}
+
+	switch kind {
+	case "standard":
+		if _, ok := standardProtocols[protocol]; !ok {
+			return infraerrors.BadRequest("PROXY_PROTOCOL_INVALID", "standard proxy protocol must be http, https, socks5, or socks5h")
+		}
+	case "xray":
+		if _, ok := xrayProtocols[protocol]; !ok {
+			return infraerrors.BadRequest("PROXY_PROTOCOL_INVALID", "xray proxy protocol is not supported")
+		}
+		raw, _ := extra["raw"].(string)
+		if strings.TrimSpace(raw) == "" {
+			return infraerrors.BadRequest("PROXY_XRAY_RAW_REQUIRED", "xray proxy requires extra.raw node URI")
+		}
+		candidate := &Proxy{Kind: kind, Protocol: protocol, Extra: extra}
+		if requiresSingBoxRuntime(candidate) {
+			if _, err := buildSingBoxRuntimeSpec(raw, candidate); err != nil {
+				return infraerrors.BadRequest("PROXY_XRAY_RAW_INVALID", "xray proxy contains an invalid sing-box node URI")
+			}
+		} else if _, err := buildXrayOutbound(raw, candidate); err != nil {
+			return infraerrors.BadRequest("PROXY_XRAY_RAW_INVALID", "xray proxy contains an invalid node URI")
+		}
+	default:
+		return infraerrors.BadRequest("PROXY_KIND_INVALID", "proxy kind must be standard or xray")
+	}
+	return nil
+}
+
+func (s *adminServiceImpl) validateProxyFallbackOwner(ctx context.Context, current *Proxy, backupID *int64) error {
+	if current == nil || backupID == nil {
+		return nil
+	}
+	if current.ID > 0 && *backupID == current.ID {
+		return infraerrors.BadRequest("PROXY_BACKUP_SELF", "backup proxy cannot be itself")
+	}
+	backup, err := s.proxyRepo.GetByID(ctx, *backupID)
+	if err != nil {
+		return err
+	}
+	if current.OwnerUserID == nil {
+		if backup.OwnerUserID != nil {
+			return infraerrors.BadRequest("PROXY_BACKUP_OWNER_INVALID", "system proxies cannot use user-owned backup proxies")
+		}
+		return nil
+	}
+	if backup.OwnerUserID != nil && *backup.OwnerUserID == *current.OwnerUserID {
+		return nil
+	}
+	if backup.OwnerUserID == nil && backup.IsPublic {
+		return nil
+	}
+	return infraerrors.BadRequest("PROXY_BACKUP_OWNER_INVALID", "user proxies can only use owned or public system backup proxies")
 }
 
 func (s *adminServiceImpl) DeleteProxy(ctx context.Context, id int64) error {
@@ -165,6 +313,16 @@ func (s *adminServiceImpl) DeleteProxy(ctx context.Context, id int64) error {
 	}
 	if count > 0 {
 		return ErrProxyInUse
+	}
+	fallbackCount, err := s.proxyRepo.CountFallbackReferencesByProxyID(ctx, id)
+	if err != nil {
+		return err
+	}
+	if fallbackCount > 0 {
+		return ErrProxyInUse
+	}
+	if err := stopProxyRuntimesWithRetry(id); err != nil {
+		return err
 	}
 	return s.proxyRepo.Delete(ctx, id)
 }
@@ -188,6 +346,22 @@ func (s *adminServiceImpl) BatchDeleteProxies(ctx context.Context, ids []int64) 
 			result.Skipped = append(result.Skipped, ProxyBatchDeleteSkipped{
 				ID:     id,
 				Reason: ErrProxyInUse.Error(),
+			})
+			continue
+		}
+		fallbackCount, err := s.proxyRepo.CountFallbackReferencesByProxyID(ctx, id)
+		if err != nil {
+			result.Skipped = append(result.Skipped, ProxyBatchDeleteSkipped{ID: id, Reason: err.Error()})
+			continue
+		}
+		if fallbackCount > 0 {
+			result.Skipped = append(result.Skipped, ProxyBatchDeleteSkipped{ID: id, Reason: ErrProxyInUse.Error()})
+			continue
+		}
+		if err := stopProxyRuntimesWithRetry(id); err != nil {
+			result.Skipped = append(result.Skipped, ProxyBatchDeleteSkipped{
+				ID:     id,
+				Reason: err.Error(),
 			})
 			continue
 		}
@@ -218,7 +392,17 @@ func (s *adminServiceImpl) TestProxy(ctx context.Context, id int64) (*ProxyTestR
 		return nil, err
 	}
 
-	proxyURL := proxy.URL()
+	proxyURL, cleanup, resolveErr := resolveProxyProbeURL(ctx, s.proxyProbeResolver, proxy)
+	if resolveErr != nil {
+		message := logredact.RedactText(resolveErr.Error())
+		s.saveProxyLatency(ctx, id, &ProxyLatencyInfo{
+			Success:   false,
+			Message:   message,
+			UpdatedAt: time.Now(),
+		})
+		return &ProxyTestResult{Success: false, Message: message}, nil
+	}
+	defer cleanup()
 	exitInfo, latencyMs, err := s.proxyProber.ProbeProxy(ctx, proxyURL)
 	if err != nil {
 		s.saveProxyLatency(ctx, id, &ProxyLatencyInfo{
@@ -270,7 +454,6 @@ func (s *adminServiceImpl) CheckProxyQuality(ctx context.Context, id int64) (*Pr
 		Items:     make([]ProxyQualityCheckItem, 0, len(proxyQualityTargets)+1),
 	}
 
-	proxyURL := proxy.URL()
 	if s.proxyProber == nil {
 		result.Items = append(result.Items, ProxyQualityCheckItem{
 			Target:  "base_connectivity",
@@ -282,6 +465,19 @@ func (s *adminServiceImpl) CheckProxyQuality(ctx context.Context, id int64) (*Pr
 		s.saveProxyQualitySnapshot(ctx, id, result, nil)
 		return result, nil
 	}
+	proxyURL, cleanup, resolveErr := resolveProxyProbeURL(ctx, s.proxyProbeResolver, proxy)
+	if resolveErr != nil {
+		result.Items = append(result.Items, ProxyQualityCheckItem{
+			Target:  "base_connectivity",
+			Status:  "fail",
+			Message: logredact.RedactText(resolveErr.Error()),
+		})
+		result.FailedCount++
+		finalizeProxyQualityResult(result)
+		s.saveProxyQualitySnapshot(ctx, id, result, nil)
+		return result, nil
+	}
+	defer cleanup()
 
 	exitInfo, latencyMs, err := s.proxyProber.ProbeProxy(ctx, proxyURL)
 	if err != nil {
@@ -455,6 +651,13 @@ func proxyQualityOverallStatus(result *ProxyQualityCheckResult) string {
 		return "challenge"
 	}
 	if result.FailedCount > 0 {
+		// A reachable proxy can still be unable to access one provider's
+		// public probe endpoint because of regional policy or upstream rules.
+		// Keep that distinct from a proxy that cannot establish the base
+		// connection at all.
+		if proxyQualityBaseConnectivityPass(result) {
+			return "warn"
+		}
 		return "failed"
 	}
 	if result.WarnCount > 0 {
@@ -505,6 +708,7 @@ func (s *adminServiceImpl) saveProxyQualitySnapshot(ctx context.Context, proxyID
 		QualitySummary:   result.Summary,
 		QualityCheckedAt: &checkedAt,
 		QualityCFRay:     proxyQualityFirstCFRay(result),
+		QualityEngine:    proxyQualityEngineVersion,
 		UpdatedAt:        time.Now(),
 	}
 	if result.BaseLatencyMs > 0 {
@@ -525,7 +729,17 @@ func (s *adminServiceImpl) probeProxyLatency(ctx context.Context, proxy *Proxy) 
 	if s.proxyProber == nil || proxy == nil {
 		return
 	}
-	exitInfo, latencyMs, err := s.proxyProber.ProbeProxy(ctx, proxy.URL())
+	proxyURL, cleanup, resolveErr := resolveProxyProbeURL(ctx, s.proxyProbeResolver, proxy)
+	if resolveErr != nil {
+		s.saveProxyLatency(ctx, proxy.ID, &ProxyLatencyInfo{
+			Success:   false,
+			Message:   logredact.RedactText(resolveErr.Error()),
+			UpdatedAt: time.Now(),
+		})
+		return
+	}
+	defer cleanup()
+	exitInfo, latencyMs, err := s.proxyProber.ProbeProxy(ctx, proxyURL)
 	if err != nil {
 		s.saveProxyLatency(ctx, proxy.ID, &ProxyLatencyInfo{
 			Success:   false,
@@ -582,11 +796,13 @@ func (s *adminServiceImpl) attachProxyLatency(ctx context.Context, proxies []Pro
 		proxies[i].CountryCode = info.CountryCode
 		proxies[i].Region = info.Region
 		proxies[i].City = info.City
-		proxies[i].QualityStatus = info.QualityStatus
-		proxies[i].QualityScore = info.QualityScore
-		proxies[i].QualityGrade = info.QualityGrade
-		proxies[i].QualitySummary = info.QualitySummary
-		proxies[i].QualityChecked = info.QualityCheckedAt
+		if hasCurrentProxyQuality(info) {
+			proxies[i].QualityStatus = info.QualityStatus
+			proxies[i].QualityScore = info.QualityScore
+			proxies[i].QualityGrade = info.QualityGrade
+			proxies[i].QualitySummary = info.QualitySummary
+			proxies[i].QualityChecked = info.QualityCheckedAt
+		}
 	}
 }
 
@@ -610,6 +826,7 @@ func (s *adminServiceImpl) saveProxyLatency(ctx context.Context, proxyID int64, 
 				merged.QualitySummary = existing.QualitySummary
 				merged.QualityCheckedAt = existing.QualityCheckedAt
 				merged.QualityCFRay = existing.QualityCFRay
+				merged.QualityEngine = existing.QualityEngine
 			}
 		}
 	}

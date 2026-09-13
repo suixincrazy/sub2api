@@ -14,6 +14,7 @@ import (
 	"github.com/Wei-Shaw/sub2api/ent/group"
 	"github.com/Wei-Shaw/sub2api/ent/predicate"
 	"github.com/Wei-Shaw/sub2api/ent/redeemcode"
+	"github.com/Wei-Shaw/sub2api/ent/redeemcodeusage"
 	"github.com/Wei-Shaw/sub2api/ent/user"
 )
 
@@ -41,6 +42,33 @@ func (_u *RedeemCodeUpdate) SetNillableCode(v *string) *RedeemCodeUpdate {
 	if v != nil {
 		_u.SetCode(*v)
 	}
+	return _u
+}
+
+// SetOwnerUserID sets the "owner_user_id" field.
+func (_u *RedeemCodeUpdate) SetOwnerUserID(v int64) *RedeemCodeUpdate {
+	_u.mutation.ResetOwnerUserID()
+	_u.mutation.SetOwnerUserID(v)
+	return _u
+}
+
+// SetNillableOwnerUserID sets the "owner_user_id" field if the given value is not nil.
+func (_u *RedeemCodeUpdate) SetNillableOwnerUserID(v *int64) *RedeemCodeUpdate {
+	if v != nil {
+		_u.SetOwnerUserID(*v)
+	}
+	return _u
+}
+
+// AddOwnerUserID adds value to the "owner_user_id" field.
+func (_u *RedeemCodeUpdate) AddOwnerUserID(v int64) *RedeemCodeUpdate {
+	_u.mutation.AddOwnerUserID(v)
+	return _u
+}
+
+// ClearOwnerUserID clears the value of the "owner_user_id" field.
+func (_u *RedeemCodeUpdate) ClearOwnerUserID() *RedeemCodeUpdate {
+	_u.mutation.ClearOwnerUserID()
 	return _u
 }
 
@@ -214,6 +242,48 @@ func (_u *RedeemCodeUpdate) AddValidityDays(v int) *RedeemCodeUpdate {
 	return _u
 }
 
+// SetMaxUses sets the "max_uses" field.
+func (_u *RedeemCodeUpdate) SetMaxUses(v int) *RedeemCodeUpdate {
+	_u.mutation.ResetMaxUses()
+	_u.mutation.SetMaxUses(v)
+	return _u
+}
+
+// SetNillableMaxUses sets the "max_uses" field if the given value is not nil.
+func (_u *RedeemCodeUpdate) SetNillableMaxUses(v *int) *RedeemCodeUpdate {
+	if v != nil {
+		_u.SetMaxUses(*v)
+	}
+	return _u
+}
+
+// AddMaxUses adds value to the "max_uses" field.
+func (_u *RedeemCodeUpdate) AddMaxUses(v int) *RedeemCodeUpdate {
+	_u.mutation.AddMaxUses(v)
+	return _u
+}
+
+// SetUsedCount sets the "used_count" field.
+func (_u *RedeemCodeUpdate) SetUsedCount(v int) *RedeemCodeUpdate {
+	_u.mutation.ResetUsedCount()
+	_u.mutation.SetUsedCount(v)
+	return _u
+}
+
+// SetNillableUsedCount sets the "used_count" field if the given value is not nil.
+func (_u *RedeemCodeUpdate) SetNillableUsedCount(v *int) *RedeemCodeUpdate {
+	if v != nil {
+		_u.SetUsedCount(*v)
+	}
+	return _u
+}
+
+// AddUsedCount adds value to the "used_count" field.
+func (_u *RedeemCodeUpdate) AddUsedCount(v int) *RedeemCodeUpdate {
+	_u.mutation.AddUsedCount(v)
+	return _u
+}
+
 // SetUserID sets the "user" edge to the User entity by ID.
 func (_u *RedeemCodeUpdate) SetUserID(id int64) *RedeemCodeUpdate {
 	_u.mutation.SetUserID(id)
@@ -238,6 +308,21 @@ func (_u *RedeemCodeUpdate) SetGroup(v *Group) *RedeemCodeUpdate {
 	return _u.SetGroupID(v.ID)
 }
 
+// AddUsageRecordIDs adds the "usage_records" edge to the RedeemCodeUsage entity by IDs.
+func (_u *RedeemCodeUpdate) AddUsageRecordIDs(ids ...int64) *RedeemCodeUpdate {
+	_u.mutation.AddUsageRecordIDs(ids...)
+	return _u
+}
+
+// AddUsageRecords adds the "usage_records" edges to the RedeemCodeUsage entity.
+func (_u *RedeemCodeUpdate) AddUsageRecords(v ...*RedeemCodeUsage) *RedeemCodeUpdate {
+	ids := make([]int64, len(v))
+	for i := range v {
+		ids[i] = v[i].ID
+	}
+	return _u.AddUsageRecordIDs(ids...)
+}
+
 // Mutation returns the RedeemCodeMutation object of the builder.
 func (_u *RedeemCodeUpdate) Mutation() *RedeemCodeMutation {
 	return _u.mutation
@@ -253,6 +338,27 @@ func (_u *RedeemCodeUpdate) ClearUser() *RedeemCodeUpdate {
 func (_u *RedeemCodeUpdate) ClearGroup() *RedeemCodeUpdate {
 	_u.mutation.ClearGroup()
 	return _u
+}
+
+// ClearUsageRecords clears all "usage_records" edges to the RedeemCodeUsage entity.
+func (_u *RedeemCodeUpdate) ClearUsageRecords() *RedeemCodeUpdate {
+	_u.mutation.ClearUsageRecords()
+	return _u
+}
+
+// RemoveUsageRecordIDs removes the "usage_records" edge to RedeemCodeUsage entities by IDs.
+func (_u *RedeemCodeUpdate) RemoveUsageRecordIDs(ids ...int64) *RedeemCodeUpdate {
+	_u.mutation.RemoveUsageRecordIDs(ids...)
+	return _u
+}
+
+// RemoveUsageRecords removes "usage_records" edges to RedeemCodeUsage entities.
+func (_u *RedeemCodeUpdate) RemoveUsageRecords(v ...*RedeemCodeUsage) *RedeemCodeUpdate {
+	ids := make([]int64, len(v))
+	for i := range v {
+		ids[i] = v[i].ID
+	}
+	return _u.RemoveUsageRecordIDs(ids...)
 }
 
 // Save executes the query and returns the number of nodes affected by the update operation.
@@ -317,6 +423,15 @@ func (_u *RedeemCodeUpdate) sqlSave(ctx context.Context) (_node int, err error) 
 	if value, ok := _u.mutation.Code(); ok {
 		_spec.SetField(redeemcode.FieldCode, field.TypeString, value)
 	}
+	if value, ok := _u.mutation.OwnerUserID(); ok {
+		_spec.SetField(redeemcode.FieldOwnerUserID, field.TypeInt64, value)
+	}
+	if value, ok := _u.mutation.AddedOwnerUserID(); ok {
+		_spec.AddField(redeemcode.FieldOwnerUserID, field.TypeInt64, value)
+	}
+	if _u.mutation.OwnerUserIDCleared() {
+		_spec.ClearField(redeemcode.FieldOwnerUserID, field.TypeInt64)
+	}
 	if value, ok := _u.mutation.GetType(); ok {
 		_spec.SetField(redeemcode.FieldType, field.TypeString, value)
 	}
@@ -352,6 +467,18 @@ func (_u *RedeemCodeUpdate) sqlSave(ctx context.Context) (_node int, err error) 
 	}
 	if value, ok := _u.mutation.AddedValidityDays(); ok {
 		_spec.AddField(redeemcode.FieldValidityDays, field.TypeInt, value)
+	}
+	if value, ok := _u.mutation.MaxUses(); ok {
+		_spec.SetField(redeemcode.FieldMaxUses, field.TypeInt, value)
+	}
+	if value, ok := _u.mutation.AddedMaxUses(); ok {
+		_spec.AddField(redeemcode.FieldMaxUses, field.TypeInt, value)
+	}
+	if value, ok := _u.mutation.UsedCount(); ok {
+		_spec.SetField(redeemcode.FieldUsedCount, field.TypeInt, value)
+	}
+	if value, ok := _u.mutation.AddedUsedCount(); ok {
+		_spec.AddField(redeemcode.FieldUsedCount, field.TypeInt, value)
 	}
 	if _u.mutation.UserCleared() {
 		edge := &sqlgraph.EdgeSpec{
@@ -411,6 +538,51 @@ func (_u *RedeemCodeUpdate) sqlSave(ctx context.Context) (_node int, err error) 
 		}
 		_spec.Edges.Add = append(_spec.Edges.Add, edge)
 	}
+	if _u.mutation.UsageRecordsCleared() {
+		edge := &sqlgraph.EdgeSpec{
+			Rel:     sqlgraph.O2M,
+			Inverse: false,
+			Table:   redeemcode.UsageRecordsTable,
+			Columns: []string{redeemcode.UsageRecordsColumn},
+			Bidi:    false,
+			Target: &sqlgraph.EdgeTarget{
+				IDSpec: sqlgraph.NewFieldSpec(redeemcodeusage.FieldID, field.TypeInt64),
+			},
+		}
+		_spec.Edges.Clear = append(_spec.Edges.Clear, edge)
+	}
+	if nodes := _u.mutation.RemovedUsageRecordsIDs(); len(nodes) > 0 && !_u.mutation.UsageRecordsCleared() {
+		edge := &sqlgraph.EdgeSpec{
+			Rel:     sqlgraph.O2M,
+			Inverse: false,
+			Table:   redeemcode.UsageRecordsTable,
+			Columns: []string{redeemcode.UsageRecordsColumn},
+			Bidi:    false,
+			Target: &sqlgraph.EdgeTarget{
+				IDSpec: sqlgraph.NewFieldSpec(redeemcodeusage.FieldID, field.TypeInt64),
+			},
+		}
+		for _, k := range nodes {
+			edge.Target.Nodes = append(edge.Target.Nodes, k)
+		}
+		_spec.Edges.Clear = append(_spec.Edges.Clear, edge)
+	}
+	if nodes := _u.mutation.UsageRecordsIDs(); len(nodes) > 0 {
+		edge := &sqlgraph.EdgeSpec{
+			Rel:     sqlgraph.O2M,
+			Inverse: false,
+			Table:   redeemcode.UsageRecordsTable,
+			Columns: []string{redeemcode.UsageRecordsColumn},
+			Bidi:    false,
+			Target: &sqlgraph.EdgeTarget{
+				IDSpec: sqlgraph.NewFieldSpec(redeemcodeusage.FieldID, field.TypeInt64),
+			},
+		}
+		for _, k := range nodes {
+			edge.Target.Nodes = append(edge.Target.Nodes, k)
+		}
+		_spec.Edges.Add = append(_spec.Edges.Add, edge)
+	}
 	if _node, err = sqlgraph.UpdateNodes(ctx, _u.driver, _spec); err != nil {
 		if _, ok := err.(*sqlgraph.NotFoundError); ok {
 			err = &NotFoundError{redeemcode.Label}
@@ -442,6 +614,33 @@ func (_u *RedeemCodeUpdateOne) SetNillableCode(v *string) *RedeemCodeUpdateOne {
 	if v != nil {
 		_u.SetCode(*v)
 	}
+	return _u
+}
+
+// SetOwnerUserID sets the "owner_user_id" field.
+func (_u *RedeemCodeUpdateOne) SetOwnerUserID(v int64) *RedeemCodeUpdateOne {
+	_u.mutation.ResetOwnerUserID()
+	_u.mutation.SetOwnerUserID(v)
+	return _u
+}
+
+// SetNillableOwnerUserID sets the "owner_user_id" field if the given value is not nil.
+func (_u *RedeemCodeUpdateOne) SetNillableOwnerUserID(v *int64) *RedeemCodeUpdateOne {
+	if v != nil {
+		_u.SetOwnerUserID(*v)
+	}
+	return _u
+}
+
+// AddOwnerUserID adds value to the "owner_user_id" field.
+func (_u *RedeemCodeUpdateOne) AddOwnerUserID(v int64) *RedeemCodeUpdateOne {
+	_u.mutation.AddOwnerUserID(v)
+	return _u
+}
+
+// ClearOwnerUserID clears the value of the "owner_user_id" field.
+func (_u *RedeemCodeUpdateOne) ClearOwnerUserID() *RedeemCodeUpdateOne {
+	_u.mutation.ClearOwnerUserID()
 	return _u
 }
 
@@ -615,6 +814,48 @@ func (_u *RedeemCodeUpdateOne) AddValidityDays(v int) *RedeemCodeUpdateOne {
 	return _u
 }
 
+// SetMaxUses sets the "max_uses" field.
+func (_u *RedeemCodeUpdateOne) SetMaxUses(v int) *RedeemCodeUpdateOne {
+	_u.mutation.ResetMaxUses()
+	_u.mutation.SetMaxUses(v)
+	return _u
+}
+
+// SetNillableMaxUses sets the "max_uses" field if the given value is not nil.
+func (_u *RedeemCodeUpdateOne) SetNillableMaxUses(v *int) *RedeemCodeUpdateOne {
+	if v != nil {
+		_u.SetMaxUses(*v)
+	}
+	return _u
+}
+
+// AddMaxUses adds value to the "max_uses" field.
+func (_u *RedeemCodeUpdateOne) AddMaxUses(v int) *RedeemCodeUpdateOne {
+	_u.mutation.AddMaxUses(v)
+	return _u
+}
+
+// SetUsedCount sets the "used_count" field.
+func (_u *RedeemCodeUpdateOne) SetUsedCount(v int) *RedeemCodeUpdateOne {
+	_u.mutation.ResetUsedCount()
+	_u.mutation.SetUsedCount(v)
+	return _u
+}
+
+// SetNillableUsedCount sets the "used_count" field if the given value is not nil.
+func (_u *RedeemCodeUpdateOne) SetNillableUsedCount(v *int) *RedeemCodeUpdateOne {
+	if v != nil {
+		_u.SetUsedCount(*v)
+	}
+	return _u
+}
+
+// AddUsedCount adds value to the "used_count" field.
+func (_u *RedeemCodeUpdateOne) AddUsedCount(v int) *RedeemCodeUpdateOne {
+	_u.mutation.AddUsedCount(v)
+	return _u
+}
+
 // SetUserID sets the "user" edge to the User entity by ID.
 func (_u *RedeemCodeUpdateOne) SetUserID(id int64) *RedeemCodeUpdateOne {
 	_u.mutation.SetUserID(id)
@@ -639,6 +880,21 @@ func (_u *RedeemCodeUpdateOne) SetGroup(v *Group) *RedeemCodeUpdateOne {
 	return _u.SetGroupID(v.ID)
 }
 
+// AddUsageRecordIDs adds the "usage_records" edge to the RedeemCodeUsage entity by IDs.
+func (_u *RedeemCodeUpdateOne) AddUsageRecordIDs(ids ...int64) *RedeemCodeUpdateOne {
+	_u.mutation.AddUsageRecordIDs(ids...)
+	return _u
+}
+
+// AddUsageRecords adds the "usage_records" edges to the RedeemCodeUsage entity.
+func (_u *RedeemCodeUpdateOne) AddUsageRecords(v ...*RedeemCodeUsage) *RedeemCodeUpdateOne {
+	ids := make([]int64, len(v))
+	for i := range v {
+		ids[i] = v[i].ID
+	}
+	return _u.AddUsageRecordIDs(ids...)
+}
+
 // Mutation returns the RedeemCodeMutation object of the builder.
 func (_u *RedeemCodeUpdateOne) Mutation() *RedeemCodeMutation {
 	return _u.mutation
@@ -654,6 +910,27 @@ func (_u *RedeemCodeUpdateOne) ClearUser() *RedeemCodeUpdateOne {
 func (_u *RedeemCodeUpdateOne) ClearGroup() *RedeemCodeUpdateOne {
 	_u.mutation.ClearGroup()
 	return _u
+}
+
+// ClearUsageRecords clears all "usage_records" edges to the RedeemCodeUsage entity.
+func (_u *RedeemCodeUpdateOne) ClearUsageRecords() *RedeemCodeUpdateOne {
+	_u.mutation.ClearUsageRecords()
+	return _u
+}
+
+// RemoveUsageRecordIDs removes the "usage_records" edge to RedeemCodeUsage entities by IDs.
+func (_u *RedeemCodeUpdateOne) RemoveUsageRecordIDs(ids ...int64) *RedeemCodeUpdateOne {
+	_u.mutation.RemoveUsageRecordIDs(ids...)
+	return _u
+}
+
+// RemoveUsageRecords removes "usage_records" edges to RedeemCodeUsage entities.
+func (_u *RedeemCodeUpdateOne) RemoveUsageRecords(v ...*RedeemCodeUsage) *RedeemCodeUpdateOne {
+	ids := make([]int64, len(v))
+	for i := range v {
+		ids[i] = v[i].ID
+	}
+	return _u.RemoveUsageRecordIDs(ids...)
 }
 
 // Where appends a list predicates to the RedeemCodeUpdate builder.
@@ -748,6 +1025,15 @@ func (_u *RedeemCodeUpdateOne) sqlSave(ctx context.Context) (_node *RedeemCode, 
 	if value, ok := _u.mutation.Code(); ok {
 		_spec.SetField(redeemcode.FieldCode, field.TypeString, value)
 	}
+	if value, ok := _u.mutation.OwnerUserID(); ok {
+		_spec.SetField(redeemcode.FieldOwnerUserID, field.TypeInt64, value)
+	}
+	if value, ok := _u.mutation.AddedOwnerUserID(); ok {
+		_spec.AddField(redeemcode.FieldOwnerUserID, field.TypeInt64, value)
+	}
+	if _u.mutation.OwnerUserIDCleared() {
+		_spec.ClearField(redeemcode.FieldOwnerUserID, field.TypeInt64)
+	}
 	if value, ok := _u.mutation.GetType(); ok {
 		_spec.SetField(redeemcode.FieldType, field.TypeString, value)
 	}
@@ -783,6 +1069,18 @@ func (_u *RedeemCodeUpdateOne) sqlSave(ctx context.Context) (_node *RedeemCode, 
 	}
 	if value, ok := _u.mutation.AddedValidityDays(); ok {
 		_spec.AddField(redeemcode.FieldValidityDays, field.TypeInt, value)
+	}
+	if value, ok := _u.mutation.MaxUses(); ok {
+		_spec.SetField(redeemcode.FieldMaxUses, field.TypeInt, value)
+	}
+	if value, ok := _u.mutation.AddedMaxUses(); ok {
+		_spec.AddField(redeemcode.FieldMaxUses, field.TypeInt, value)
+	}
+	if value, ok := _u.mutation.UsedCount(); ok {
+		_spec.SetField(redeemcode.FieldUsedCount, field.TypeInt, value)
+	}
+	if value, ok := _u.mutation.AddedUsedCount(); ok {
+		_spec.AddField(redeemcode.FieldUsedCount, field.TypeInt, value)
 	}
 	if _u.mutation.UserCleared() {
 		edge := &sqlgraph.EdgeSpec{
@@ -835,6 +1133,51 @@ func (_u *RedeemCodeUpdateOne) sqlSave(ctx context.Context) (_node *RedeemCode, 
 			Bidi:    false,
 			Target: &sqlgraph.EdgeTarget{
 				IDSpec: sqlgraph.NewFieldSpec(group.FieldID, field.TypeInt64),
+			},
+		}
+		for _, k := range nodes {
+			edge.Target.Nodes = append(edge.Target.Nodes, k)
+		}
+		_spec.Edges.Add = append(_spec.Edges.Add, edge)
+	}
+	if _u.mutation.UsageRecordsCleared() {
+		edge := &sqlgraph.EdgeSpec{
+			Rel:     sqlgraph.O2M,
+			Inverse: false,
+			Table:   redeemcode.UsageRecordsTable,
+			Columns: []string{redeemcode.UsageRecordsColumn},
+			Bidi:    false,
+			Target: &sqlgraph.EdgeTarget{
+				IDSpec: sqlgraph.NewFieldSpec(redeemcodeusage.FieldID, field.TypeInt64),
+			},
+		}
+		_spec.Edges.Clear = append(_spec.Edges.Clear, edge)
+	}
+	if nodes := _u.mutation.RemovedUsageRecordsIDs(); len(nodes) > 0 && !_u.mutation.UsageRecordsCleared() {
+		edge := &sqlgraph.EdgeSpec{
+			Rel:     sqlgraph.O2M,
+			Inverse: false,
+			Table:   redeemcode.UsageRecordsTable,
+			Columns: []string{redeemcode.UsageRecordsColumn},
+			Bidi:    false,
+			Target: &sqlgraph.EdgeTarget{
+				IDSpec: sqlgraph.NewFieldSpec(redeemcodeusage.FieldID, field.TypeInt64),
+			},
+		}
+		for _, k := range nodes {
+			edge.Target.Nodes = append(edge.Target.Nodes, k)
+		}
+		_spec.Edges.Clear = append(_spec.Edges.Clear, edge)
+	}
+	if nodes := _u.mutation.UsageRecordsIDs(); len(nodes) > 0 {
+		edge := &sqlgraph.EdgeSpec{
+			Rel:     sqlgraph.O2M,
+			Inverse: false,
+			Table:   redeemcode.UsageRecordsTable,
+			Columns: []string{redeemcode.UsageRecordsColumn},
+			Bidi:    false,
+			Target: &sqlgraph.EdgeTarget{
+				IDSpec: sqlgraph.NewFieldSpec(redeemcodeusage.FieldID, field.TypeInt64),
 			},
 		}
 		for _, k := range nodes {

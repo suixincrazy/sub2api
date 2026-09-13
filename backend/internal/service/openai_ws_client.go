@@ -13,6 +13,7 @@ import (
 	"time"
 
 	openaiwsv2 "github.com/Wei-Shaw/sub2api/internal/service/openai_ws_v2"
+	"github.com/Wei-Shaw/sub2api/internal/util/urlvalidator"
 	coderws "github.com/coder/websocket"
 	"github.com/coder/websocket/wsjson"
 )
@@ -78,6 +79,10 @@ func newDefaultOpenAIWSClientDialer() openAIWSClientDialer {
 	}
 }
 
+func withOpenAIWSNetworkPolicy(ctx context.Context, account *Account, proxyURL string) context.Context {
+	return WithHTTPUpstreamNetworkPolicy(ctx, HTTPUpstreamNetworkPolicyForAccount(account, proxyURL))
+}
+
 type coderOpenAIWSClientDialer struct {
 	proxyMu      sync.Mutex
 	proxyClients map[string]*openAIWSProxyClientEntry
@@ -132,12 +137,15 @@ func (d *coderOpenAIWSClientDialer) Dial(
 			return true
 		},
 	}
+	policy := HTTPUpstreamNetworkPolicyFromContext(ctx)
 	if proxy := strings.TrimSpace(proxyURL); proxy != "" {
-		proxyClient, err := d.proxyHTTPClient(proxy)
+		proxyClient, err := d.proxyHTTPClient(proxy, policy)
 		if err != nil {
 			return nil, 0, nil, err
 		}
 		opts.HTTPClient = proxyClient
+	} else if policy.PublicOnly {
+		opts.HTTPClient = &http.Client{Transport: newOpenAIWSHTTPTransport(nil, policy)}
 	}
 
 	conn, resp, err := coderws.Dial(ctx, targetURL, opts)
@@ -166,7 +174,7 @@ func (d *coderOpenAIWSClientDialer) Dial(
 	return wrapped, 0, respHeaders, nil
 }
 
-func (d *coderOpenAIWSClientDialer) proxyHTTPClient(proxy string) (*http.Client, error) {
+func (d *coderOpenAIWSClientDialer) proxyHTTPClient(proxy string, policies ...HTTPUpstreamNetworkPolicy) (*http.Client, error) {
 	if d == nil {
 		return nil, errors.New("openai ws dialer is nil")
 	}
@@ -178,32 +186,49 @@ func (d *coderOpenAIWSClientDialer) proxyHTTPClient(proxy string) (*http.Client,
 	if err != nil {
 		return nil, fmt.Errorf("invalid proxy url: %w", err)
 	}
+	policy := HTTPUpstreamNetworkPolicy{}
+	if len(policies) > 0 {
+		policy = policies[0]
+	}
+	cacheKey := normalizedProxy
+	if policyKey := policy.CacheKey(); policyKey != "" {
+		cacheKey += ":" + policyKey
+	}
 	now := time.Now().UnixNano()
 
 	d.proxyMu.Lock()
 	defer d.proxyMu.Unlock()
-	if entry, ok := d.proxyClients[normalizedProxy]; ok && entry != nil && entry.client != nil {
+	if entry, ok := d.proxyClients[cacheKey]; ok && entry != nil && entry.client != nil {
 		entry.lastUsedUnixNano = now
 		d.proxyHits.Add(1)
 		return entry.client, nil
 	}
 	d.cleanupProxyClientsLocked(now)
-	transport := &http.Transport{
-		Proxy:               http.ProxyURL(parsedProxyURL),
-		MaxIdleConns:        openAIWSProxyTransportMaxIdleConns,
-		MaxIdleConnsPerHost: openAIWSProxyTransportMaxIdleConnsPerHost,
-		IdleConnTimeout:     openAIWSProxyTransportIdleConnTimeout,
-		TLSHandshakeTimeout: 10 * time.Second,
-		ForceAttemptHTTP2:   true,
-	}
-	client := &http.Client{Transport: transport}
-	d.proxyClients[normalizedProxy] = &openAIWSProxyClientEntry{
+	client := &http.Client{Transport: newOpenAIWSHTTPTransport(parsedProxyURL, policy)}
+	d.proxyClients[cacheKey] = &openAIWSProxyClientEntry{
 		client:           client,
 		lastUsedUnixNano: now,
 	}
 	d.ensureProxyClientCapacityLocked()
 	d.proxyMisses.Add(1)
 	return client, nil
+}
+
+func newOpenAIWSHTTPTransport(proxyURL *url.URL, policy HTTPUpstreamNetworkPolicy) *http.Transport {
+	transport := &http.Transport{
+		MaxIdleConns:        openAIWSProxyTransportMaxIdleConns,
+		MaxIdleConnsPerHost: openAIWSProxyTransportMaxIdleConnsPerHost,
+		IdleConnTimeout:     openAIWSProxyTransportIdleConnTimeout,
+		TLSHandshakeTimeout: 10 * time.Second,
+		ForceAttemptHTTP2:   true,
+	}
+	if proxyURL != nil {
+		transport.Proxy = http.ProxyURL(proxyURL)
+	}
+	if policy.PublicOnly {
+		transport.DialContext = urlvalidator.NewPublicOnlyDialer(policy.AllowedDialAddresses).DialContext
+	}
+	return transport
 }
 
 func (d *coderOpenAIWSClientDialer) cleanupProxyClientsLocked(nowUnixNano int64) {

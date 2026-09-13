@@ -224,6 +224,17 @@ func (s *UserResourceService) normalizeAndValidateGroupPayload(ctx context.Conte
 		}
 		payload["models_list_config"] = normalizeGroupModelsListConfig(cfg)
 	}
+	if raw, ok := payload["model_allowlist"]; ok {
+		var cfg GroupModelAllowlist
+		if err := decodeResourceJSON(raw, &cfg); err != nil {
+			return invalidUserResourceField("model_allowlist", "is malformed")
+		}
+		normalized, err := normalizeGroupModelAllowlist(cfg)
+		if err != nil {
+			return err
+		}
+		payload["model_allowlist"] = normalized
+	}
 
 	return s.validateGroupStateReferences(ctx, ownerID, groupID, platform, subscriptionType, state, payload)
 }

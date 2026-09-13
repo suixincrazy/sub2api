@@ -15,6 +15,33 @@ type accountRepoStubForCompositeModelsList struct {
 	accounts []Account
 }
 
+type accountRepoStubForCompositeAssignment struct {
+	*accountRepoStubForBulkUpdate
+}
+
+func (s *accountRepoStubForCompositeAssignment) CreateWithAccountGroups(ctx context.Context, account *Account, groups []AccountGroup) error {
+	if err := s.Create(ctx, account); err != nil {
+		return err
+	}
+	groupIDs := make([]int64, 0, len(groups))
+	for _, group := range groups {
+		groupIDs = append(groupIDs, group.GroupID)
+	}
+	account.GroupIDs = append([]int64(nil), groupIDs...)
+	account.AccountGroups = append([]AccountGroup(nil), groups...)
+	return s.BindGroups(ctx, account.ID, groupIDs)
+}
+
+func (s *accountRepoStubForCompositeAssignment) UpdateAccountWithGroupsAtomically(ctx context.Context, account *Account, groupIDs []int64, _ *bool) error {
+	committed := *account
+	committed.GroupIDs = append([]int64(nil), groupIDs...)
+	committed.AccountGroups = accountGroupsFromIDs(groupIDs)
+	if err := s.Update(ctx, &committed); err != nil {
+		return err
+	}
+	return s.BindGroups(ctx, account.ID, groupIDs)
+}
+
 func (s *accountRepoStubForCompositeModelsList) ListSchedulableByGroupID(_ context.Context, _ int64) ([]Account, error) {
 	return s.accounts, nil
 }
@@ -114,7 +141,9 @@ func TestAdminService_UpdateCompositeGroupCopiesAccountsFromConcreteGroups(t *te
 }
 
 func TestAdminService_CreateAccountAllowsCompositeGroupAssignment(t *testing.T) {
-	accountRepo := &accountRepoStubForBulkUpdate{createID: 7}
+	accountRepo := &accountRepoStubForCompositeAssignment{
+		accountRepoStubForBulkUpdate: &accountRepoStubForBulkUpdate{createID: 7},
+	}
 	groupRepo := &groupRepoStubForAdmin{
 		getByIDByID: map[int64]*Group{
 			99: {ID: 99, Platform: PlatformComposite},
@@ -139,9 +168,11 @@ func TestAdminService_CreateAccountAllowsCompositeGroupAssignment(t *testing.T) 
 }
 
 func TestAdminService_UpdateAccountAllowsCompositeGroupAssignment(t *testing.T) {
-	accountRepo := &accountRepoStubForBulkUpdate{
-		getByIDAccounts: map[int64]*Account{
-			7: {ID: 7, Platform: PlatformGemini, Type: AccountTypeAPIKey, Status: StatusActive, Extra: map[string]any{}},
+	accountRepo := &accountRepoStubForCompositeAssignment{
+		accountRepoStubForBulkUpdate: &accountRepoStubForBulkUpdate{
+			getByIDAccounts: map[int64]*Account{
+				7: {ID: 7, Platform: PlatformGemini, Type: AccountTypeAPIKey, Status: StatusActive, Extra: map[string]any{}},
+			},
 		},
 	}
 	groupRepo := &groupRepoStubForAdmin{

@@ -35,6 +35,7 @@ backend/.gocache/
 node_modules/
 frontend/node_modules/
 frontend/dist/
+/.pnpm-store/
 *.local
 *.tsbuildinfo
 vite.config.d.ts
@@ -113,6 +114,30 @@ backend/config.yaml
 deploy/config.yaml
 backend/.installed
 
+# 任意位置的运行时配置文件（可能含数据库口令、上游密钥、支付密钥）
+config.yaml
+config.yml
+config.local.yaml
+config.local.yml
+# openspec/config.yaml 是已跟踪的规格文件，不含敏感信息，保持可提交
+!openspec/config.yaml
+
+# 证书、私钥与密钥库（一律不进仓库；示例请用 *.example）
+*.pem
+*.key
+*.crt
+*.cer
+*.der
+*.p12
+*.pfx
+*.jks
+*.keystore
+*.ppk
+id_rsa
+id_rsa.*
+id_ed25519
+id_ed25519.*
+
 # ===================
 # 其他
 # ===================
@@ -143,6 +168,8 @@ docs/*
 !docs/channel-monitor-v2-safe-defaults.md
 !docs/legal/
 !docs/legal/*.md
+!docs/releases/
+!docs/releases/*.md
 !docs/screenshots/
 docs/screenshots/*
 !docs/screenshots/mobile-account-actions-menu.png
@@ -153,6 +180,9 @@ aicodex
 output/
 .codegraph/
 
+# Local review/deployment artifacts (may contain environment-specific data)
+/artifacts/
+/deploy/docker-compose.review.yml
 # Vitest / Vite cache at repo root
 .vite/
 # 本地闭源插件开发目录及构建产物不进入 Sub2API 仓库

@@ -13,6 +13,7 @@
             <input
               v-model="searchQuery"
               type="text"
+              data-test="admin-proxy-search-input"
               :placeholder="t('admin.proxies.searchProxies')"
               class="input pl-10"
               @input="handleSearch"
@@ -24,7 +25,8 @@
               v-model="filters.protocol"
               :options="protocolOptions"
               :placeholder="t('admin.proxies.allProtocols')"
-              @change="handleFilterChange"
+              data-test="admin-proxy-protocol-filter"
+              @change="loadProxies"
             />
           </div>
           <div class="w-full sm:w-36">
@@ -32,12 +34,31 @@
               v-model="filters.status"
               :options="statusOptions"
               :placeholder="t('admin.proxies.allStatus')"
-              @change="handleFilterChange"
+              data-test="admin-proxy-status-filter"
+              @change="loadProxies"
+            />
+          </div>
+          <div class="w-full sm:w-40">
+            <Select
+              v-model="filters.owner_scope"
+              :options="ownerScopeOptions"
+              :placeholder="t('admin.proxies.allResourceOwners')"
+              data-test="admin-proxy-owner-scope-filter"
+              @change="loadProxies"
+            />
+          </div>
+          <div v-if="proxySourceFilterOptions.length > 1" class="w-full sm:w-44">
+            <Select
+              v-model="filters.source_id"
+              :options="proxySourceFilterOptions"
+              :placeholder="t('admin.proxies.allSources')"
+              data-test="admin-proxy-source-filter"
+              @change="loadProxies"
             />
           </div>
 
           <!-- Right: All action buttons -->
-          <div class="flex flex-1 flex-wrap items-center justify-end gap-2">
+          <div class="flex w-full grow flex-wrap items-center justify-end gap-2 whitespace-nowrap lg:w-auto">
             <button
               @click="loadProxies"
               :disabled="loading"
@@ -47,9 +68,19 @@
               <Icon name="refresh" size="md" :class="loading ? 'animate-spin' : ''" />
             </button>
             <button
+              type="button"
+              class="btn btn-secondary"
+              data-test="admin-proxy-source-manager-button"
+              @click="openProxySourcesModal"
+            >
+              <Icon name="cloud" size="md" class="mr-2" />
+              {{ t('admin.proxies.sourceManager') }}
+            </button>
+            <button
               @click="handleBatchTest"
               :disabled="batchTesting || loading"
               class="btn btn-secondary"
+              data-test="admin-proxy-batch-test-button"
               :title="t('admin.proxies.testConnection')"
             >
               <Icon name="play" size="md" class="mr-2" />
@@ -59,6 +90,7 @@
               @click="handleBatchQualityCheck"
               :disabled="batchQualityChecking || loading"
               class="btn btn-secondary"
+              data-test="admin-proxy-batch-quality-button"
               :title="t('admin.proxies.batchQualityCheck')"
             >
               <Icon name="shield" size="md" class="mr-2" :class="batchQualityChecking ? 'animate-pulse' : ''" />
@@ -79,7 +111,11 @@
             <button @click="showExportDataDialog = true" class="btn btn-secondary">
               {{ selectedCount > 0 ? t('admin.proxies.dataExportSelected') : t('admin.proxies.dataExport') }}
             </button>
-            <button @click="showCreateModal = true" class="btn btn-primary">
+            <button
+              class="btn btn-primary"
+              data-test="admin-proxy-create-button"
+              @click="showCreateModal = true"
+            >
               <Icon name="plus" size="md" class="mr-2" />
               {{ t('admin.proxies.createProxy') }}
             </button>
@@ -120,6 +156,27 @@
 
           <template #cell-name="{ value }">
             <span class="font-medium text-gray-900 dark:text-white">{{ value }}</span>
+          </template>
+
+          <template #cell-owner_user_id="{ row }">
+            <span v-if="row.owner_user_id" class="font-mono text-xs text-primary-600 dark:text-primary-400">
+              {{ t('admin.proxies.userResourceOwner', { id: row.owner_user_id }) }}
+            </span>
+            <span v-else class="text-xs text-gray-500 dark:text-gray-400">
+              {{ t('admin.proxies.systemResource') }}
+            </span>
+          </template>
+
+          <template #cell-visibility="{ row }">
+            <span :class="['badge', row.is_public ? 'badge-success' : 'badge-gray']">
+              {{ row.is_public ? t('admin.proxies.publicResource') : t('admin.proxies.privateResource') }}
+            </span>
+          </template>
+
+          <template #cell-kind="{ value }">
+            <span :class="['badge', value === 'xray' ? 'badge-primary' : 'badge-gray']">
+              {{ value === 'xray' ? 'Xray' : t('admin.proxies.standardProxy') }}
+            </span>
           </template>
 
           <template #cell-protocol="{ value }">
@@ -166,15 +223,18 @@
           <template #cell-auth="{ row }">
             <div v-if="row.username || row.password" class="flex items-center gap-1.5">
               <div class="flex flex-col text-xs">
-                <span v-if="row.username" class="text-gray-700 dark:text-gray-200">{{ row.username }}</span>
+                <span v-if="row.username" class="font-mono text-gray-700 dark:text-gray-200">
+                  {{ visiblePasswordIds.has(row.id) ? row.username : '••••••' }}
+                </span>
                 <span v-if="row.password" class="font-mono text-gray-500 dark:text-gray-400">
                   {{ visiblePasswordIds.has(row.id) ? row.password : '••••••' }}
                 </span>
               </div>
               <button
-                v-if="row.password"
+                v-if="row.username || row.password"
                 type="button"
                 class="ml-1 rounded p-0.5 text-gray-400 hover:text-gray-600 dark:hover:text-gray-300"
+                :title="visiblePasswordIds.has(row.id) ? t('admin.proxies.hideCredentials') : t('admin.proxies.showCredentials')"
                 @click.stop="visiblePasswordIds.has(row.id) ? visiblePasswordIds.delete(row.id) : visiblePasswordIds.add(row.id)"
               >
                 <Icon :name="visiblePasswordIds.has(row.id) ? 'eyeOff' : 'eye'" size="sm" />
@@ -373,221 +433,325 @@
       width="normal"
       @close="closeCreateModal"
     >
-      <!-- Tab Switch -->
       <div
-        class="mb-6 flex items-center justify-between gap-3 border-b border-gray-200 dark:border-dark-600"
+        class="mb-6 flex flex-wrap items-center border-b border-gray-200 dark:border-dark-600"
+        data-test="admin-proxy-create-mode-tabs"
       >
-        <div class="flex min-w-0 shrink-0">
-          <button
-            type="button"
-            @click="createMode = 'standard'"
-            :class="[
-              '-mb-px border-b-2 px-4 py-2 text-sm font-medium transition-colors',
-              createMode === 'standard'
-                ? 'border-primary-500 text-primary-600 dark:text-primary-400'
-                : 'border-transparent text-gray-500 hover:text-gray-700 dark:text-gray-400 dark:hover:text-gray-300'
-            ]"
-          >
-            <Icon name="plus" size="sm" class="mr-1.5 inline" />
-            {{ t('admin.proxies.standardAdd') }}
-          </button>
-          <button
-            type="button"
-            @click="createMode = 'batch'"
-            :class="[
-              '-mb-px border-b-2 px-4 py-2 text-sm font-medium transition-colors',
-              createMode === 'batch'
-                ? 'border-primary-500 text-primary-600 dark:text-primary-400'
-                : 'border-transparent text-gray-500 hover:text-gray-700 dark:text-gray-400 dark:hover:text-gray-300'
-            ]"
-          >
-            <svg
-              class="mr-1.5 inline h-4 w-4"
-              fill="none"
-              viewBox="0 0 24 24"
-              stroke="currentColor"
-              stroke-width="1.5"
-            >
-              <path
-                stroke-linecap="round"
-                stroke-linejoin="round"
-                d="M3.75 12h16.5m-16.5 3.75h16.5M3.75 19.5h16.5M5.625 4.5h12.75a1.875 1.875 0 010 3.75H5.625a1.875 1.875 0 010-3.75z"
-              />
-            </svg>
-            {{ t('admin.proxies.batchAdd') }}
-          </button>
-        </div>
-        <ProxyAdBanner />
+        <button
+          type="button"
+          data-test="admin-proxy-create-mode-standard"
+          :class="[
+            '-mb-px border-b-2 px-4 py-2 text-sm font-medium transition-colors',
+            createMode === 'standard'
+              ? 'border-primary-500 text-primary-600 dark:text-primary-400'
+              : 'border-transparent text-gray-500 hover:text-gray-700 dark:text-gray-400 dark:hover:text-gray-300',
+          ]"
+          @click="createMode = 'standard'"
+        >
+          <Icon name="plus" size="sm" class="mr-1.5 inline" />
+          {{ t('admin.proxies.standardAdd') }}
+        </button>
+        <button
+          type="button"
+          data-test="admin-proxy-create-mode-batch"
+          :class="[
+            '-mb-px border-b-2 px-4 py-2 text-sm font-medium transition-colors',
+            createMode === 'batch'
+              ? 'border-primary-500 text-primary-600 dark:text-primary-400'
+              : 'border-transparent text-gray-500 hover:text-gray-700 dark:text-gray-400 dark:hover:text-gray-300',
+          ]"
+          @click="createMode = 'batch'"
+        >
+          <Icon name="upload" size="sm" class="mr-1.5 inline" />
+          {{ t('admin.proxies.batchAdd') }}
+        </button>
       </div>
 
-      <!-- Standard Add Form -->
-      <form
-        v-if="createMode === 'standard'"
-        id="create-proxy-form"
-        @submit.prevent="handleCreateProxy"
-        class="space-y-5"
-      >
-        <div>
-          <label class="input-label">{{ t('admin.proxies.name') }}</label>
-          <input
-            v-model="createForm.name"
-            type="text"
-            required
-            class="input"
-            :placeholder="t('admin.proxies.enterProxyName')"
-          />
-        </div>
-        <div>
-          <label class="input-label">{{ t('admin.proxies.protocol') }}</label>
-          <Select v-model="createForm.protocol" :options="protocolSelectOptions" />
-        </div>
-        <div class="grid grid-cols-2 gap-4">
-          <div>
-            <label class="input-label">{{ t('admin.proxies.host') }}</label>
+      <form id="create-proxy-form" class="space-y-5" @submit.prevent="handleCreateProxy">
+        <template v-if="createMode === 'standard'">
+          <div data-test="admin-proxy-name-field">
+            <label class="input-label">
+              {{ inputMode === 'config' ? t('admin.proxies.importNamePrefix') : t('admin.proxies.name') }}
+            </label>
             <input
-              v-model="createForm.host"
+              v-model.trim="createForm.name"
               type="text"
-              required
-              :placeholder="t('admin.proxies.form.hostPlaceholder')"
+              :required="inputMode !== 'config'"
               class="input"
+              data-test="admin-proxy-name-input"
+              :placeholder="inputMode === 'config'
+                ? t('admin.proxies.importNamePrefixPlaceholder')
+                : t('admin.proxies.enterProxyName')"
+            />
+          </div>
+
+          <div data-test="admin-proxy-input-mode-field">
+            <label class="input-label">{{ t('admin.proxies.creationMethod') }}</label>
+            <Select
+              v-model="inputMode"
+              :options="inputModeOptions"
+              :searchable="false"
+              data-test="admin-proxy-input-mode-selector"
+            />
+          </div>
+
+          <template v-if="inputMode === 'direct'">
+            <div data-test="admin-proxy-protocol-field">
+              <label class="input-label">{{ t('admin.proxies.protocol') }}</label>
+              <Select
+                v-model="createForm.protocol"
+                :options="standardProtocolSelectOptions"
+                :searchable="false"
+                data-test="admin-proxy-protocol-selector"
+              />
+            </div>
+            <div class="grid grid-cols-1 gap-4 sm:grid-cols-2">
+              <div>
+                <label class="input-label">{{ t('admin.proxies.host') }}</label>
+                <input
+                  v-model.trim="createForm.host"
+                  type="text"
+                  required
+                  :placeholder="t('admin.proxies.form.hostPlaceholder')"
+                  class="input"
+                />
+              </div>
+              <div>
+                <label class="input-label">{{ t('admin.proxies.port') }}</label>
+                <input
+                  v-model.number="createForm.port"
+                  type="number"
+                  required
+                  min="1"
+                  max="65535"
+                  :placeholder="t('admin.proxies.form.portPlaceholder')"
+                  class="input"
+                />
+              </div>
+            </div>
+            <div>
+              <label class="input-label">{{ t('admin.proxies.username') }}</label>
+              <input
+                v-model.trim="createForm.username"
+                type="text"
+                class="input"
+                :placeholder="t('admin.proxies.optionalAuth')"
+              />
+            </div>
+            <div>
+              <label class="input-label">{{ t('admin.proxies.password') }}</label>
+              <div class="relative">
+                <input
+                  v-model="createForm.password"
+                  :type="createPasswordVisible ? 'text' : 'password'"
+                  class="input pr-10"
+                  :placeholder="t('admin.proxies.optionalAuth')"
+                />
+                <button
+                  type="button"
+                  class="absolute right-3 top-1/2 -translate-y-1/2 text-gray-400 hover:text-gray-600 dark:hover:text-gray-300"
+                  :title="createPasswordVisible ? t('admin.proxies.hideCredentials') : t('admin.proxies.showCredentials')"
+                  @click="createPasswordVisible = !createPasswordVisible"
+                >
+                  <Icon :name="createPasswordVisible ? 'eyeOff' : 'eye'" size="md" />
+                </button>
+              </div>
+            </div>
+            <div>
+              <label class="input-label">{{ t('admin.proxies.expiresAt') }}</label>
+              <div class="mb-2 flex flex-wrap gap-2">
+                <button
+                  v-for="d in EXPIRY_PRESETS"
+                  :key="d"
+                  type="button"
+                  class="btn btn-sm"
+                  :class="createForm.expires_at === addDaysToBase('', d) ? 'btn-primary' : 'btn-secondary'"
+                  @click="createExpiresDays = d"
+                >
+                  {{ t('admin.proxies.nDays', { days: d }) }}
+                </button>
+              </div>
+              <input
+                v-model.number="createExpiresDays"
+                type="number"
+                min="0"
+                class="input mb-2"
+                :placeholder="t('admin.proxies.expiryDaysPlaceholder')"
+              />
+              <input v-model="createForm.expires_at" type="date" max="9999-12-31" class="input" />
+            </div>
+            <div>
+              <label class="input-label">{{ t('admin.proxies.fallbackMode') }}</label>
+              <Select v-model="createForm.fallback_mode" :options="[
+                { label: t('admin.proxies.fallbackNone'), value: 'none' },
+                { label: t('admin.proxies.fallbackProxy'), value: 'proxy' },
+                { label: t('admin.proxies.fallbackDirect'), value: 'direct' },
+              ]" />
+            </div>
+            <div v-if="createForm.fallback_mode === 'proxy'">
+              <label class="input-label">{{ t('admin.proxies.backupProxy') }}</label>
+              <Select v-model="createForm.backup_proxy_id" :options="backupProxyOptions()" />
+            </div>
+          </template>
+
+          <template v-else-if="inputMode === 'xray'">
+            <div>
+              <label class="input-label">{{ t('admin.proxies.shareLinkInput') }}</label>
+              <textarea
+                v-model.trim="createForm.import_content"
+                rows="7"
+                required
+                class="input break-all font-mono text-xs"
+                data-test="admin-proxy-share-input"
+                :placeholder="t('admin.proxies.shareLinkPlaceholder')"
+              ></textarea>
+              <p class="input-hint mt-2">{{ t('admin.proxies.shareLinkHint') }}</p>
+            </div>
+          </template>
+
+          <template v-else-if="inputMode === 'source'">
+            <div>
+              <label class="input-label">{{ t('admin.proxies.subscriptionUrl') }}</label>
+              <input
+                v-model.trim="createForm.subscription_url"
+                type="url"
+                required
+                class="input"
+                data-test="admin-proxy-source-url"
+                :placeholder="t('admin.proxies.subscriptionUrlPlaceholder')"
+              />
+            </div>
+            <div>
+              <label class="input-label">{{ t('admin.proxies.refreshIntervalMinutes') }}</label>
+              <input
+                v-model.number="createForm.refresh_interval_minutes"
+                type="number"
+                min="5"
+                max="10080"
+                required
+                class="input"
+              />
+              <p class="input-hint mt-2">{{ t('admin.proxies.refreshIntervalHint') }}</p>
+            </div>
+          </template>
+
+          <template v-else>
+            <div>
+              <label class="input-label">{{ t('admin.proxies.configFile') }}</label>
+              <div
+                class="flex flex-col gap-3 rounded-md border border-dashed border-gray-300 bg-gray-50 px-4 py-3 dark:border-dark-600 dark:bg-dark-800 sm:flex-row sm:items-center sm:justify-between"
+              >
+                <div class="min-w-0">
+                  <div class="truncate text-sm text-gray-700 dark:text-dark-200" :title="configFileName">
+                    {{ configFileName || t('admin.proxies.configFileNotSelected') }}
+                  </div>
+                  <div class="mt-1 text-xs text-gray-500 dark:text-dark-400">
+                    {{ t('admin.proxies.configFileTypes') }}
+                  </div>
+                </div>
+                <div class="flex shrink-0 items-center gap-2">
+                  <button
+                    type="button"
+                    class="btn btn-secondary"
+                    data-test="admin-proxy-config-file-button"
+                    :disabled="configFileReading"
+                    @click="openConfigFilePicker"
+                  >
+                    <Icon name="upload" size="sm" class="mr-2" />
+                    {{ configFileName ? t('admin.proxies.replaceConfigFile') : t('common.chooseFile') }}
+                  </button>
+                  <button
+                    v-if="configFileName"
+                    type="button"
+                    class="inline-flex h-9 w-9 items-center justify-center rounded-md text-gray-500 hover:bg-gray-200 hover:text-gray-700 focus:outline-none focus:ring-2 focus:ring-primary-500 dark:text-dark-300 dark:hover:bg-dark-700 dark:hover:text-white"
+                    data-test="admin-proxy-config-file-clear"
+                    :title="t('admin.proxies.clearConfigFile')"
+                    :aria-label="t('admin.proxies.clearConfigFile')"
+                    @click="clearConfigFile"
+                  >
+                    <Icon name="x" size="sm" />
+                  </button>
+                </div>
+              </div>
+              <input
+                ref="configFileInput"
+                type="file"
+                class="hidden"
+                accept=".json,.yaml,.yml,.txt,.conf,application/json,application/yaml,text/yaml,text/plain"
+                data-test="admin-proxy-config-file-input"
+                @change="handleConfigFileChange"
+              />
+            </div>
+            <div>
+              <label class="input-label">{{ t('admin.proxies.configInput') }}</label>
+              <textarea
+                v-model="createForm.import_content"
+                rows="10"
+                required
+                class="input break-all font-mono text-xs"
+                data-test="admin-proxy-config-input"
+                :placeholder="t('admin.proxies.configPlaceholder')"
+              ></textarea>
+              <p class="input-hint mt-2">{{ t('admin.proxies.configHint') }}</p>
+            </div>
+          </template>
+        </template>
+
+        <template v-else>
+          <div>
+            <label class="input-label">{{ t('admin.proxies.importNamePrefix') }}</label>
+            <input
+              v-model.trim="createForm.name"
+              type="text"
+              class="input"
+              :placeholder="t('admin.proxies.importNamePrefixPlaceholder')"
             />
           </div>
           <div>
-            <label class="input-label">{{ t('admin.proxies.port') }}</label>
-            <input
-              v-model.number="createForm.port"
-              type="number"
+            <label class="input-label">{{ t('admin.proxies.batchInput') }}</label>
+            <textarea
+              v-model="batchInput"
+              rows="10"
               required
-              min="1"
-              max="65535"
-              :placeholder="t('admin.proxies.form.portPlaceholder')"
-              class="input"
-            />
+              class="input break-all font-mono text-xs"
+              data-test="admin-proxy-batch-input"
+              :placeholder="t('admin.proxies.batchModernPlaceholder')"
+              @input="parseBatchInput"
+            ></textarea>
+            <p class="input-hint mt-2">{{ t('admin.proxies.batchModernHint') }}</p>
           </div>
-        </div>
-        <div>
-          <label class="input-label">{{ t('admin.proxies.username') }}</label>
-          <input
-            v-model="createForm.username"
-            type="text"
-            class="input"
-            :placeholder="t('admin.proxies.optionalAuth')"
-          />
-        </div>
-        <div>
-          <label class="input-label">{{ t('admin.proxies.password') }}</label>
-          <div class="relative">
-            <input
-              v-model="createForm.password"
-              :type="createPasswordVisible ? 'text' : 'password'"
-              class="input pr-10"
-              :placeholder="t('admin.proxies.optionalAuth')"
-            />
-            <button
-              type="button"
-              class="absolute right-3 top-1/2 -translate-y-1/2 text-gray-400 hover:text-gray-600 dark:hover:text-gray-300"
-              @click="createPasswordVisible = !createPasswordVisible"
-            >
-              <Icon :name="createPasswordVisible ? 'eyeOff' : 'eye'" size="md" />
-            </button>
+          <div v-if="batchParseResult.total > 0" class="rounded-md bg-gray-50 p-4 dark:bg-dark-700">
+            <div class="grid grid-cols-2 gap-2 text-center sm:grid-cols-4">
+              <div>
+                <div class="text-xs text-gray-500 dark:text-gray-400">{{ t('admin.proxies.totalCount') }}</div>
+                <div class="mt-1 font-semibold text-gray-900 dark:text-white">{{ batchParseResult.total }}</div>
+              </div>
+              <div>
+                <div class="text-xs text-gray-500 dark:text-gray-400">{{ t('admin.proxies.validCount') }}</div>
+                <div class="mt-1 font-semibold text-emerald-600">{{ batchParseResult.valid }}</div>
+              </div>
+              <div>
+                <div class="text-xs text-gray-500 dark:text-gray-400">{{ t('admin.proxies.invalidLabel') }}</div>
+                <div class="mt-1 font-semibold text-amber-600">{{ batchParseResult.invalid }}</div>
+              </div>
+              <div>
+                <div class="text-xs text-gray-500 dark:text-gray-400">{{ t('admin.proxies.duplicateLabel') }}</div>
+                <div class="mt-1 font-semibold text-gray-600 dark:text-gray-300">{{ batchParseResult.duplicate }}</div>
+              </div>
+            </div>
           </div>
-        </div>
-        <div>
-          <label class="input-label">{{ t('admin.proxies.expiresAt') }}</label>
-          <div class="mb-2 flex flex-wrap gap-2">
-            <button
-              v-for="d in EXPIRY_PRESETS"
-              :key="d"
-              type="button"
-              class="btn btn-sm"
-              :class="createForm.expires_at === addDaysToBase('', d) ? 'btn-primary' : 'btn-secondary'"
-              @click="createExpiresDays = d"
-            >
-              {{ t('admin.proxies.nDays', { days: d }) }}
-            </button>
-          </div>
-          <input
-            v-model.number="createExpiresDays"
-            type="number"
-            min="0"
-            class="input mb-2"
-            :placeholder="t('admin.proxies.expiryDaysPlaceholder')"
-          />
-          <input v-model="createForm.expires_at" type="date" max="9999-12-31" class="input" />
-        </div>
-        <div>
-          <label class="input-label">{{ t('admin.proxies.fallbackMode') }}</label>
-          <Select v-model="createForm.fallback_mode" :options="[
-            { label: t('admin.proxies.fallbackNone'), value: 'none' },
-            { label: t('admin.proxies.fallbackProxy'), value: 'proxy' },
-            { label: t('admin.proxies.fallbackDirect'), value: 'direct' },
-          ]" />
-        </div>
-        <div v-if="createForm.fallback_mode === 'proxy'">
-          <label class="input-label">{{ t('admin.proxies.backupProxy') }}</label>
-          <Select v-model="createForm.backup_proxy_id" :options="backupProxyOptions()" />
-        </div>
+        </template>
 
+        <label class="flex cursor-pointer items-center gap-2">
+          <input
+            v-model="createForm.is_public"
+            type="checkbox"
+            class="h-4 w-4 rounded border-gray-300 text-primary-600 focus:ring-primary-500"
+            data-test="admin-proxy-is-public"
+          />
+          <span class="text-sm text-gray-700 dark:text-gray-200">{{ t('admin.proxies.publicToUsers') }}</span>
+        </label>
       </form>
-
-      <!-- Batch Add Form -->
-      <div v-else class="space-y-5">
-        <div>
-          <label class="input-label">{{ t('admin.proxies.batchInput') }}</label>
-          <textarea
-            v-model="batchInput"
-            rows="10"
-            class="input font-mono text-sm"
-            :placeholder="t('admin.proxies.batchInputPlaceholder')"
-            @input="parseBatchInput"
-          ></textarea>
-          <p class="input-hint mt-2">
-            {{ t('admin.proxies.batchInputHint') }}
-          </p>
-        </div>
-
-        <!-- Parse Result -->
-        <div v-if="batchParseResult.total > 0" class="rounded-lg bg-gray-50 p-4 dark:bg-dark-700">
-            <div class="flex items-center gap-4 text-sm">
-              <div class="flex items-center gap-1.5">
-              <Icon name="checkCircle" size="sm" :stroke-width="2" class="text-primary-500" />
-              <span class="text-gray-700 dark:text-gray-300">
-                {{ t('admin.proxies.parsedCount', { count: batchParseResult.valid }) }}
-              </span>
-            </div>
-            <div v-if="batchParseResult.invalid > 0" class="flex items-center gap-1.5">
-              <Icon
-                name="exclamationCircle"
-                size="sm"
-                :stroke-width="2"
-                class="text-amber-500"
-              />
-              <span class="text-amber-600 dark:text-amber-400">
-                {{ t('admin.proxies.invalidCount', { count: batchParseResult.invalid }) }}
-              </span>
-            </div>
-            <div v-if="batchParseResult.duplicate > 0" class="flex items-center gap-1.5">
-              <svg
-                class="h-4 w-4 text-gray-400"
-                fill="none"
-                viewBox="0 0 24 24"
-                stroke="currentColor"
-                stroke-width="2"
-              >
-                <path
-                  stroke-linecap="round"
-                  stroke-linejoin="round"
-                  d="M15.75 17.25v3.375c0 .621-.504 1.125-1.125 1.125h-9.75a1.125 1.125 0 01-1.125-1.125V7.875c0-.621.504-1.125 1.125-1.125H6.75a9.06 9.06 0 011.5.124m7.5 10.376h3.375c.621 0 1.125-.504 1.125-1.125V11.25c0-4.46-3.243-8.161-7.5-8.876a9.06 9.06 0 00-1.5-.124H9.375c-.621 0-1.125.504-1.125 1.125v3.5m7.5 10.375H9.375a1.125 1.125 0 01-1.125-1.125v-9.25m12 6.625v-1.875a3.375 3.375 0 00-3.375-3.375h-1.5a1.125 1.125 0 01-1.125-1.125v-1.5a3.375 3.375 0 00-3.375-3.375H9.75"
-                />
-              </svg>
-              <span class="text-gray-500 dark:text-gray-400">
-                {{ t('admin.proxies.duplicateCount', { count: batchParseResult.duplicate }) }}
-              </span>
-            </div>
-          </div>
-        </div>
-
-      </div>
 
       <template #footer>
         <div class="flex justify-end gap-3">
@@ -595,10 +759,9 @@
             {{ t('common.cancel') }}
           </button>
           <button
-            v-if="createMode === 'standard'"
             type="submit"
             form="create-proxy-form"
-            :disabled="submitting"
+            :disabled="submitting || !createFormReady"
             class="btn btn-primary"
           >
             <svg
@@ -621,44 +784,335 @@
                 d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"
               ></path>
             </svg>
-            {{ submitting ? t('admin.proxies.creating') : t('common.create') }}
-          </button>
-          <button
-            v-else
-            @click="handleBatchCreate"
-            type="button"
-            :disabled="submitting || batchParseResult.valid === 0"
-            class="btn btn-primary"
-          >
-            <svg
-              v-if="submitting"
-              class="-ml-1 mr-2 h-4 w-4 animate-spin"
-              fill="none"
-              viewBox="0 0 24 24"
-            >
-              <circle
-                class="opacity-25"
-                cx="12"
-                cy="12"
-                r="10"
-                stroke="currentColor"
-                stroke-width="4"
-              ></circle>
-              <path
-                class="opacity-75"
-                fill="currentColor"
-                d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"
-              ></path>
-            </svg>
-            {{
-              submitting
-                ? t('admin.proxies.importing')
-                : t('admin.proxies.importProxies', { count: batchParseResult.valid })
-            }}
+            {{ createSubmitLabel }}
           </button>
         </div>
       </template>
     </BaseDialog>
+
+    <!-- System proxy subscription sources -->
+    <BaseDialog
+      :show="showProxySourcesModal"
+      :title="t('admin.proxies.sourceManagerTitle')"
+      width="wide"
+      @close="closeProxySourcesModal"
+    >
+      <div data-test="admin-proxy-source-manager">
+        <div
+          v-if="proxySourceError"
+          class="mb-5 rounded-md border border-red-200 bg-red-50 px-4 py-3 text-sm text-red-700 dark:border-red-900/60 dark:bg-red-900/20 dark:text-red-300"
+        >
+          {{ proxySourceError }}
+        </div>
+
+        <div class="grid grid-cols-1 gap-6 lg:grid-cols-[minmax(0,1.6fr)_minmax(280px,0.9fr)]">
+          <section class="min-w-0">
+            <div class="mb-3 flex flex-wrap items-center justify-between gap-3">
+              <h4 class="text-sm font-semibold text-gray-900 dark:text-white">
+                {{ t('admin.proxies.sourceManager') }}
+              </h4>
+              <div class="flex items-center gap-2">
+                <button
+                  type="button"
+                  class="btn btn-secondary btn-sm"
+                  data-test="admin-proxy-source-sync-all"
+                  :disabled="proxySourcesSyncingAll || proxySourcesLoading || proxySources.length === 0"
+                  :title="t('admin.proxies.sourceSyncAll')"
+                  @click="syncAllProxySources"
+                >
+                  <Icon name="refresh" size="sm" class="mr-2" :class="proxySourcesSyncingAll ? 'animate-spin' : ''" />
+                  {{ t('admin.proxies.sourceSyncAll') }}
+                </button>
+                <button
+                  type="button"
+                  class="btn btn-secondary btn-sm"
+                  :disabled="proxySourcesLoading"
+                  :title="t('common.refresh')"
+                  @click="loadProxySources"
+                >
+                  <Icon name="refresh" size="sm" :class="proxySourcesLoading ? 'animate-spin' : ''" />
+                </button>
+              </div>
+            </div>
+
+            <div
+              v-if="proxySourceSyncAllSummary"
+              class="mb-3 rounded-md border border-gray-200 bg-gray-50 px-3 py-2 text-xs text-gray-600 dark:border-dark-600 dark:bg-dark-700/40 dark:text-gray-300"
+              data-test="admin-proxy-source-sync-all-summary"
+            >
+              {{ proxySourceSyncAllSummary }}
+            </div>
+
+            <div
+              v-if="proxySourcesLoading"
+              class="flex min-h-44 items-center justify-center text-sm text-gray-500 dark:text-gray-400"
+            >
+              {{ t('admin.proxies.sourceLoading') }}
+            </div>
+            <div
+              v-else-if="proxySources.length === 0"
+              class="flex min-h-44 items-center justify-center rounded-md border border-dashed border-gray-300 px-4 text-center text-sm text-gray-500 dark:border-dark-600 dark:text-gray-400"
+            >
+              {{ t('admin.proxies.sourceEmpty') }}
+            </div>
+            <template v-else>
+              <div
+                class="overflow-x-auto rounded-md border border-gray-200 dark:border-dark-600"
+                data-test="admin-proxy-source-table-scroll"
+              >
+                <table class="w-full min-w-[1040px] divide-y divide-gray-200 text-left text-sm dark:divide-dark-600">
+                <thead class="bg-gray-50 dark:bg-dark-700/60">
+                  <tr>
+                    <th class="px-4 py-3 font-medium text-gray-600 dark:text-gray-300">
+                      {{ t('admin.proxies.sourceColumnName') }}
+                    </th>
+                    <th class="px-4 py-3 text-center font-medium text-gray-600 dark:text-gray-300">
+                      {{ t('admin.proxies.sourceColumnVisibility') }}
+                    </th>
+                    <th class="px-4 py-3 text-center font-medium text-gray-600 dark:text-gray-300">
+                      {{ t('admin.proxies.sourceColumnNodes') }}
+                    </th>
+                    <th class="px-4 py-3 text-center font-medium text-gray-600 dark:text-gray-300">
+                      {{ t('admin.proxies.sourceColumnInterval') }}
+                    </th>
+                    <th class="px-4 py-3 font-medium text-gray-600 dark:text-gray-300">
+                      {{ t('admin.proxies.sourceColumnQuota') }}
+                    </th>
+                    <th class="px-4 py-3 font-medium text-gray-600 dark:text-gray-300">
+                      {{ t('admin.proxies.sourceColumnStatus') }}
+                    </th>
+                    <th class="px-4 py-3 text-right font-medium text-gray-600 dark:text-gray-300">
+                      {{ t('admin.proxies.sourceColumnActions') }}
+                    </th>
+                  </tr>
+                </thead>
+                <tbody class="divide-y divide-gray-100 bg-white dark:divide-dark-700 dark:bg-dark-800">
+                  <tr v-for="source in proxySources" :key="source.id">
+                    <td class="px-4 py-3 align-top">
+                      <div class="max-w-[260px] font-medium text-gray-900 dark:text-white">
+                        {{ source.name }}
+                      </div>
+                      <div
+                        class="mt-1 max-w-[260px] truncate font-mono text-xs text-gray-500 dark:text-gray-400"
+                        :title="maskSubscriptionUrl(source.subscription_url)"
+                      >
+                        {{ maskSubscriptionUrl(source.subscription_url) }}
+                      </div>
+                    </td>
+                    <td class="px-4 py-3 text-center align-top">
+                      <span :class="['badge', source.is_public ? 'badge-success' : 'badge-gray']">
+                        {{ source.is_public ? t('admin.proxies.publicResource') : t('admin.proxies.privateResource') }}
+                      </span>
+                    </td>
+                    <td class="px-4 py-3 text-center align-top">
+                      <button
+                        type="button"
+                        class="text-primary-600 hover:underline dark:text-primary-400"
+                        :data-test="`admin-proxy-source-filter-${source.id}`"
+                        :title="t('admin.proxies.sourceFilterBySource')"
+                        @click="filterProxiesBySource(source)"
+                      >
+                        {{ t('admin.proxies.sourceNodeCount', {
+                          active: Number(source.active_node_count) || 0,
+                          total: Number(source.node_count) || 0,
+                        }) }}
+                      </button>
+                    </td>
+                    <td class="whitespace-nowrap px-4 py-3 text-center align-top text-gray-600 dark:text-gray-300">
+                      {{ t('admin.proxies.sourceIntervalValue', { minutes: source.refresh_interval_minutes }) }}
+                      <div class="mt-1 text-xs text-gray-500 dark:text-gray-400">
+                        {{ source.sync_enabled === false
+                          ? t('admin.proxies.sourceSyncPausedHint')
+                          : t('admin.proxies.sourceNextSyncAt', { time: source.next_sync_at ? formatDateTime(source.next_sync_at) : '-' }) }}
+                      </div>
+                    </td>
+                    <td class="whitespace-nowrap px-4 py-3 align-top text-gray-600 dark:text-gray-300">
+                      <div>{{ proxySourceTrafficText(source) }}</div>
+                      <div class="mt-1 text-xs text-gray-500 dark:text-gray-400">
+                        {{ t('admin.proxies.sourceExpiresAt', { time: source.sub_expires_at ? formatDateTime(source.sub_expires_at) : '-' }) }}
+                      </div>
+                    </td>
+                    <td class="px-4 py-3 align-top">
+                      <span :class="['badge', proxySourceStatusClass(source.last_sync_status)]">
+                        {{ proxySourceStatusLabel(source.last_sync_status) }}
+                      </span>
+                      <div class="mt-1 whitespace-nowrap text-xs text-gray-500 dark:text-gray-400">
+                        {{ source.last_synced_at ? formatDateTime(source.last_synced_at) : '-' }}
+                      </div>
+                      <div
+                        v-if="source.last_sync_error"
+                        class="mt-1 max-w-[220px] truncate text-xs text-red-600 dark:text-red-400"
+                        :title="source.last_sync_error"
+                      >
+                        {{ source.last_sync_error }}
+                      </div>
+                    </td>
+                    <td class="px-4 py-3 align-top">
+                      <div class="flex justify-end gap-1.5">
+                        <button
+                          type="button"
+                          class="btn btn-secondary btn-sm !px-2"
+                          :data-test="`admin-proxy-source-sync-${source.id}`"
+                          :disabled="syncingProxySourceId === source.id"
+                          :title="t('admin.proxies.sourceSync')"
+                          :aria-label="t('admin.proxies.sourceSync')"
+                          @click="syncProxySource(source)"
+                        >
+                          <Icon
+                            name="refresh"
+                            size="sm"
+                            :class="syncingProxySourceId === source.id ? 'animate-spin' : ''"
+                          />
+                        </button>
+                        <button
+                          type="button"
+                          class="btn btn-secondary btn-sm !px-2"
+                          :data-test="`admin-proxy-source-toggle-${source.id}`"
+                          :disabled="togglingProxySourceId === source.id"
+                          :title="source.sync_enabled === false ? t('admin.proxies.sourceResumeSync') : t('admin.proxies.sourcePauseSync')"
+                          :aria-label="source.sync_enabled === false ? t('admin.proxies.sourceResumeSync') : t('admin.proxies.sourcePauseSync')"
+                          @click="toggleProxySourceSync(source)"
+                        >
+                          <Icon :name="source.sync_enabled === false ? 'play' : 'ban'" size="sm" />
+                        </button>
+                        <button
+                          type="button"
+                          class="btn btn-secondary btn-sm !px-2"
+                          :data-test="`admin-proxy-source-edit-${source.id}`"
+                          :title="t('common.edit')"
+                          :aria-label="t('common.edit')"
+                          @click="editProxySource(source)"
+                        >
+                          <Icon name="edit" size="sm" />
+                        </button>
+                        <button
+                          type="button"
+                          class="btn btn-danger btn-sm !px-2"
+                          :data-test="`admin-proxy-source-delete-${source.id}`"
+                          :disabled="proxySourceDeleting"
+                          :title="t('common.delete')"
+                          :aria-label="t('common.delete')"
+                          @click="proxySourcePendingDelete = source"
+                        >
+                          <Icon name="trash" size="sm" />
+                        </button>
+                      </div>
+                    </td>
+                  </tr>
+                </tbody>
+                </table>
+              </div>
+              <Pagination
+                v-if="proxySourcePagination.total > PROXY_SOURCE_PAGE_SIZE"
+                :total="proxySourcePagination.total"
+                :page="proxySourcePagination.page"
+                :page-size="PROXY_SOURCE_PAGE_SIZE"
+                :show-page-size-selector="false"
+                data-test="admin-proxy-source-pagination"
+                @update:page="handleProxySourcePageChange"
+              />
+            </template>
+          </section>
+
+          <section class="border-t border-gray-200 pt-5 dark:border-dark-600 lg:border-l lg:border-t-0 lg:pl-6 lg:pt-0">
+            <h4 class="mb-4 text-sm font-semibold text-gray-900 dark:text-white">
+              {{ editingProxySourceId ? t('admin.proxies.sourceEditTitle') : t('admin.proxies.sourceAddTitle') }}
+            </h4>
+            <form id="proxy-source-manager-form" class="space-y-5" @submit.prevent="saveProxySource">
+              <div>
+                <label class="input-label">{{ t('admin.proxies.subscriptionName') }}</label>
+                <input
+                  v-model.trim="proxySourceForm.name"
+                  type="text"
+                  required
+                  class="input"
+                  :placeholder="t('admin.proxies.subscriptionNamePlaceholder')"
+                />
+              </div>
+              <div>
+                <label class="input-label">{{ t('admin.proxies.subscriptionUrl') }}</label>
+                <input
+                  v-model.trim="proxySourceForm.subscription_url"
+                  type="url"
+                  required
+                  class="input"
+                  :placeholder="t('admin.proxies.subscriptionUrlPlaceholder')"
+                />
+              </div>
+              <div>
+                <label class="input-label">{{ t('admin.proxies.refreshIntervalMinutes') }}</label>
+                <input
+                  v-model.number="proxySourceForm.refresh_interval_minutes"
+                  type="number"
+                  min="5"
+                  max="10080"
+                  required
+                  class="input"
+                />
+                <p class="input-hint mt-2">{{ t('admin.proxies.refreshIntervalHint') }}</p>
+              </div>
+              <label class="flex cursor-pointer items-center gap-2">
+                <input
+                  v-model="proxySourceForm.sync_enabled"
+                  type="checkbox"
+                  data-test="admin-proxy-source-sync-enabled"
+                  class="h-4 w-4 rounded border-gray-300 text-primary-600 focus:ring-primary-500"
+                />
+                <span class="text-sm text-gray-700 dark:text-gray-200">{{ t('admin.proxies.sourceAutoSyncEnabled') }}</span>
+              </label>
+              <label class="flex cursor-pointer items-center gap-2">
+                <input
+                  v-model="proxySourceForm.is_public"
+                  type="checkbox"
+                  class="h-4 w-4 rounded border-gray-300 text-primary-600 focus:ring-primary-500"
+                />
+                <span class="text-sm text-gray-700 dark:text-gray-200">{{ t('admin.proxies.publicToUsers') }}</span>
+              </label>
+              <div class="flex flex-wrap justify-end gap-2">
+                <button
+                  v-if="editingProxySourceId"
+                  type="button"
+                  class="btn btn-secondary"
+                  :disabled="proxySourceSaving"
+                  @click="resetProxySourceForm"
+                >
+                  {{ t('common.cancel') }}
+                </button>
+                <button
+                  type="submit"
+                  class="btn btn-primary"
+                  :disabled="proxySourceSaving || !proxySourceFormReady"
+                >
+                  {{ proxySourceSaving
+                    ? t('admin.proxies.saving')
+                    : editingProxySourceId
+                      ? t('admin.proxies.sourceUpdate')
+                      : t('admin.proxies.sourceSave') }}
+                </button>
+              </div>
+            </form>
+          </section>
+        </div>
+      </div>
+
+      <template #footer>
+        <div class="flex justify-end">
+          <button type="button" class="btn btn-secondary" @click="closeProxySourcesModal">
+            {{ t('common.close') }}
+          </button>
+        </div>
+      </template>
+    </BaseDialog>
+
+    <ConfirmDialog
+      :show="Boolean(proxySourcePendingDelete)"
+      :title="t('admin.proxies.sourceDeleteTitle')"
+      :message="t('admin.proxies.sourceDeleteConfirm', { name: proxySourcePendingDelete?.name || '' })"
+      :confirm-text="t('common.delete')"
+      danger
+      @confirm="confirmDeleteProxySource"
+      @cancel="proxySourcePendingDelete = null"
+    />
 
     <!-- Edit Proxy Modal -->
     <BaseDialog
@@ -678,8 +1132,12 @@
           <input v-model="editForm.name" type="text" required class="input" />
         </div>
         <div>
+          <label class="input-label">{{ t('admin.proxies.kind') }}</label>
+          <Select v-model="editForm.kind" :options="proxyKindOptions" :searchable="false" @change="normalizeEditProtocol" />
+        </div>
+        <div>
           <label class="input-label">{{ t('admin.proxies.protocol') }}</label>
-          <Select v-model="editForm.protocol" :options="protocolSelectOptions" />
+          <Select v-model="editForm.protocol" :options="editProtocolSelectOptions" :searchable="false" />
         </div>
         <div class="grid grid-cols-2 gap-4">
           <div>
@@ -721,10 +1179,24 @@
             </button>
           </div>
         </div>
+        <div v-if="editForm.kind === 'xray'">
+          <label class="input-label">{{ t('admin.proxies.xrayNodeUri') }}</label>
+          <textarea v-model.trim="editForm.xray_raw" rows="4" class="input break-all font-mono text-xs" :placeholder="t('admin.proxies.xrayNodeUriPlaceholder')"></textarea>
+          <p class="input-hint mt-1">{{ t('admin.proxies.xrayNodeUriHint') }}</p>
+        </div>
         <div>
           <label class="input-label">{{ t('admin.proxies.status') }}</label>
           <Select v-model="editForm.status" :options="editStatusOptions" />
         </div>
+        <label class="flex items-center gap-2">
+          <input
+            v-model="editForm.is_public"
+            type="checkbox"
+            :disabled="editingProxy.owner_user_id != null"
+            class="h-4 w-4 rounded border-gray-300 text-primary-600 focus:ring-primary-500 disabled:cursor-not-allowed disabled:opacity-50"
+          />
+          <span class="text-sm text-gray-700 dark:text-gray-200">{{ t('admin.proxies.publicToUsers') }}</span>
+        </label>
         <div>
           <label class="input-label">{{ t('admin.proxies.expiresAt') }}</label>
           <div class="mb-2 flex flex-wrap gap-2">
@@ -968,7 +1440,9 @@ import { ref, reactive, computed, onMounted, onUnmounted } from 'vue'
 import { useI18n } from 'vue-i18n'
 import { useAppStore } from '@/stores/app'
 import { adminAPI } from '@/api/admin'
-import type { Proxy, ProxyAccountSummary, ProxyProtocol, ProxyQualityCheckResult } from '@/types'
+import { getAdminProxyImportCount } from '@/api/admin/proxies'
+import type { AdminProxyImportResult, AdminProxySource } from '@/api/admin/proxies'
+import type { Proxy, ProxyAccountSummary, ProxyKind, ProxyProtocol, ProxyQualityCheckResult, ProxySourceSyncAllResult } from '@/types'
 import type { Column } from '@/components/common/types'
 import AppLayout from '@/components/layout/AppLayout.vue'
 import TablePageLayout from '@/components/layout/TablePageLayout.vue'
@@ -979,15 +1453,15 @@ import ConfirmDialog from '@/components/common/ConfirmDialog.vue'
 import EmptyState from '@/components/common/EmptyState.vue'
 import ImportDataModal from '@/components/admin/proxy/ImportDataModal.vue'
 import Select from '@/components/common/Select.vue'
-import ProxyAdBanner from '@/components/common/ProxyAdBanner.vue'
 import Icon from '@/components/icons/Icon.vue'
 import PlatformTypeBadge from '@/components/common/PlatformTypeBadge.vue'
 import { useClipboard } from '@/composables/useClipboard'
 import { useSwipeSelect } from '@/composables/useSwipeSelect'
 import { useTableSelection } from '@/composables/useTableSelection'
 import { getPersistedPageSize } from '@/composables/usePersistedPageSize'
-import { formatDateTime } from '@/utils/format'
+import { formatBytes, formatDateTime } from '@/utils/format'
 import { proxyExpiryBadgeClass, proxyExpiryLabelKey } from '@/utils/proxyExpiry'
+import { extractApiErrorMessage } from '@/utils/apiError'
 
 const { t } = useI18n()
 const appStore = useAppStore()
@@ -996,6 +1470,9 @@ const { copyToClipboard } = useClipboard()
 const columns = computed<Column[]>(() => [
   { key: 'select', label: '', sortable: false },
   { key: 'name', label: t('admin.proxies.columns.name'), sortable: true },
+  { key: 'owner_user_id', label: t('admin.proxies.columns.owner'), sortable: false },
+  { key: 'visibility', label: t('admin.proxies.columns.visibility'), sortable: false },
+  { key: 'kind', label: t('admin.proxies.columns.kind'), sortable: false },
   { key: 'protocol', label: t('admin.proxies.columns.protocol'), sortable: true },
   { key: 'address', label: t('admin.proxies.columns.address'), sortable: false },
   { key: 'auth', label: t('admin.proxies.columns.auth'), sortable: false },
@@ -1014,7 +1491,17 @@ const protocolOptions = computed(() => [
   { value: 'http', label: 'HTTP' },
   { value: 'https', label: 'HTTPS' },
   { value: 'socks5', label: 'SOCKS5' },
-  { value: 'socks5h', label: 'SOCKS5H' }
+  { value: 'socks5h', label: 'SOCKS5H' },
+  { value: 'vmess', label: 'VMess' },
+  { value: 'vless', label: 'VLESS' },
+  { value: 'trojan', label: 'Trojan' },
+  { value: 'ss', label: 'Shadowsocks' },
+  { value: 'hysteria', label: 'Hysteria' },
+  { value: 'hysteria2', label: 'Hysteria2' },
+  { value: 'tuic', label: 'TUIC' },
+  { value: 'anytls', label: 'AnyTLS' },
+  { value: 'naive', label: 'Naive' },
+  { value: 'wireguard', label: 'WireGuard' }
 ])
 
 const statusOptions = computed(() => [
@@ -1024,12 +1511,45 @@ const statusOptions = computed(() => [
   { value: 'expired', label: t('admin.proxies.expired') }
 ])
 
+const ownerScopeOptions = computed(() => [
+  { value: '', label: t('admin.proxies.allResourceOwners') },
+  { value: 'system', label: t('admin.proxies.systemResources') },
+  { value: 'user', label: t('admin.proxies.userResources') }
+])
+
+// Source names for the list filter. Loaded independently of the manager modal so
+// the filter keeps working before the modal has ever been opened.
+const proxySourceFilterItems = ref<AdminProxySource[]>([])
+const proxySourceFilterOptions = computed(() => [
+  { value: '', label: t('admin.proxies.allSources') },
+  ...proxySourceFilterItems.value.map(source => ({
+    value: String(source.id),
+    label: source.name || `#${source.id}`
+  }))
+])
+
 // Form options
-const protocolSelectOptions = computed(() => [
+const standardProtocolSelectOptions = computed(() => [
   { value: 'http', label: t('admin.proxies.protocols.http') },
   { value: 'https', label: t('admin.proxies.protocols.https') },
   { value: 'socks5', label: t('admin.proxies.protocols.socks5') },
   { value: 'socks5h', label: t('admin.proxies.protocols.socks5h') }
+])
+const xrayProtocolSelectOptions = computed(() => [
+  { value: 'vmess', label: 'VMess' },
+  { value: 'vless', label: 'VLESS' },
+  { value: 'trojan', label: 'Trojan' },
+  { value: 'ss', label: 'Shadowsocks' },
+  { value: 'hysteria', label: 'Hysteria' },
+  { value: 'hysteria2', label: 'Hysteria2' },
+  { value: 'tuic', label: 'TUIC' },
+  { value: 'anytls', label: 'AnyTLS' },
+  { value: 'naive', label: 'Naive' },
+  { value: 'wireguard', label: 'WireGuard' },
+])
+const proxyKindOptions = computed(() => [
+  { value: 'standard', label: t('admin.proxies.standardProxy') },
+  { value: 'xray', label: 'Xray' },
 ])
 
 const editStatusOptions = computed(() => [
@@ -1044,7 +1564,9 @@ const loading = ref(false)
 const searchQuery = ref('')
 const filters = reactive({
   protocol: '',
-  status: ''
+  status: '',
+  owner_scope: '',
+  source_id: ''
 })
 const pagination = reactive({
   page: 1,
@@ -1103,26 +1625,77 @@ const deletingProxy = ref<Proxy | null>(null)
 const showQualityReportDialog = ref(false)
 const qualityReportProxy = ref<Proxy | null>(null)
 const qualityReport = ref<ProxyQualityCheckResult | null>(null)
+const showProxySourcesModal = ref(false)
+const proxySources = ref<AdminProxySource[]>([])
+const proxySourcesLoading = ref(false)
+const PROXY_SOURCE_PAGE_SIZE = 100
+const proxySourcePagination = reactive({
+  page: 1,
+  total: 0,
+  pages: 0,
+})
+const proxySourceSaving = ref(false)
+const editingProxySourceId = ref<number | null>(null)
+const syncingProxySourceId = ref<number | null>(null)
+const togglingProxySourceId = ref<number | null>(null)
+const proxySourcesSyncingAll = ref(false)
+const proxySourceSyncAllResult = ref<ProxySourceSyncAllResult | null>(null)
+const proxySourceDeleting = ref(false)
+const proxySourcePendingDelete = ref<AdminProxySource | null>(null)
+const proxySourceError = ref('')
+const proxySourceForm = reactive({
+  name: '',
+  subscription_url: '',
+  refresh_interval_minutes: 1440,
+  is_public: false,
+  sync_enabled: true,
+})
 
-// Batch import state
-const createMode = ref<'standard' | 'batch'>('standard')
+// One-line recap of the last "sync every source" run. Counts only: node payloads
+// and subscription URLs must never reach this strip.
+const proxySourceSyncAllSummary = computed(() => {
+  const result = proxySourceSyncAllResult.value
+  if (!result) return ''
+  return t('admin.proxies.sourceSyncAllSummary', {
+    total: Number(result.total) || 0,
+    success: Number(result.success_count) || 0,
+    partial: Number(result.partial_count) || 0,
+    failed: Number(result.failed_count) || 0,
+    skipped: Number(result.skipped_count) || 0,
+    deferred: Number(result.deferred_count) || 0,
+    created: Number(result.created_count) || 0,
+    updated: Number(result.updated_count) || 0,
+  })
+})
+
+type CreateMode = 'standard' | 'batch'
+type InputMode = 'direct' | 'xray' | 'source' | 'config'
+
+const inputModeOptions = computed<Array<{ value: InputMode; label: string }>>(() => [
+  { value: 'direct', label: t('myResources.proxyEditor.standardProxy') },
+  { value: 'xray', label: t('myResources.proxyEditor.xrayShare') },
+  { value: 'source', label: t('myResources.proxyEditor.providerSubscription') },
+  { value: 'config', label: t('myResources.proxyEditor.nodeConfig') },
+])
+
+// Creation/import state
+const createMode = ref<CreateMode>('standard')
+const inputMode = ref<InputMode>('direct')
 const batchInput = ref('')
+const configFileInput = ref<HTMLInputElement | null>(null)
+const configFileName = ref('')
+const configFileReading = ref(false)
 const batchParseResult = reactive({
   total: 0,
   valid: 0,
   invalid: 0,
-  duplicate: 0,
-  proxies: [] as Array<{
-    protocol: ProxyProtocol
-    host: string
-    port: number
-    username: string
-    password: string
-  }>
+  duplicate: 0
 })
 
 const createForm = reactive({
   name: '',
+  is_public: false,
+  kind: 'standard' as ProxyKind,
   protocol: 'http' as ProxyProtocol,
   host: '',
   port: 8080,
@@ -1132,20 +1705,89 @@ const createForm = reactive({
   fallback_mode: 'none' as 'none' | 'proxy' | 'direct',
   backup_proxy_id: null as number | null,
   expiry_warn_days: 7 as number,
+  import_content: '',
+  subscription_url: '',
+  refresh_interval_minutes: 1440
 })
 
 const editForm = reactive({
   name: '',
+  is_public: false,
+  kind: 'standard' as ProxyKind,
   protocol: 'http' as ProxyProtocol,
   host: '',
   port: 8080,
   username: '',
   password: '',
-  status: 'active' as 'active' | 'inactive' | 'expired',
+  status: 'active' as 'active' | 'inactive' | 'disabled' | 'expired',
   expires_at: '' as string,
   fallback_mode: 'none' as 'none' | 'proxy' | 'direct',
   backup_proxy_id: null as number | null,
   expiry_warn_days: 7 as number,
+  xray_raw: '',
+})
+
+const editProtocolSelectOptions = computed(() => editForm.kind === 'xray' ? xrayProtocolSelectOptions.value : standardProtocolSelectOptions.value)
+const normalizeEditProtocol = () => {
+  if (!editProtocolSelectOptions.value.some(option => option.value === editForm.protocol)) {
+    editForm.protocol = editProtocolSelectOptions.value[0].value as ProxyProtocol
+  }
+}
+
+const createFormReady = computed(() => {
+  if (createMode.value === 'batch') {
+    return batchParseResult.valid > 0
+  }
+  if (inputMode.value === 'direct') {
+    const port = Number(createForm.port)
+    return Boolean(
+      createForm.name.trim()
+      && createForm.host.trim()
+      && Number.isFinite(port)
+      && port >= 1
+      && port <= 65535
+    )
+  }
+  if (inputMode.value === 'xray') {
+    return Boolean(createForm.name.trim() && createForm.import_content.trim())
+  }
+  if (inputMode.value === 'source') {
+    const interval = Number(createForm.refresh_interval_minutes)
+    return Boolean(
+      createForm.name.trim()
+      && createForm.subscription_url.trim()
+      && Number.isFinite(interval)
+      && interval >= 5
+      && interval <= 10080
+    )
+  }
+  if (inputMode.value === 'config') {
+    return Boolean(createForm.import_content.trim())
+  }
+  return false
+})
+
+const createSubmitLabel = computed(() => {
+  const mode = createMode.value === 'batch' ? 'batch' : inputMode.value
+  if (submitting.value) {
+    return mode === 'direct'
+      ? t('admin.proxies.creating')
+      : t('admin.proxies.importing')
+  }
+  return mode === 'direct' || mode === 'source'
+    ? t('common.create')
+    : t('admin.proxies.dataImportButton')
+})
+
+const proxySourceFormReady = computed(() => {
+  const interval = Number(proxySourceForm.refresh_interval_minutes)
+  return Boolean(
+    proxySourceForm.name.trim()
+    && proxySourceForm.subscription_url.trim()
+    && Number.isInteger(interval)
+    && interval >= 5
+    && interval <= 10080
+  )
 })
 
 const allProxiesForBackup = ref<Proxy[]>([])
@@ -1182,6 +1824,8 @@ const toggleSelectAllVisible = (event: Event) => {
 const buildProxyQueryFilters = () => ({
   protocol: filters.protocol || undefined,
   status: (filters.status || undefined) as 'active' | 'inactive' | 'expired' | undefined,
+  owner_scope: (filters.owner_scope || undefined) as 'system' | 'user' | undefined,
+  source_id: filters.source_id ? Number(filters.source_id) : undefined,
   search: searchQuery.value || undefined,
   sort_by: sortState.sort_by,
   sort_order: sortState.sort_order
@@ -1221,9 +1865,272 @@ const loadProxies = async () => {
   }
 }
 
-const handleFilterChange = () => {
+const resetProxySourceForm = () => {
+  editingProxySourceId.value = null
+  proxySourceForm.name = ''
+  proxySourceForm.subscription_url = ''
+  proxySourceForm.refresh_interval_minutes = 1440
+  proxySourceForm.is_public = false
+  proxySourceForm.sync_enabled = true
+}
+
+const ensureProxySourceFilterOptions = async (force = false) => {
+  if (!force && proxySourceFilterItems.value.length > 0) return
+  try {
+    const response = await adminAPI.proxies.sources.list(1, PROXY_SOURCE_PAGE_SIZE)
+    proxySourceFilterItems.value = response.items ?? []
+  } catch {
+    // The filter is optional; the proxy table must still load without it.
+    proxySourceFilterItems.value = []
+  }
+}
+
+const filterProxiesBySource = async (source: AdminProxySource) => {
+  filters.source_id = String(source.id)
+  closeProxySourcesModal()
   pagination.page = 1
-  loadProxies()
+  await loadProxies()
+}
+
+// Remaining / total traffic reported by the subscription provider. Providers that
+// send no usage header leave both counters at zero, which reads as "unknown".
+const proxySourceTrafficText = (source: AdminProxySource) => {
+  const used = Math.max(0, Number(source.sub_traffic_used) || 0)
+  const total = Math.max(0, Number(source.sub_traffic_total) || 0)
+  if (total <= 0 && used <= 0) return '-'
+  if (total <= 0) return t('admin.proxies.sourceTrafficUsedOnly', { used: formatBytes(used) })
+  return t('admin.proxies.sourceTrafficRemaining', {
+    remaining: formatBytes(Math.max(0, total - used)),
+    total: formatBytes(total),
+  })
+}
+
+// Pause/resume only flips sync_enabled; the other fields are resent unchanged
+// because the update endpoint replaces the whole source record.
+const toggleProxySourceSync = async (source: AdminProxySource) => {
+  togglingProxySourceId.value = source.id
+  proxySourceError.value = ''
+  const nextEnabled = source.sync_enabled === false
+  try {
+    await adminAPI.proxies.sources.update(source.id, {
+      name: source.name,
+      subscription_url: source.subscription_url,
+      refresh_interval_minutes: source.refresh_interval_minutes,
+      is_public: source.is_public,
+      sync_enabled: nextEnabled,
+    })
+    appStore.showSuccess(
+      nextEnabled ? t('admin.proxies.sourceSyncResumed') : t('admin.proxies.sourceSyncPaused')
+    )
+    await loadProxySources()
+  } catch (error: unknown) {
+    proxySourceError.value = extractApiErrorMessage(error, t('admin.proxies.sourceSaveFailed'))
+  } finally {
+    togglingProxySourceId.value = null
+  }
+}
+
+const syncAllProxySources = async () => {
+  if (proxySourcesSyncingAll.value) return
+  proxySourcesSyncingAll.value = true
+  proxySourceError.value = ''
+  try {
+    const result = await adminAPI.proxies.sources.syncAll()
+    proxySourceSyncAllResult.value = result || null
+    const failed = Number(result?.failed_count) || 0
+    if (failed > 0) {
+      appStore.showInfo(t('admin.proxies.sourceSyncAllPartial', { failed }))
+    } else {
+      appStore.showSuccess(t('admin.proxies.sourceSyncAllDone'))
+    }
+    await Promise.all([loadProxySources(), loadProxies()])
+    void ensureProxySourceFilterOptions(true)
+  } catch (error: unknown) {
+    proxySourceError.value = extractApiErrorMessage(error, t('admin.proxies.sourceSyncFailed'))
+  } finally {
+    proxySourcesSyncingAll.value = false
+  }
+}
+
+const loadProxySources = async () => {
+  proxySourcesLoading.value = true
+  proxySourceError.value = ''
+  try {
+    let response = await adminAPI.proxies.sources.list(
+      proxySourcePagination.page,
+      PROXY_SOURCE_PAGE_SIZE,
+    )
+    let totalPages = Math.max(
+      1,
+      Number(response.pages) || Math.ceil(Number(response.total || 0) / PROXY_SOURCE_PAGE_SIZE),
+    )
+    if (proxySourcePagination.page > totalPages) {
+      proxySourcePagination.page = totalPages
+      response = await adminAPI.proxies.sources.list(
+        proxySourcePagination.page,
+        PROXY_SOURCE_PAGE_SIZE,
+      )
+      totalPages = Math.max(
+        1,
+        Number(response.pages) || Math.ceil(Number(response.total || 0) / PROXY_SOURCE_PAGE_SIZE),
+      )
+    }
+    proxySources.value = response.items ?? []
+    proxySourcePagination.total = Math.max(0, Number(response.total) || 0)
+    proxySourcePagination.pages = totalPages
+  } catch (error: unknown) {
+    proxySourceError.value = extractApiErrorMessage(error, t('admin.proxies.sourceLoadFailed'))
+  } finally {
+    proxySourcesLoading.value = false
+  }
+}
+
+const openProxySourcesModal = async () => {
+  proxySourceError.value = ''
+  resetProxySourceForm()
+  proxySourcePagination.page = 1
+  showProxySourcesModal.value = true
+  await loadProxySources()
+}
+
+const handleProxySourcePageChange = async (page: number) => {
+  const nextPage = Math.min(Math.max(1, page), Math.max(1, proxySourcePagination.pages))
+  if (nextPage === proxySourcePagination.page) return
+  proxySourcePagination.page = nextPage
+  await loadProxySources()
+}
+
+const closeProxySourcesModal = () => {
+  showProxySourcesModal.value = false
+  proxySourcePendingDelete.value = null
+  proxySourceError.value = ''
+  resetProxySourceForm()
+}
+
+const editProxySource = (source: AdminProxySource) => {
+  editingProxySourceId.value = source.id
+  proxySourceForm.name = source.name
+  proxySourceForm.subscription_url = source.subscription_url
+  proxySourceForm.refresh_interval_minutes = source.refresh_interval_minutes
+  proxySourceForm.is_public = source.is_public
+  proxySourceForm.sync_enabled = source.sync_enabled !== false
+  proxySourceError.value = ''
+}
+
+const saveProxySource = async () => {
+  if (!proxySourceFormReady.value) return
+
+  proxySourceSaving.value = true
+  proxySourceError.value = ''
+  try {
+    const payload = {
+      name: proxySourceForm.name.trim(),
+      subscription_url: proxySourceForm.subscription_url.trim(),
+      refresh_interval_minutes: Number(proxySourceForm.refresh_interval_minutes),
+      is_public: proxySourceForm.is_public,
+      sync_enabled: proxySourceForm.sync_enabled,
+    }
+    if (editingProxySourceId.value) {
+      await adminAPI.proxies.sources.update(editingProxySourceId.value, payload)
+    } else {
+      await adminAPI.proxies.sources.create(payload)
+    }
+    appStore.showSuccess(t('admin.proxies.sourceSaved'))
+    resetProxySourceForm()
+    await loadProxySources()
+    void ensureProxySourceFilterOptions(true)
+  } catch (error: unknown) {
+    proxySourceError.value = extractApiErrorMessage(error, t('admin.proxies.sourceSaveFailed'))
+  } finally {
+    proxySourceSaving.value = false
+  }
+}
+
+const syncProxySource = async (source: AdminProxySource) => {
+  syncingProxySourceId.value = source.id
+  proxySourceError.value = ''
+  try {
+    const result = await adminAPI.proxies.sources.sync(source.id)
+    const stats = getImportResultStats(result)
+    if (stats.errors.length > 0) {
+      appStore.showInfo(t('admin.proxies.sourceSyncPartial', { count: stats.imported, errors: stats.errors.length }))
+    } else {
+      appStore.showSuccess(t('admin.proxies.sourceSynced', { count: stats.imported }))
+    }
+    await Promise.all([loadProxySources(), loadProxies()])
+  } catch (error: unknown) {
+    proxySourceError.value = extractApiErrorMessage(error, t('admin.proxies.sourceSyncFailed'))
+  } finally {
+    syncingProxySourceId.value = null
+  }
+}
+
+const confirmDeleteProxySource = async () => {
+  const source = proxySourcePendingDelete.value
+  if (!source) return
+
+  proxySourceDeleting.value = true
+  proxySourceError.value = ''
+  try {
+    await adminAPI.proxies.sources.delete(source.id)
+    if (editingProxySourceId.value === source.id) {
+      resetProxySourceForm()
+    }
+    proxySourcePendingDelete.value = null
+    appStore.showSuccess(t('admin.proxies.sourceDeleted'))
+    const remainingTotal = Math.max(0, proxySourcePagination.total - 1)
+    const lastPage = Math.max(1, Math.ceil(remainingTotal / PROXY_SOURCE_PAGE_SIZE))
+    if (proxySourcePagination.page > lastPage) {
+      proxySourcePagination.page = lastPage
+    }
+    await loadProxySources()
+    void ensureProxySourceFilterOptions(true)
+  } catch (error: unknown) {
+    proxySourceError.value = extractApiErrorMessage(error, t('admin.proxies.sourceDeleteFailed'))
+  } finally {
+    proxySourceDeleting.value = false
+  }
+}
+
+const maskSubscriptionUrl = (value?: string | null) => {
+  const raw = String(value || '').trim()
+  if (!raw) return t('admin.proxies.sourceUrlHidden')
+  try {
+    const parsed = new URL(raw)
+    return parsed.protocol + '//' + parsed.host + '/***'
+  } catch {
+    return t('admin.proxies.sourceUrlHidden')
+  }
+}
+
+const proxySourceStatusClass = (status?: string) => {
+  switch (String(status || '').toLowerCase()) {
+    case 'success':
+      return 'badge-success'
+    case 'partial':
+      return 'badge-warning'
+    case 'syncing':
+      return 'badge-primary'
+    case 'error':
+      return 'badge-danger'
+    default:
+      return 'badge-gray'
+  }
+}
+
+const proxySourceStatusLabel = (status?: string) => {
+  switch (String(status || '').toLowerCase()) {
+    case 'success':
+      return t('admin.proxies.sourceStatusSuccess')
+    case 'partial':
+      return t('admin.proxies.sourceStatusPartial')
+    case 'error':
+      return t('admin.proxies.sourceStatusError')
+    case 'syncing':
+      return t('admin.proxies.sourceStatusSyncing')
+    default:
+      return t('admin.proxies.sourceStatusPending')
+  }
 }
 
 let searchTimeout: ReturnType<typeof setTimeout>
@@ -1256,7 +2163,10 @@ const handleSort = (key: string, order: 'asc' | 'desc') => {
 const closeCreateModal = () => {
   showCreateModal.value = false
   createMode.value = 'standard'
+  inputMode.value = 'direct'
   createForm.name = ''
+  createForm.is_public = false
+  createForm.kind = 'standard'
   createForm.protocol = 'http'
   createForm.host = ''
   createForm.port = 8080
@@ -1266,13 +2176,20 @@ const closeCreateModal = () => {
   createForm.fallback_mode = 'none'
   createForm.backup_proxy_id = null
   createForm.expiry_warn_days = 7
+  createForm.import_content = ''
+  createForm.subscription_url = ''
+  createForm.refresh_interval_minutes = 1440
   createPasswordVisible.value = false
+  configFileName.value = ''
+  configFileReading.value = false
+  if (configFileInput.value) {
+    configFileInput.value.value = ''
+  }
   batchInput.value = ''
   batchParseResult.total = 0
   batchParseResult.valid = 0
   batchParseResult.invalid = 0
   batchParseResult.duplicate = 0
-  batchParseResult.proxies = []
 }
 
 const handleDataImported = () => {
@@ -1280,135 +2197,216 @@ const handleDataImported = () => {
   loadProxies()
 }
 
-// Parse proxy URL: protocol://user:pass@host:port or protocol://host:port
-// Host may be a domain, IPv4, or bracketed IPv6 ([2001:db8::1]).
-const parseProxyUrl = (
-  line: string
-): {
-  protocol: ProxyProtocol
-  host: string
-  port: number
-  username: string
-  password: string
-} | null => {
-  const trimmed = line.trim()
-  if (!trimmed) return null
+const CONFIG_FILE_EXTENSIONS = ['.json', '.yaml', '.yml', '.txt', '.conf'] as const
+const MAX_CONFIG_FILE_SIZE = 8 * 1024 * 1024
 
-  // Regex to parse proxy URL (supports http, https, socks5, socks5h).
-  // Host alternatives: [bracketed-IPv6] | hostname/IPv4 (colon-free, so the
-  // match stops before the final :port).
-  const regex =
-    /^(https?|socks5h?):\/\/(?:([^:@\[\]]+):([^@\[\]]+)@)?(\[[0-9a-f:.]+\]|[^:\[\]]+):(\d+)$/i
-  const match = trimmed.match(regex)
+const openConfigFilePicker = () => {
+  configFileInput.value?.click()
+}
 
-  if (!match) return null
-
-  const [, protocol, username, password, rawHost, port] = match
-  const portNum = parseInt(port, 10)
-
-  if (portNum < 1 || portNum > 65535) return null
-
-  // Strip brackets from IPv6 literals; the backend re-brackets via net.JoinHostPort.
-  const host = rawHost.replace(/^\[|\]$/g, '').trim()
-
-  return {
-    protocol: protocol.toLowerCase() as ProxyProtocol,
-    host,
-    port: portNum,
-    username: username?.trim() || '',
-    password: password?.trim() || ''
+const clearConfigFile = () => {
+  configFileName.value = ''
+  createForm.import_content = ''
+  if (configFileInput.value) {
+    configFileInput.value.value = ''
   }
 }
 
+const readFileAsText = async (sourceFile: File): Promise<string> => {
+  if (typeof sourceFile.text === 'function') {
+    return sourceFile.text()
+  }
+  if (typeof sourceFile.arrayBuffer === 'function') {
+    const buffer = await sourceFile.arrayBuffer()
+    return new TextDecoder().decode(buffer)
+  }
+  return await new Promise<string>((resolve, reject) => {
+    const reader = new FileReader()
+    reader.onload = () => resolve(String(reader.result ?? ''))
+    reader.onerror = () => reject(reader.error || new Error('Failed to read proxy configuration file'))
+    reader.readAsText(sourceFile)
+  })
+}
+
+const handleConfigFileChange = async (event: Event) => {
+  const target = event.target as HTMLInputElement
+  const file = target.files?.[0]
+  if (!file) return
+
+  const lowerName = file.name.toLowerCase()
+  if (!CONFIG_FILE_EXTENSIONS.some((extension) => lowerName.endsWith(extension))) {
+    appStore.showError(t('admin.proxies.configFileUnsupported'))
+    target.value = ''
+    return
+  }
+  if (file.size > MAX_CONFIG_FILE_SIZE) {
+    appStore.showError(t('admin.proxies.configFileTooLarge'))
+    target.value = ''
+    return
+  }
+
+  configFileReading.value = true
+  try {
+    const content = await readFileAsText(file)
+    if (!content.trim()) {
+      appStore.showError(t('admin.proxies.configFileEmpty'))
+      return
+    }
+    createForm.import_content = content
+    configFileName.value = file.name
+  } catch {
+    appStore.showError(t('admin.proxies.configFileReadFailed'))
+  } finally {
+    configFileReading.value = false
+    target.value = ''
+  }
+}
+
+const MODERN_PROXY_URI_PATTERN = /^(https?|socks(?:5h?)?|vmess|vless|trojan|ss|hysteria|hy2|hysteria2|tuic|anytls|naive(?:\+https|\+quic)?|wireguard|wg):\/\/\S+$/i
+
 const parseBatchInput = () => {
-  const lines = batchInput.value.split('\n').filter((l) => l.trim())
+  const lines = batchInput.value
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter(Boolean)
   const seen = new Set<string>()
-  const proxies: typeof batchParseResult.proxies = []
   let invalid = 0
   let duplicate = 0
+  let valid = 0
 
   for (const line of lines) {
-    const parsed = parseProxyUrl(line)
-    if (!parsed) {
+    if (!MODERN_PROXY_URI_PATTERN.test(line)) {
       invalid++
       continue
     }
-
-    // Check for duplicates (same host:port:username:password)
-    const key = `${parsed.host}:${parsed.port}:${parsed.username}:${parsed.password}`
-    if (seen.has(key)) {
+    if (seen.has(line)) {
       duplicate++
       continue
     }
-    seen.add(key)
-    proxies.push(parsed)
+    seen.add(line)
+    valid++
   }
 
   batchParseResult.total = lines.length
-  batchParseResult.valid = proxies.length
+  batchParseResult.valid = valid
   batchParseResult.invalid = invalid
   batchParseResult.duplicate = duplicate
-  batchParseResult.proxies = proxies
 }
 
-const handleBatchCreate = async () => {
-  if (batchParseResult.valid === 0) return
-
-  submitting.value = true
-  try {
-    const result = await adminAPI.proxies.batchCreate(batchParseResult.proxies)
-    const created = result.created || 0
-    const skipped = result.skipped || 0
-
-    if (created > 0) {
-      appStore.showSuccess(t('admin.proxies.batchImportSuccess', { created, skipped }))
-    } else {
-      appStore.showInfo(t('admin.proxies.batchImportAllSkipped', { skipped }))
-    }
-
-    closeCreateModal()
-    loadProxies()
-  } catch (error: any) {
-    appStore.showError(error.response?.data?.detail || t('admin.proxies.failedToImport'))
-    console.error('Error batch creating proxies:', error)
-  } finally {
-    submitting.value = false
-  }
+const getImportResultStats = (result: AdminProxyImportResult) => {
+  const imported = getAdminProxyImportCount(result)
+  const errors = Array.isArray(result.errors)
+    ? result.errors.filter((error) => Boolean(typeof error === 'string' ? error.trim() : error.message || error.error))
+    : []
+  return { imported, errors }
 }
 
 const handleCreateProxy = async () => {
-  if (!createForm.name.trim()) {
-    appStore.showError(t('admin.proxies.nameRequired'))
-    return
+  const mode: InputMode | 'batch' = createMode.value === 'batch' ? 'batch' : inputMode.value
+
+  if (mode === 'direct' || mode === 'xray' || mode === 'source') {
+    if (!createForm.name.trim()) {
+      appStore.showError(t('admin.proxies.nameRequired'))
+      return
+    }
   }
-  if (!createForm.host.trim()) {
-    appStore.showError(t('admin.proxies.hostRequired'))
-    return
+  if (mode === 'direct') {
+    if (!createForm.host.trim()) {
+      appStore.showError(t('admin.proxies.hostRequired'))
+      return
+    }
+    const port = Number(createForm.port)
+    if (!Number.isInteger(port) || port < 1 || port > 65535) {
+      appStore.showError(t('admin.proxies.portInvalid'))
+      return
+    }
+  } else if (mode === 'source') {
+    if (!createForm.subscription_url.trim()) {
+      appStore.showError(t('admin.proxies.subscriptionUrlRequired'))
+      return
+    }
+    const interval = Number(createForm.refresh_interval_minutes)
+    if (!Number.isInteger(interval) || interval < 5 || interval > 10080) {
+      appStore.showError(t('admin.proxies.refreshIntervalHint'))
+      return
+    }
+  } else {
+    const content = mode === 'batch' ? batchInput.value : createForm.import_content
+    if (!content.trim()) {
+      appStore.showError(t('admin.proxies.importContentRequired'))
+      return
+    }
+    if (mode === 'batch' && batchParseResult.valid === 0) {
+      appStore.showError(t('admin.proxies.importContentRequired'))
+      return
+    }
   }
-  if (createForm.port < 1 || createForm.port > 65535) {
-    appStore.showError(t('admin.proxies.portInvalid'))
-    return
-  }
+
   submitting.value = true
   try {
-    await adminAPI.proxies.create({
-      name: createForm.name.trim(),
-      protocol: createForm.protocol,
-      host: createForm.host.trim(),
-      port: createForm.port,
-      username: createForm.username.trim() || null,
-      password: createForm.password.trim() || null,
-      expires_at: createForm.expires_at ? Math.floor(new Date(createForm.expires_at).getTime() / 1000) : null,
-      fallback_mode: createForm.fallback_mode,
-      backup_proxy_id: createForm.fallback_mode === 'proxy' ? createForm.backup_proxy_id : null,
-      expiry_warn_days: createForm.expiry_warn_days,
-    })
-    appStore.showSuccess(t('admin.proxies.proxyCreated'))
+    if (mode === 'direct') {
+      await adminAPI.proxies.create({
+        name: createForm.name.trim(),
+        is_public: createForm.is_public,
+        kind: 'standard' as ProxyKind,
+        protocol: createForm.protocol,
+        host: createForm.host.trim(),
+        port: Number(createForm.port),
+        username: createForm.username.trim() || null,
+        password: createForm.password.trim() || null,
+        expires_at: createForm.expires_at ? Math.floor(new Date(createForm.expires_at).getTime() / 1000) : null,
+        fallback_mode: createForm.fallback_mode,
+        backup_proxy_id: createForm.fallback_mode === 'proxy' ? createForm.backup_proxy_id : null,
+        expiry_warn_days: createForm.expiry_warn_days,
+        extra: {},
+      })
+      appStore.showSuccess(t('admin.proxies.proxyCreated'))
+    } else if (mode === 'source') {
+      const source = await adminAPI.proxies.sources.create({
+        name: createForm.name.trim(),
+        subscription_url: createForm.subscription_url.trim(),
+        refresh_interval_minutes: Number(createForm.refresh_interval_minutes),
+        is_public: createForm.is_public,
+      })
+      try {
+        const result = await adminAPI.proxies.sources.sync(source.id)
+        const stats = getImportResultStats(result)
+        if (stats.errors.length > 0) {
+          appStore.showInfo(t('admin.proxies.sourceSyncPartial', { count: stats.imported, errors: stats.errors.length }))
+        } else {
+          appStore.showSuccess(t('admin.proxies.sourceCreated', { count: stats.imported }))
+        }
+      } catch (syncError: unknown) {
+        const message = extractApiErrorMessage(syncError, t('admin.proxies.sourceSyncFailed'))
+        closeCreateModal()
+        await openProxySourcesModal()
+        proxySourceError.value = message
+        appStore.showError(t('admin.proxies.sourceCreatedSyncFailed'))
+        await loadProxies()
+        return
+      }
+    } else {
+      const content = mode === 'batch' ? batchInput.value : createForm.import_content
+      const result = await adminAPI.proxies.importNodes({
+        name_prefix: createForm.name.trim() || undefined,
+        content: content.trim(),
+        is_public: createForm.is_public,
+      })
+      const stats = getImportResultStats(result)
+      if (stats.imported > 0 && stats.errors.length > 0) {
+        appStore.showInfo(t('admin.proxies.importPartial', { count: stats.imported, errors: stats.errors.length }))
+      } else if (stats.imported > 0) {
+        appStore.showSuccess(t('admin.proxies.importSuccess', { count: stats.imported }))
+      } else {
+        appStore.showError(t('admin.proxies.failedToImport'))
+        return
+      }
+    }
     closeCreateModal()
-    loadProxies()
-  } catch (error: any) {
-    appStore.showError(error.response?.data?.detail || t('admin.proxies.failedToCreate'))
-    console.error('Error creating proxy:', error)
+    await loadProxies()
+  } catch (error: unknown) {
+    appStore.showError(extractApiErrorMessage(error, t('admin.proxies.failedToCreate')))
+    console.error('Error creating or importing proxy:', error)
   } finally {
     submitting.value = false
   }
@@ -1417,6 +2415,8 @@ const handleCreateProxy = async () => {
 const handleEdit = (proxy: Proxy) => {
   editingProxy.value = proxy
   editForm.name = proxy.name
+  editForm.is_public = Boolean(proxy.is_public)
+  editForm.kind = proxy.kind || 'standard'
   editForm.protocol = proxy.protocol
   editForm.host = proxy.host
   editForm.port = proxy.port
@@ -1427,6 +2427,7 @@ const handleEdit = (proxy: Proxy) => {
   editForm.fallback_mode = proxy.fallback_mode || 'none'
   editForm.backup_proxy_id = proxy.backup_proxy_id ?? null
   editForm.expiry_warn_days = proxy.expiry_warn_days ?? 7
+  editForm.xray_raw = typeof proxy.extra?.raw === 'string' ? proxy.extra.raw : ''
   editPasswordVisible.value = false
   editPasswordDirty.value = false
   showEditModal.value = true
@@ -1453,11 +2454,17 @@ const handleUpdateProxy = async () => {
     appStore.showError(t('admin.proxies.portInvalid'))
     return
   }
+  if (editForm.kind === 'xray' && !editForm.xray_raw.trim()) {
+    appStore.showError(t('admin.proxies.xrayNodeUriRequired'))
+    return
+  }
 
   submitting.value = true
   try {
     const updateData: any = {
       name: editForm.name.trim(),
+      is_public: editForm.is_public,
+      kind: editForm.kind,
       protocol: editForm.protocol,
       host: editForm.host.trim(),
       port: editForm.port,
@@ -1467,6 +2474,9 @@ const handleUpdateProxy = async () => {
       fallback_mode: editForm.fallback_mode,
       backup_proxy_id: editForm.fallback_mode === 'proxy' ? editForm.backup_proxy_id : null,
       expiry_warn_days: editForm.expiry_warn_days,
+      extra: editForm.kind === 'xray'
+        ? { ...(editingProxy.value.extra || {}), raw: editForm.xray_raw.trim() }
+        : { ...(editingProxy.value.extra || {}) },
     }
 
     // Only include password if user actually modified the field
@@ -1523,7 +2533,10 @@ const applyLatencyResult = (
 
 const summarizeQualityStatus = (result: ProxyQualityCheckResult): Proxy['quality_status'] => {
   if (result.challenge_count > 0) return 'challenge'
-  if (result.failed_count > 0) return 'failed'
+  if (result.failed_count > 0) {
+    const baseConnected = result.items?.some((item) => item.target === 'base_connectivity' && item.status === 'pass') ?? false
+    return baseConnected ? 'warn' : 'failed'
+  }
   if (result.warn_count > 0) return 'warn'
   return 'healthy'
 }
@@ -1814,13 +2827,7 @@ const fetchAllProxiesForBatch = async (): Promise<Proxy[]> => {
     const response = await adminAPI.proxies.list(
       page,
       pageSize,
-      {
-        protocol: filters.protocol || undefined,
-        status: filters.status as any,
-        search: searchQuery.value || undefined,
-        sort_by: sortState.sort_by,
-        sort_order: sortState.sort_order
-      }
+      buildProxyQueryFilters(),
     )
     result.push(...response.items)
     totalPages = response.pages || 1
@@ -2040,10 +3047,17 @@ function buildAuthPart(row: any): string {
 }
 
 function buildProxyUrl(row: any): string {
+  if (row.kind === 'xray' && typeof row.extra?.raw === 'string' && row.extra.raw.trim()) {
+    return row.extra.raw.trim()
+  }
   return `${row.protocol}://${buildAuthPart(row)}${row.host}:${row.port}`
 }
 
 function getCopyFormats(row: any) {
+  if (row.kind === 'xray') {
+    const nodeURI = buildProxyUrl(row)
+    return [{ label: nodeURI, value: nodeURI }]
+  }
   const hasAuth = row.username || row.password
   const fullUrl = buildProxyUrl(row)
   const formats = [
@@ -2078,6 +3092,7 @@ function closeCopyMenu() {
 onMounted(() => {
   loadProxies()
   loadBackupProxyOptions()
+  void ensureProxySourceFilterOptions()
   document.addEventListener('click', closeCopyMenu)
 })
 

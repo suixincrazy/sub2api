@@ -26,6 +26,11 @@ func TestListModelAvailabilityCandidates_GroupQueryIgnoresTransientState(t *test
 	t.Cleanup(func() { _ = client.Close() })
 	repo := newAccountRepositoryWithSQL(client, db, nil)
 
+	// Group-scoped queries first resolve ownership so a system group cannot
+	// accidentally include user-owned accounts. The account-group query then
+	// carries the configured-state predicates under test.
+	mock.ExpectQuery("group owner lookup").
+		WillReturnRows(sqlmock.NewRows([]string{"owner_user_id"}).AddRow(nil))
 	mock.ExpectQuery("model availability candidates").
 		WillReturnRows(sqlmock.NewRows([]string{"id"}))
 	groupID := int64(42)

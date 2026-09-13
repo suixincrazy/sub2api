@@ -54,6 +54,10 @@ func (Account) Fields() []ent.Field {
 		field.String("name").
 			MaxLen(100).
 			NotEmpty(),
+		field.Int64("owner_user_id").
+			Optional().
+			Nillable().
+			Comment("NULL means system/admin resource; non-NULL means user-owned private resource."),
 		// notes: 管理员备注（可为空）
 		field.String("notes").
 			Optional().
@@ -234,7 +238,9 @@ func (Account) Edges() []ent.Edge {
 // 每个索引对应一个常用的查询条件。
 func (Account) Indexes() []ent.Index {
 	return []ent.Index{
-		index.Fields("platform"),            // 按平台筛选
+		index.Fields("platform"), // 按平台筛选
+		index.Fields("owner_user_id"),
+		index.Fields("owner_user_id", "deleted_at"),
 		index.Fields("type"),                // 按认证类型筛选
 		index.Fields("status"),              // 按状态筛选
 		index.Fields("proxy_id"),            // 按代理筛选

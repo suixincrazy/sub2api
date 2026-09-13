@@ -515,6 +515,13 @@ func registerProxyRoutes(admin *gin.RouterGroup, h *handler.Handlers, stepUpAuth
 		// 代理导出泄露账号密码原文——要求 step-up 2FA
 		proxies.GET("/data", gin.HandlerFunc(stepUpAuth), h.Admin.Proxy.ExportData)
 		proxies.POST("/data", h.Admin.Proxy.ImportData)
+		proxies.POST("/import", h.Admin.Proxy.ImportProxyNodes)
+		proxies.GET("/sources", h.Admin.Proxy.ListProxySources)
+		proxies.POST("/sources", h.Admin.Proxy.CreateProxySource)
+		proxies.POST("/sources/sync-all", h.Admin.Proxy.SyncAllProxySources)
+		proxies.PUT("/sources/:id", h.Admin.Proxy.UpdateProxySource)
+		proxies.DELETE("/sources/:id", h.Admin.Proxy.DeleteProxySource)
+		proxies.POST("/sources/:id/sync", h.Admin.Proxy.SyncProxySource)
 		proxies.GET("/:id", h.Admin.Proxy.GetByID)
 		proxies.POST("", h.Admin.Proxy.Create)
 		proxies.PUT("/:id", h.Admin.Proxy.Update)

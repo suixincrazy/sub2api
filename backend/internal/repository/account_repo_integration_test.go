@@ -752,6 +752,28 @@ func (s *AccountRepoSuite) TestListSchedulable() {
 	s.Require().NotContains(ids, overloaded.ID)
 }
 
+func (s *AccountRepoSuite) TestUserOwnedAccountsStayOutOfSystemPoolAndMatchOwnedGroup() {
+	owner := mustCreateUser(s.T(), s.client, &service.User{Email: "scheduler-owner@example.com"})
+	ownerID := owner.ID
+	systemAccount := mustCreateAccount(s.T(), s.client, &service.Account{Name: "system-pool", Schedulable: true})
+	privateAccount := mustCreateAccount(s.T(), s.client, &service.Account{Name: "private-pool", OwnerUserID: &ownerID, Schedulable: true})
+	privateGroup := mustCreateGroup(s.T(), s.client, &service.Group{
+		Name: "private-group", OwnerUserID: &ownerID, SubscriptionType: service.SubscriptionTypeSubscription,
+	})
+	mustBindAccountToGroup(s.T(), s.client, privateAccount.ID, privateGroup.ID, 1)
+
+	global, err := s.repo.ListSchedulable(s.ctx)
+	s.Require().NoError(err)
+	globalIDs := idsOfAccounts(global)
+	s.Require().Contains(globalIDs, systemAccount.ID)
+	s.Require().NotContains(globalIDs, privateAccount.ID)
+
+	owned, err := s.repo.ListSchedulableByGroupID(s.ctx, privateGroup.ID)
+	s.Require().NoError(err)
+	s.Require().Len(owned, 1)
+	s.Require().Equal(privateAccount.ID, owned[0].ID)
+}
+
 func (s *AccountRepoSuite) TestListSchedulableByGroupID_TimeBoundaries_And_StatusUpdates() {
 	now := time.Now()
 	group := mustCreateGroup(s.T(), s.client, &service.Group{Name: "g-sched"})

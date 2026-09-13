@@ -322,6 +322,9 @@ type SystemSettings struct {
 	// (sidebar entries, purchase-page subscription tab, header badge, /subscriptions route).
 	SubscriptionEnabled bool `json:"subscription_enabled"`
 
+	// User-owned resource workspace switch
+	EnableUserResources bool `json:"enable_user_resources"`
+
 	// Model Plaza feature (public group/model pricing showcase)
 	ModelPlazaEnabled       bool   `json:"model_plaza_enabled"`
 	ModelPlazaRequireAuth   bool   `json:"model_plaza_require_auth"`
@@ -433,6 +436,7 @@ type PublicSettings struct {
 
 	SubscriptionEnabled bool `json:"subscription_enabled"`
 
+	EnableUserResources     bool `json:"enable_user_resources"`
 	ModelPlazaEnabled       bool `json:"model_plaza_enabled"`
 	ModelPlazaRequireAuth   bool `json:"model_plaza_require_auth"`
 	PluginManagementEnabled bool `json:"plugin_management_enabled"`

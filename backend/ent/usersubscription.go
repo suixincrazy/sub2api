@@ -49,6 +49,14 @@ type UserSubscription struct {
 	MonthlyUsageUsd float64 `json:"monthly_usage_usd,omitempty"`
 	// AssignedBy holds the value of the "assigned_by" field.
 	AssignedBy *int64 `json:"assigned_by,omitempty"`
+	// User who can manage this subscription through /my assigned-subscriptions.
+	ManagedByUserID *int64 `json:"managed_by_user_id,omitempty"`
+	// manual | redeem_code | admin | empty legacy
+	SourceType string `json:"source_type,omitempty"`
+	// SourceRedeemCodeID holds the value of the "source_redeem_code_id" field.
+	SourceRedeemCodeID *int64 `json:"source_redeem_code_id,omitempty"`
+	// User who most recently revoked this subscription.
+	RevokedByUserID *int64 `json:"revoked_by_user_id,omitempty"`
 	// AssignedAt holds the value of the "assigned_at" field.
 	AssignedAt time.Time `json:"assigned_at,omitempty"`
 	// Notes holds the value of the "notes" field.
@@ -67,11 +75,13 @@ type UserSubscriptionEdges struct {
 	Group *Group `json:"group,omitempty"`
 	// AssignedByUser holds the value of the assigned_by_user edge.
 	AssignedByUser *User `json:"assigned_by_user,omitempty"`
+	// RevokedByUser holds the value of the revoked_by_user edge.
+	RevokedByUser *User `json:"revoked_by_user,omitempty"`
 	// UsageLogs holds the value of the usage_logs edge.
 	UsageLogs []*UsageLog `json:"usage_logs,omitempty"`
 	// loadedTypes holds the information for reporting if a
 	// type was loaded (or requested) in eager-loading or not.
-	loadedTypes [4]bool
+	loadedTypes [5]bool
 }
 
 // UserOrErr returns the User value or an error if the edge
@@ -107,10 +117,21 @@ func (e UserSubscriptionEdges) AssignedByUserOrErr() (*User, error) {
 	return nil, &NotLoadedError{edge: "assigned_by_user"}
 }
 
+// RevokedByUserOrErr returns the RevokedByUser value or an error if the edge
+// was not loaded in eager-loading, or loaded but was not found.
+func (e UserSubscriptionEdges) RevokedByUserOrErr() (*User, error) {
+	if e.RevokedByUser != nil {
+		return e.RevokedByUser, nil
+	} else if e.loadedTypes[3] {
+		return nil, &NotFoundError{label: user.Label}
+	}
+	return nil, &NotLoadedError{edge: "revoked_by_user"}
+}
+
 // UsageLogsOrErr returns the UsageLogs value or an error if the edge
 // was not loaded in eager-loading.
 func (e UserSubscriptionEdges) UsageLogsOrErr() ([]*UsageLog, error) {
-	if e.loadedTypes[3] {
+	if e.loadedTypes[4] {
 		return e.UsageLogs, nil
 	}
 	return nil, &NotLoadedError{edge: "usage_logs"}
@@ -123,9 +144,9 @@ func (*UserSubscription) scanValues(columns []string) ([]any, error) {
 		switch columns[i] {
 		case usersubscription.FieldDailyUsageUsd, usersubscription.FieldWeeklyUsageUsd, usersubscription.FieldMonthlyUsageUsd:
 			values[i] = new(sql.NullFloat64)
-		case usersubscription.FieldID, usersubscription.FieldUserID, usersubscription.FieldGroupID, usersubscription.FieldAssignedBy:
+		case usersubscription.FieldID, usersubscription.FieldUserID, usersubscription.FieldGroupID, usersubscription.FieldAssignedBy, usersubscription.FieldManagedByUserID, usersubscription.FieldSourceRedeemCodeID, usersubscription.FieldRevokedByUserID:
 			values[i] = new(sql.NullInt64)
-		case usersubscription.FieldStatus, usersubscription.FieldNotes:
+		case usersubscription.FieldStatus, usersubscription.FieldSourceType, usersubscription.FieldNotes:
 			values[i] = new(sql.NullString)
 		case usersubscription.FieldCreatedAt, usersubscription.FieldUpdatedAt, usersubscription.FieldDeletedAt, usersubscription.FieldStartsAt, usersubscription.FieldExpiresAt, usersubscription.FieldDailyWindowStart, usersubscription.FieldWeeklyWindowStart, usersubscription.FieldMonthlyWindowStart, usersubscription.FieldAssignedAt:
 			values[i] = new(sql.NullTime)
@@ -245,6 +266,33 @@ func (_m *UserSubscription) assignValues(columns []string, values []any) error {
 				_m.AssignedBy = new(int64)
 				*_m.AssignedBy = value.Int64
 			}
+		case usersubscription.FieldManagedByUserID:
+			if value, ok := values[i].(*sql.NullInt64); !ok {
+				return fmt.Errorf("unexpected type %T for field managed_by_user_id", values[i])
+			} else if value.Valid {
+				_m.ManagedByUserID = new(int64)
+				*_m.ManagedByUserID = value.Int64
+			}
+		case usersubscription.FieldSourceType:
+			if value, ok := values[i].(*sql.NullString); !ok {
+				return fmt.Errorf("unexpected type %T for field source_type", values[i])
+			} else if value.Valid {
+				_m.SourceType = value.String
+			}
+		case usersubscription.FieldSourceRedeemCodeID:
+			if value, ok := values[i].(*sql.NullInt64); !ok {
+				return fmt.Errorf("unexpected type %T for field source_redeem_code_id", values[i])
+			} else if value.Valid {
+				_m.SourceRedeemCodeID = new(int64)
+				*_m.SourceRedeemCodeID = value.Int64
+			}
+		case usersubscription.FieldRevokedByUserID:
+			if value, ok := values[i].(*sql.NullInt64); !ok {
+				return fmt.Errorf("unexpected type %T for field revoked_by_user_id", values[i])
+			} else if value.Valid {
+				_m.RevokedByUserID = new(int64)
+				*_m.RevokedByUserID = value.Int64
+			}
 		case usersubscription.FieldAssignedAt:
 			if value, ok := values[i].(*sql.NullTime); !ok {
 				return fmt.Errorf("unexpected type %T for field assigned_at", values[i])
@@ -284,6 +332,11 @@ func (_m *UserSubscription) QueryGroup() *GroupQuery {
 // QueryAssignedByUser queries the "assigned_by_user" edge of the UserSubscription entity.
 func (_m *UserSubscription) QueryAssignedByUser() *UserQuery {
 	return NewUserSubscriptionClient(_m.config).QueryAssignedByUser(_m)
+}
+
+// QueryRevokedByUser queries the "revoked_by_user" edge of the UserSubscription entity.
+func (_m *UserSubscription) QueryRevokedByUser() *UserQuery {
+	return NewUserSubscriptionClient(_m.config).QueryRevokedByUser(_m)
 }
 
 // QueryUsageLogs queries the "usage_logs" edge of the UserSubscription entity.
@@ -366,6 +419,24 @@ func (_m *UserSubscription) String() string {
 	builder.WriteString(", ")
 	if v := _m.AssignedBy; v != nil {
 		builder.WriteString("assigned_by=")
+		builder.WriteString(fmt.Sprintf("%v", *v))
+	}
+	builder.WriteString(", ")
+	if v := _m.ManagedByUserID; v != nil {
+		builder.WriteString("managed_by_user_id=")
+		builder.WriteString(fmt.Sprintf("%v", *v))
+	}
+	builder.WriteString(", ")
+	builder.WriteString("source_type=")
+	builder.WriteString(_m.SourceType)
+	builder.WriteString(", ")
+	if v := _m.SourceRedeemCodeID; v != nil {
+		builder.WriteString("source_redeem_code_id=")
+		builder.WriteString(fmt.Sprintf("%v", *v))
+	}
+	builder.WriteString(", ")
+	if v := _m.RevokedByUserID; v != nil {
+		builder.WriteString("revoked_by_user_id=")
 		builder.WriteString(fmt.Sprintf("%v", *v))
 	}
 	builder.WriteString(", ")

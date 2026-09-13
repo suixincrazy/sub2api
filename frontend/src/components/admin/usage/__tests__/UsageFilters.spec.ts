@@ -40,7 +40,7 @@ const messages: Record<string, string> = {
   'common.refresh': 'Refresh',
   'common.reset': 'Reset',
   'admin.usage.cleanup.button': 'Cleanup',
-  'usage.exportExcel': 'Export',
+  'usage.exportCsv': 'Export',
 }
 
 // Mock vue-i18n

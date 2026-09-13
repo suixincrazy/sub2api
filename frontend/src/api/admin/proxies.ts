@@ -8,12 +8,83 @@ import type {
   Proxy,
   ProxyAccountSummary,
   ProxyQualityCheckResult,
+  ProxySourceSyncAllResult,
   CreateProxyRequest,
   UpdateProxyRequest,
   PaginatedResponse,
   AdminDataPayload,
   AdminDataImportResult
 } from '@/types'
+
+export interface AdminProxyImportRequest {
+  name_prefix?: string
+  content: string
+  is_public?: boolean
+}
+
+export interface AdminProxyImportResult {
+  created?: Proxy[]
+  updated?: Proxy[]
+  created_count?: number
+  updated_count?: number
+  imported_count?: number
+  skipped?: number
+  errors?: Array<string | { line?: number; message?: string; error?: string }>
+}
+
+const normalizeImportCount = (value: number | undefined): number | undefined => {
+  if (typeof value !== 'number' || !Number.isFinite(value)) return undefined
+  return Math.max(0, value)
+}
+
+export function getAdminProxyImportCount(result: AdminProxyImportResult): number {
+  const importedCount = normalizeImportCount(result.imported_count)
+  if (importedCount !== undefined) return importedCount
+
+  const createdCount = normalizeImportCount(result.created_count)
+  const updatedCount = normalizeImportCount(result.updated_count)
+  if (createdCount !== undefined || updatedCount !== undefined) {
+    return (createdCount ?? 0) + (updatedCount ?? 0)
+  }
+
+  const created = Array.isArray(result.created) ? result.created.length : 0
+  const updated = Array.isArray(result.updated) ? result.updated.length : 0
+  return created + updated
+}
+
+export interface AdminProxySource {
+  id: number
+  owner_user_id?: number | null
+  name: string
+  subscription_url: string
+  refresh_interval_minutes: number
+  is_public: boolean
+  last_sync_status?: string
+  last_sync_error?: string | null
+  last_synced_at?: string | null
+  last_imported_count?: number
+  sync_enabled?: boolean
+  next_sync_at?: string | null
+  node_count?: number
+  active_node_count?: number
+  sub_traffic_used?: number
+  sub_traffic_total?: number
+  sub_expires_at?: string | null
+  sub_info_updated_at?: string | null
+  created_at?: string
+  updated_at?: string
+}
+
+export interface AdminProxySourcePayload {
+  name: string
+  subscription_url: string
+  refresh_interval_minutes: number
+  is_public: boolean
+  sync_enabled?: boolean
+}
+
+/** Per-source line of a "sync every source" run. Counts only, never node payloads. */
+export type { ProxySourceSyncAllItem, ProxySourceSyncAllResult } from '@/types'
 
 function assertProxyArray(value: unknown): asserts value is Proxy[] {
   if (!Array.isArray(value)) {
@@ -34,6 +105,8 @@ export async function list(
   filters?: {
     protocol?: string
     status?: 'active' | 'inactive' | 'expired'
+    owner_scope?: 'system' | 'user'
+    source_id?: number
     search?: string
     sort_by?: string
     sort_order?: 'asc' | 'desc'
@@ -221,6 +294,53 @@ export async function batchCreate(
   return data
 }
 
+/**
+ * Import standard proxies, modern share links, or Sing-box/Clash configuration.
+ */
+export async function importNodes(payload: AdminProxyImportRequest): Promise<AdminProxyImportResult> {
+  const { data } = await apiClient.post<AdminProxyImportResult>('/admin/proxies/import', payload)
+  return data
+}
+
+export async function listSources(
+  page: number = 1,
+  pageSize: number = 20
+): Promise<PaginatedResponse<AdminProxySource>> {
+  const { data } = await apiClient.get<PaginatedResponse<AdminProxySource>>('/admin/proxies/sources', {
+    params: { page, page_size: pageSize }
+  })
+  return data
+}
+
+export async function createSource(payload: AdminProxySourcePayload): Promise<AdminProxySource> {
+  const { data } = await apiClient.post<AdminProxySource>('/admin/proxies/sources', payload)
+  return data
+}
+
+export async function updateSource(
+  id: number,
+  payload: AdminProxySourcePayload
+): Promise<AdminProxySource> {
+  const { data } = await apiClient.put<AdminProxySource>(`/admin/proxies/sources/${id}`, payload)
+  return data
+}
+
+export async function deleteSource(id: number): Promise<{ message: string }> {
+  const { data } = await apiClient.delete<{ message: string }>(`/admin/proxies/sources/${id}`)
+  return data
+}
+
+export async function syncSource(id: number): Promise<AdminProxyImportResult> {
+  const { data } = await apiClient.post<AdminProxyImportResult>(`/admin/proxies/sources/${id}/sync`)
+  return data
+}
+
+/** Refresh every system-owned source in one request; paused sources are skipped. */
+export async function syncAllSources(): Promise<ProxySourceSyncAllResult> {
+  const { data } = await apiClient.post<ProxySourceSyncAllResult>('/admin/proxies/sources/sync-all')
+  return data
+}
+
 export async function batchDelete(ids: number[]): Promise<{
   deleted_ids: number[]
   skipped: Array<{ id: number; reason: string }>
@@ -278,6 +398,15 @@ export const proxiesAPI = {
   getStats,
   getProxyAccounts,
   batchCreate,
+  importNodes,
+  sources: {
+    list: listSources,
+    create: createSource,
+    update: updateSource,
+    delete: deleteSource,
+    sync: syncSource,
+    syncAll: syncAllSources
+  },
   batchDelete,
   exportData,
   importData

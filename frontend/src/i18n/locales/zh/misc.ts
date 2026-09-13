@@ -134,7 +134,13 @@ export default {
     resetIn: '{time} 后重置',
     quotaEndsIn: '额度将在 {time} 后结束',
     windowNotActive: '等待首次使用',
-    usageOf: '已用 {used} / {limit}'
+    usageOf: '已用 {used} / {limit}',
+    creator: '创建者 #{id}',
+    unsubscribe: '退订',
+    poolHealth: '号池健康',
+    unsubscribeConfirm: '确认退订该订阅？退订后当前 API Key 将不能继续使用该订阅分组。',
+    unsubscribeSuccess: '已退订',
+    unsubscribeFailed: '退订失败'
   },
 
   // Onboarding Tour

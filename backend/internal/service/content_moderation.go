@@ -498,12 +498,15 @@ type ContentModerationHashCache interface {
 }
 
 type ContentModerationService struct {
-	settingRepo              SettingRepository
-	repo                     ContentModerationRepository
-	hashCache                ContentModerationHashCache
-	groupRepo                GroupRepository
-	userRepo                 UserRepository
-	proxyRepo                ProxyRepository
+	settingRepo               SettingRepository
+	repo                      ContentModerationRepository
+	hashCache                 ContentModerationHashCache
+	groupRepo                 GroupRepository
+	userRepo                  UserRepository
+	proxyRepo                 ProxyRepository
+	userResourceDeprovisioner interface {
+		DisableUserAndOwnedResources(context.Context, int64) error
+	}
 	authCacheInvalidator     APIKeyAuthCacheInvalidator
 	emailService             *EmailService
 	httpClient               *http.Client
@@ -601,6 +604,16 @@ func NewContentModerationService(
 		go svc.cleanupWorker()
 	}
 	return svc
+}
+
+// SetUserResourceDeprovisioner wires the shared admin lifecycle operation
+// without making content moderation depend on a concrete admin service.
+func (s *ContentModerationService) SetUserResourceDeprovisioner(deprovisioner interface {
+	DisableUserAndOwnedResources(context.Context, int64) error
+}) {
+	if s != nil {
+		s.userResourceDeprovisioner = deprovisioner
+	}
 }
 
 func (s *ContentModerationService) GetConfig(ctx context.Context) (*ContentModerationConfigView, error) {
@@ -1933,11 +1946,15 @@ func (s *ContentModerationService) applyFlaggedAccountSideEffects(ctx context.Co
 			return false
 		}
 		if user.Status != StatusDisabled {
-			user.Status = StatusDisabled
-			if err := s.userRepo.Update(ctx, user, UserUpdateFields{Status: true}); err != nil {
-				slog.Warn("content_moderation.ban_update_user_failed", "user_id", *log.UserID, "error", err)
+			if s.userResourceDeprovisioner == nil {
+				slog.Warn("content_moderation.ban_lifecycle_unavailable", "user_id", *log.UserID)
 				return false
 			}
+			if err := s.userResourceDeprovisioner.DisableUserAndOwnedResources(ctx, *log.UserID); err != nil {
+				slog.Warn("content_moderation.ban_disable_resources_failed", "user_id", *log.UserID, "error", err)
+				return false
+			}
+			user.Status = StatusDisabled
 			if s.authCacheInvalidator != nil {
 				s.authCacheInvalidator.InvalidateAuthCacheByUserID(ctx, *log.UserID)
 			}

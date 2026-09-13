@@ -27,6 +27,32 @@ func TestFinalizeProxyQualityResult_ScoreAndGrade(t *testing.T) {
 	require.Contains(t, result.Summary, "挑战 1 项")
 }
 
+func TestProxyQualityOverallStatusDistinguishesPartialTargetFailure(t *testing.T) {
+	partial := &ProxyQualityCheckResult{
+		Items:       []ProxyQualityCheckItem{{Target: "base_connectivity", Status: "pass"}},
+		FailedCount: 1,
+	}
+	require.Equal(t, "warn", proxyQualityOverallStatus(partial))
+
+	baseFailed := &ProxyQualityCheckResult{
+		Items:       []ProxyQualityCheckItem{{Target: "base_connectivity", Status: "fail"}},
+		FailedCount: 1,
+	}
+	require.Equal(t, "failed", proxyQualityOverallStatus(baseFailed))
+}
+
+func TestHasCurrentProxyQualityRejectsLegacyCache(t *testing.T) {
+	checkedAt := int64(123)
+
+	require.True(t, hasCurrentProxyQuality(&ProxyLatencyInfo{
+		QualityCheckedAt: &checkedAt,
+		QualityEngine:    proxyQualityEngineVersion,
+	}))
+	require.False(t, hasCurrentProxyQuality(&ProxyLatencyInfo{
+		QualityCheckedAt: &checkedAt,
+	}))
+}
+
 func TestRunProxyQualityTarget_CloudflareChallenge(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "text/html")

@@ -172,6 +172,7 @@ func (r *apiKeyRepository) GetByKeyForAuth(ctx context.Context, key string) (*se
 		WithGroup(func(q *dbent.GroupQuery) {
 			q.Select(
 				group.FieldID,
+				group.FieldOwnerUserID,
 				group.FieldName,
 				group.FieldPlatform,
 				group.FieldIsExclusive,
@@ -967,6 +968,7 @@ func groupEntityToService(g *dbent.Group) *service.Group {
 	return &service.Group{
 		ID:                              g.ID,
 		Name:                            g.Name,
+		OwnerUserID:                     g.OwnerUserID,
 		Description:                     derefString(g.Description),
 		Platform:                        g.Platform,
 		RateMultiplier:                  g.RateMultiplier,

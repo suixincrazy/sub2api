@@ -73,6 +73,8 @@ interface Props {
   platform?: GroupPlatform // Optional platform filter
   mixedScheduling?: boolean // For antigravity accounts: allow anthropic/gemini groups
   searchable?: boolean | 'auto'
+  ownerUserId?: number | null
+  enforceOwner?: boolean
 }
 
 const props = withDefaults(defineProps<Props>(), {
@@ -94,6 +96,9 @@ const filteredGroups = computed(() => {
   let result = authStore.isSimpleMode
     ? props.groups.filter((g) => g.platform !== 'composite')
     : props.groups
+  if (props.enforceOwner) {
+    result = result.filter((group) => (group.owner_user_id ?? null) === (props.ownerUserId ?? null))
+  }
   if (props.platform) {
     // antigravity 账户启用混合调度后，可选择 anthropic/gemini 分组
     if (props.platform === 'antigravity' && props.mixedScheduling) {

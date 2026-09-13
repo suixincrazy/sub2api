@@ -5,6 +5,8 @@ package service
 import (
 	"context"
 	"errors"
+	"os"
+	"path/filepath"
 	"testing"
 	"time"
 
@@ -67,6 +69,21 @@ func TestUpdateServicePerformUpdateNoUpdateReturnsSentinel(t *testing.T) {
 	require.Error(t, err)
 	require.True(t, errors.Is(err, ErrNoUpdateAvailable))
 	require.ErrorIs(t, err, ErrNoUpdateAvailable)
+}
+
+func TestDockerImagesAllowNonRootAtomicUpdates(t *testing.T) {
+	repoRoot := filepath.Join("..", "..", "..")
+	for _, relativePath := range []string{
+		"Dockerfile",
+		"Dockerfile.goreleaser",
+		filepath.Join("deploy", "Dockerfile"),
+	} {
+		t.Run(relativePath, func(t *testing.T) {
+			content, err := os.ReadFile(filepath.Join(repoRoot, relativePath))
+			require.NoError(t, err)
+			require.Contains(t, string(content), "chown -R sub2api:sub2api /app")
+		})
+	}
 }
 
 func newRollbackTestService(current string, releases []*GitHubRelease) *UpdateService {
@@ -184,4 +201,24 @@ func TestUpdateServiceRollbackToVersionAcceptsVPrefix(t *testing.T) {
 	require.Error(t, err)
 	require.NotErrorIs(t, err, ErrRollbackVersionNotAllowed)
 	require.Contains(t, err.Error(), "no compatible release found")
+}
+
+func TestCompareVersionsSupportsXrayRevisions(t *testing.T) {
+	tests := []struct {
+		name     string
+		current  string
+		latest   string
+		expected int
+	}{
+		{name: "newer xray revision", current: "0.1.157-xray1", latest: "0.1.157-xray2", expected: -1},
+		{name: "newer upstream base wins", current: "0.1.157-xray9", latest: "0.1.158-xray1", expected: -1},
+		{name: "equal custom versions", current: "v0.1.157-xray1", latest: "0.1.157-xray1", expected: 0},
+		{name: "custom revision follows base release", current: "0.1.157", latest: "0.1.157-xray1", expected: -1},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			require.Equal(t, tt.expected, compareVersions(tt.current, tt.latest))
+		})
+	}
 }

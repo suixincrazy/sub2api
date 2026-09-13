@@ -35,7 +35,9 @@ import (
 	"github.com/Wei-Shaw/sub2api/ent/promocode"
 	"github.com/Wei-Shaw/sub2api/ent/promocodeusage"
 	"github.com/Wei-Shaw/sub2api/ent/proxy"
+	"github.com/Wei-Shaw/sub2api/ent/proxysource"
 	"github.com/Wei-Shaw/sub2api/ent/redeemcode"
+	"github.com/Wei-Shaw/sub2api/ent/redeemcodeusage"
 	"github.com/Wei-Shaw/sub2api/ent/securitysecret"
 	"github.com/Wei-Shaw/sub2api/ent/setting"
 	"github.com/Wei-Shaw/sub2api/ent/subscriptionplan"
@@ -808,6 +810,33 @@ func (f TraverseProxy) Traverse(ctx context.Context, q ent.Query) error {
 	return fmt.Errorf("unexpected query type %T. expect *ent.ProxyQuery", q)
 }
 
+// The ProxySourceFunc type is an adapter to allow the use of ordinary function as a Querier.
+type ProxySourceFunc func(context.Context, *ent.ProxySourceQuery) (ent.Value, error)
+
+// Query calls f(ctx, q).
+func (f ProxySourceFunc) Query(ctx context.Context, q ent.Query) (ent.Value, error) {
+	if q, ok := q.(*ent.ProxySourceQuery); ok {
+		return f(ctx, q)
+	}
+	return nil, fmt.Errorf("unexpected query type %T. expect *ent.ProxySourceQuery", q)
+}
+
+// The TraverseProxySource type is an adapter to allow the use of ordinary function as Traverser.
+type TraverseProxySource func(context.Context, *ent.ProxySourceQuery) error
+
+// Intercept is a dummy implementation of Intercept that returns the next Querier in the pipeline.
+func (f TraverseProxySource) Intercept(next ent.Querier) ent.Querier {
+	return next
+}
+
+// Traverse calls f(ctx, q).
+func (f TraverseProxySource) Traverse(ctx context.Context, q ent.Query) error {
+	if q, ok := q.(*ent.ProxySourceQuery); ok {
+		return f(ctx, q)
+	}
+	return fmt.Errorf("unexpected query type %T. expect *ent.ProxySourceQuery", q)
+}
+
 // The RedeemCodeFunc type is an adapter to allow the use of ordinary function as a Querier.
 type RedeemCodeFunc func(context.Context, *ent.RedeemCodeQuery) (ent.Value, error)
 
@@ -833,6 +862,33 @@ func (f TraverseRedeemCode) Traverse(ctx context.Context, q ent.Query) error {
 		return f(ctx, q)
 	}
 	return fmt.Errorf("unexpected query type %T. expect *ent.RedeemCodeQuery", q)
+}
+
+// The RedeemCodeUsageFunc type is an adapter to allow the use of ordinary function as a Querier.
+type RedeemCodeUsageFunc func(context.Context, *ent.RedeemCodeUsageQuery) (ent.Value, error)
+
+// Query calls f(ctx, q).
+func (f RedeemCodeUsageFunc) Query(ctx context.Context, q ent.Query) (ent.Value, error) {
+	if q, ok := q.(*ent.RedeemCodeUsageQuery); ok {
+		return f(ctx, q)
+	}
+	return nil, fmt.Errorf("unexpected query type %T. expect *ent.RedeemCodeUsageQuery", q)
+}
+
+// The TraverseRedeemCodeUsage type is an adapter to allow the use of ordinary function as Traverser.
+type TraverseRedeemCodeUsage func(context.Context, *ent.RedeemCodeUsageQuery) error
+
+// Intercept is a dummy implementation of Intercept that returns the next Querier in the pipeline.
+func (f TraverseRedeemCodeUsage) Intercept(next ent.Querier) ent.Querier {
+	return next
+}
+
+// Traverse calls f(ctx, q).
+func (f TraverseRedeemCodeUsage) Traverse(ctx context.Context, q ent.Query) error {
+	if q, ok := q.(*ent.RedeemCodeUsageQuery); ok {
+		return f(ctx, q)
+	}
+	return fmt.Errorf("unexpected query type %T. expect *ent.RedeemCodeUsageQuery", q)
 }
 
 // The SecuritySecretFunc type is an adapter to allow the use of ordinary function as a Querier.
@@ -1214,8 +1270,12 @@ func NewQuery(q ent.Query) (Query, error) {
 		return &query[*ent.PromoCodeUsageQuery, predicate.PromoCodeUsage, promocodeusage.OrderOption]{typ: ent.TypePromoCodeUsage, tq: q}, nil
 	case *ent.ProxyQuery:
 		return &query[*ent.ProxyQuery, predicate.Proxy, proxy.OrderOption]{typ: ent.TypeProxy, tq: q}, nil
+	case *ent.ProxySourceQuery:
+		return &query[*ent.ProxySourceQuery, predicate.ProxySource, proxysource.OrderOption]{typ: ent.TypeProxySource, tq: q}, nil
 	case *ent.RedeemCodeQuery:
 		return &query[*ent.RedeemCodeQuery, predicate.RedeemCode, redeemcode.OrderOption]{typ: ent.TypeRedeemCode, tq: q}, nil
+	case *ent.RedeemCodeUsageQuery:
+		return &query[*ent.RedeemCodeUsageQuery, predicate.RedeemCodeUsage, redeemcodeusage.OrderOption]{typ: ent.TypeRedeemCodeUsage, tq: q}, nil
 	case *ent.SecuritySecretQuery:
 		return &query[*ent.SecuritySecretQuery, predicate.SecuritySecret, securitysecret.OrderOption]{typ: ent.TypeSecuritySecret, tq: q}, nil
 	case *ent.SettingQuery:

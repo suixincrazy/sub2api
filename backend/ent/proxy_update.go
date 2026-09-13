@@ -69,6 +69,61 @@ func (_u *ProxyUpdate) SetNillableName(v *string) *ProxyUpdate {
 	return _u
 }
 
+// SetOwnerUserID sets the "owner_user_id" field.
+func (_u *ProxyUpdate) SetOwnerUserID(v int64) *ProxyUpdate {
+	_u.mutation.ResetOwnerUserID()
+	_u.mutation.SetOwnerUserID(v)
+	return _u
+}
+
+// SetNillableOwnerUserID sets the "owner_user_id" field if the given value is not nil.
+func (_u *ProxyUpdate) SetNillableOwnerUserID(v *int64) *ProxyUpdate {
+	if v != nil {
+		_u.SetOwnerUserID(*v)
+	}
+	return _u
+}
+
+// AddOwnerUserID adds value to the "owner_user_id" field.
+func (_u *ProxyUpdate) AddOwnerUserID(v int64) *ProxyUpdate {
+	_u.mutation.AddOwnerUserID(v)
+	return _u
+}
+
+// ClearOwnerUserID clears the value of the "owner_user_id" field.
+func (_u *ProxyUpdate) ClearOwnerUserID() *ProxyUpdate {
+	_u.mutation.ClearOwnerUserID()
+	return _u
+}
+
+// SetIsPublic sets the "is_public" field.
+func (_u *ProxyUpdate) SetIsPublic(v bool) *ProxyUpdate {
+	_u.mutation.SetIsPublic(v)
+	return _u
+}
+
+// SetNillableIsPublic sets the "is_public" field if the given value is not nil.
+func (_u *ProxyUpdate) SetNillableIsPublic(v *bool) *ProxyUpdate {
+	if v != nil {
+		_u.SetIsPublic(*v)
+	}
+	return _u
+}
+
+// SetKind sets the "kind" field.
+func (_u *ProxyUpdate) SetKind(v string) *ProxyUpdate {
+	_u.mutation.SetKind(v)
+	return _u
+}
+
+// SetNillableKind sets the "kind" field if the given value is not nil.
+func (_u *ProxyUpdate) SetNillableKind(v *string) *ProxyUpdate {
+	if v != nil {
+		_u.SetKind(*v)
+	}
+	return _u
+}
+
 // SetProtocol sets the "protocol" field.
 func (_u *ProxyUpdate) SetProtocol(v string) *ProxyUpdate {
 	_u.mutation.SetProtocol(v)
@@ -247,6 +302,12 @@ func (_u *ProxyUpdate) AddExpiryWarnDays(v int) *ProxyUpdate {
 	return _u
 }
 
+// SetExtra sets the "extra" field.
+func (_u *ProxyUpdate) SetExtra(v map[string]interface{}) *ProxyUpdate {
+	_u.mutation.SetExtra(v)
+	return _u
+}
+
 // AddAccountIDs adds the "accounts" edge to the Account entity by IDs.
 func (_u *ProxyUpdate) AddAccountIDs(ids ...int64) *ProxyUpdate {
 	_u.mutation.AddAccountIDs(ids...)
@@ -384,6 +445,11 @@ func (_u *ProxyUpdate) check() error {
 			return &ValidationError{Name: "name", err: fmt.Errorf(`ent: validator failed for field "Proxy.name": %w`, err)}
 		}
 	}
+	if v, ok := _u.mutation.Kind(); ok {
+		if err := proxy.KindValidator(v); err != nil {
+			return &ValidationError{Name: "kind", err: fmt.Errorf(`ent: validator failed for field "Proxy.kind": %w`, err)}
+		}
+	}
 	if v, ok := _u.mutation.Protocol(); ok {
 		if err := proxy.ProtocolValidator(v); err != nil {
 			return &ValidationError{Name: "protocol", err: fmt.Errorf(`ent: validator failed for field "Proxy.protocol": %w`, err)}
@@ -441,6 +507,21 @@ func (_u *ProxyUpdate) sqlSave(ctx context.Context) (_node int, err error) {
 	if value, ok := _u.mutation.Name(); ok {
 		_spec.SetField(proxy.FieldName, field.TypeString, value)
 	}
+	if value, ok := _u.mutation.OwnerUserID(); ok {
+		_spec.SetField(proxy.FieldOwnerUserID, field.TypeInt64, value)
+	}
+	if value, ok := _u.mutation.AddedOwnerUserID(); ok {
+		_spec.AddField(proxy.FieldOwnerUserID, field.TypeInt64, value)
+	}
+	if _u.mutation.OwnerUserIDCleared() {
+		_spec.ClearField(proxy.FieldOwnerUserID, field.TypeInt64)
+	}
+	if value, ok := _u.mutation.IsPublic(); ok {
+		_spec.SetField(proxy.FieldIsPublic, field.TypeBool, value)
+	}
+	if value, ok := _u.mutation.Kind(); ok {
+		_spec.SetField(proxy.FieldKind, field.TypeString, value)
+	}
 	if value, ok := _u.mutation.Protocol(); ok {
 		_spec.SetField(proxy.FieldProtocol, field.TypeString, value)
 	}
@@ -482,6 +563,9 @@ func (_u *ProxyUpdate) sqlSave(ctx context.Context) (_node int, err error) {
 	}
 	if value, ok := _u.mutation.AddedExpiryWarnDays(); ok {
 		_spec.AddField(proxy.FieldExpiryWarnDays, field.TypeInt, value)
+	}
+	if value, ok := _u.mutation.Extra(); ok {
+		_spec.SetField(proxy.FieldExtra, field.TypeJSON, value)
 	}
 	if _u.mutation.AccountsCleared() {
 		edge := &sqlgraph.EdgeSpec{
@@ -658,6 +742,61 @@ func (_u *ProxyUpdateOne) SetName(v string) *ProxyUpdateOne {
 func (_u *ProxyUpdateOne) SetNillableName(v *string) *ProxyUpdateOne {
 	if v != nil {
 		_u.SetName(*v)
+	}
+	return _u
+}
+
+// SetOwnerUserID sets the "owner_user_id" field.
+func (_u *ProxyUpdateOne) SetOwnerUserID(v int64) *ProxyUpdateOne {
+	_u.mutation.ResetOwnerUserID()
+	_u.mutation.SetOwnerUserID(v)
+	return _u
+}
+
+// SetNillableOwnerUserID sets the "owner_user_id" field if the given value is not nil.
+func (_u *ProxyUpdateOne) SetNillableOwnerUserID(v *int64) *ProxyUpdateOne {
+	if v != nil {
+		_u.SetOwnerUserID(*v)
+	}
+	return _u
+}
+
+// AddOwnerUserID adds value to the "owner_user_id" field.
+func (_u *ProxyUpdateOne) AddOwnerUserID(v int64) *ProxyUpdateOne {
+	_u.mutation.AddOwnerUserID(v)
+	return _u
+}
+
+// ClearOwnerUserID clears the value of the "owner_user_id" field.
+func (_u *ProxyUpdateOne) ClearOwnerUserID() *ProxyUpdateOne {
+	_u.mutation.ClearOwnerUserID()
+	return _u
+}
+
+// SetIsPublic sets the "is_public" field.
+func (_u *ProxyUpdateOne) SetIsPublic(v bool) *ProxyUpdateOne {
+	_u.mutation.SetIsPublic(v)
+	return _u
+}
+
+// SetNillableIsPublic sets the "is_public" field if the given value is not nil.
+func (_u *ProxyUpdateOne) SetNillableIsPublic(v *bool) *ProxyUpdateOne {
+	if v != nil {
+		_u.SetIsPublic(*v)
+	}
+	return _u
+}
+
+// SetKind sets the "kind" field.
+func (_u *ProxyUpdateOne) SetKind(v string) *ProxyUpdateOne {
+	_u.mutation.SetKind(v)
+	return _u
+}
+
+// SetNillableKind sets the "kind" field if the given value is not nil.
+func (_u *ProxyUpdateOne) SetNillableKind(v *string) *ProxyUpdateOne {
+	if v != nil {
+		_u.SetKind(*v)
 	}
 	return _u
 }
@@ -840,6 +979,12 @@ func (_u *ProxyUpdateOne) AddExpiryWarnDays(v int) *ProxyUpdateOne {
 	return _u
 }
 
+// SetExtra sets the "extra" field.
+func (_u *ProxyUpdateOne) SetExtra(v map[string]interface{}) *ProxyUpdateOne {
+	_u.mutation.SetExtra(v)
+	return _u
+}
+
 // AddAccountIDs adds the "accounts" edge to the Account entity by IDs.
 func (_u *ProxyUpdateOne) AddAccountIDs(ids ...int64) *ProxyUpdateOne {
 	_u.mutation.AddAccountIDs(ids...)
@@ -990,6 +1135,11 @@ func (_u *ProxyUpdateOne) check() error {
 			return &ValidationError{Name: "name", err: fmt.Errorf(`ent: validator failed for field "Proxy.name": %w`, err)}
 		}
 	}
+	if v, ok := _u.mutation.Kind(); ok {
+		if err := proxy.KindValidator(v); err != nil {
+			return &ValidationError{Name: "kind", err: fmt.Errorf(`ent: validator failed for field "Proxy.kind": %w`, err)}
+		}
+	}
 	if v, ok := _u.mutation.Protocol(); ok {
 		if err := proxy.ProtocolValidator(v); err != nil {
 			return &ValidationError{Name: "protocol", err: fmt.Errorf(`ent: validator failed for field "Proxy.protocol": %w`, err)}
@@ -1064,6 +1214,21 @@ func (_u *ProxyUpdateOne) sqlSave(ctx context.Context) (_node *Proxy, err error)
 	if value, ok := _u.mutation.Name(); ok {
 		_spec.SetField(proxy.FieldName, field.TypeString, value)
 	}
+	if value, ok := _u.mutation.OwnerUserID(); ok {
+		_spec.SetField(proxy.FieldOwnerUserID, field.TypeInt64, value)
+	}
+	if value, ok := _u.mutation.AddedOwnerUserID(); ok {
+		_spec.AddField(proxy.FieldOwnerUserID, field.TypeInt64, value)
+	}
+	if _u.mutation.OwnerUserIDCleared() {
+		_spec.ClearField(proxy.FieldOwnerUserID, field.TypeInt64)
+	}
+	if value, ok := _u.mutation.IsPublic(); ok {
+		_spec.SetField(proxy.FieldIsPublic, field.TypeBool, value)
+	}
+	if value, ok := _u.mutation.Kind(); ok {
+		_spec.SetField(proxy.FieldKind, field.TypeString, value)
+	}
 	if value, ok := _u.mutation.Protocol(); ok {
 		_spec.SetField(proxy.FieldProtocol, field.TypeString, value)
 	}
@@ -1105,6 +1270,9 @@ func (_u *ProxyUpdateOne) sqlSave(ctx context.Context) (_node *Proxy, err error)
 	}
 	if value, ok := _u.mutation.AddedExpiryWarnDays(); ok {
 		_spec.AddField(proxy.FieldExpiryWarnDays, field.TypeInt, value)
+	}
+	if value, ok := _u.mutation.Extra(); ok {
+		_spec.SetField(proxy.FieldExtra, field.TypeJSON, value)
 	}
 	if _u.mutation.AccountsCleared() {
 		edge := &sqlgraph.EdgeSpec{

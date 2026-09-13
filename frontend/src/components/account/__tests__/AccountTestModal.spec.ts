@@ -3,14 +3,23 @@ import { flushPromises, mount } from '@vue/test-utils'
 import { defineComponent } from 'vue'
 import AccountTestModal from '../AccountTestModal.vue'
 
-const { getAvailableModelsMock } = vi.hoisted(() => ({
-  getAvailableModelsMock: vi.fn()
+const { getAvailableModelsMock, getMyAvailableModelsMock } = vi.hoisted(() => ({
+  getAvailableModelsMock: vi.fn(),
+  getMyAvailableModelsMock: vi.fn()
 }))
 
 vi.mock('@/api/admin', () => ({
   adminAPI: {
     accounts: {
       getAvailableModels: getAvailableModelsMock
+    }
+  }
+}))
+
+vi.mock('@/api/myResources', () => ({
+  myResourcesApi: {
+    accounts: {
+      getAvailableModels: getMyAvailableModelsMock
     }
   }
 }))
@@ -102,6 +111,10 @@ describe('AccountTestModal', () => {
     getAvailableModelsMock.mockResolvedValue([
       { id: 'gpt-5.4', display_name: 'GPT-5.4' }
     ])
+    getMyAvailableModelsMock.mockReset()
+    getMyAvailableModelsMock.mockResolvedValue([
+      { id: 'gpt-5.6', display_name: 'GPT-5.6 (Sol)' }
+    ])
     global.fetch = vi.fn().mockResolvedValue({
       ok: true,
       body: {
@@ -121,7 +134,7 @@ describe('AccountTestModal', () => {
   it('posts compact mode for OpenAI compact probe', async () => {
     const wrapper = mount(AccountTestModal, {
       props: {
-        show: true,
+        show: false,
         account: buildAccount()
       },
       global: {
@@ -134,6 +147,7 @@ describe('AccountTestModal', () => {
       }
     })
 
+    await wrapper.setProps({ show: true })
     await flushPromises()
     ;(wrapper.vm as any).selectedModelId = 'gpt-5.4'
     ;(wrapper.vm as any).testMode = 'compact'
@@ -145,6 +159,38 @@ describe('AccountTestModal', () => {
     expect(JSON.parse(options.body)).toMatchObject({
       model_id: 'gpt-5.4',
       mode: 'compact'
+    })
+  })
+
+  it('submits an edited prompt for a regular account test', async () => {
+    const wrapper = mount(AccountTestModal, {
+      props: {
+        show: false,
+        account: buildAccount()
+      },
+      global: {
+        stubs: {
+          BaseDialog: BaseDialogStub,
+          Select: SelectStub,
+          TextArea: TextAreaStub,
+          Icon: true
+        }
+      }
+    })
+
+    await wrapper.setProps({ show: true })
+    await flushPromises()
+    const promptInput = wrapper.get('#account-test-prompt')
+    expect((promptInput.element as HTMLTextAreaElement).value).toBe('hi')
+    await promptInput.setValue('Reply with pong')
+    await (wrapper.vm as any).startTest()
+    await flushPromises()
+
+    const [, options] = (global.fetch as any).mock.calls[0]
+    expect(JSON.parse(options.body)).toMatchObject({
+      model_id: 'gpt-5.4',
+      prompt: 'Reply with pong',
+      mode: 'default'
     })
   })
 
@@ -188,5 +234,37 @@ describe('AccountTestModal', () => {
     await flushPromises()
 
     expect(wrapper.text()).toContain('已通过 /v1/chat/completions 验证')
+  })
+
+  it('uses owner-scoped model and stream endpoints for My Accounts', async () => {
+    const wrapper = mount(AccountTestModal, {
+      props: {
+        show: false,
+        account: buildAccount(),
+        scope: 'user'
+      },
+      global: {
+        stubs: {
+          BaseDialog: BaseDialogStub,
+          Select: SelectStub,
+          TextArea: TextAreaStub,
+          Icon: true
+        }
+      }
+    })
+
+    await wrapper.setProps({ show: true })
+    await flushPromises()
+    expect(getMyAvailableModelsMock).toHaveBeenCalledWith(1)
+    expect(getAvailableModelsMock).not.toHaveBeenCalled()
+
+    ;(wrapper.vm as any).selectedModelId = 'gpt-5.6'
+    await (wrapper.vm as any).startTest()
+    await flushPromises()
+
+    const [url, options] = (global.fetch as any).mock.calls[0]
+    expect(url).toContain('/my/accounts/1/test/stream')
+    expect(url).not.toContain('/admin/accounts/')
+    expect(JSON.parse(options.body)).toMatchObject({ model_id: 'gpt-5.6' })
   })
 })

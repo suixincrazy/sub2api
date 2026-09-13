@@ -117,6 +117,34 @@ func ProvideOpenAIOAuthService(
 	return svc
 }
 
+func ProvideUserResourceService(
+	db *sql.DB,
+	subscriptionService *SubscriptionService,
+	billingCacheService *BillingCacheService,
+	authCacheInvalidator APIKeyAuthCacheInvalidator,
+	oauthService *OAuthService,
+	openAIOAuthService *OpenAIOAuthService,
+	geminiOAuthService *GeminiOAuthService,
+	antigravityOAuthService *AntigravityOAuthService,
+	grokOAuthService *GrokOAuthService,
+	dashboardService *DashboardService,
+	groupCapacityService *GroupCapacityService,
+	userGroupRateRepo UserGroupRateRepository,
+	proxyProber ProxyExitInfoProber,
+	proxyLatencyCache ProxyLatencyCache,
+	accountTestService *AccountTestService,
+	tokenRefreshService *TokenRefreshService,
+) *UserResourceService {
+	svc := NewUserResourceService(db, subscriptionService, billingCacheService, authCacheInvalidator)
+	svc.SetAccountMaintenanceServices(accountTestService, tokenRefreshService)
+	svc.SetOAuthServices(oauthService, openAIOAuthService, geminiOAuthService, antigravityOAuthService, grokOAuthService)
+	svc.SetGroupSupportServices(dashboardService, groupCapacityService, userGroupRateRepo)
+	svc.SetProxyObservabilityServices(proxyProber, proxyLatencyCache)
+	svc.StartProxyQualityWorkers()
+	svc.StartProxySourceScheduler(time.Minute)
+	return svc
+}
+
 // ProvideTokenRefreshService creates and starts TokenRefreshService
 func ProvideTokenRefreshService(
 	accountRepo AccountRepository,
@@ -838,6 +866,22 @@ func ProvideAPIKeyService(
 	return svc
 }
 
+func ProvideContentModerationService(
+	settingRepo SettingRepository,
+	repo ContentModerationRepository,
+	hashCache ContentModerationHashCache,
+	groupRepo GroupRepository,
+	userRepo UserRepository,
+	proxyRepo ProxyRepository,
+	authCacheInvalidator APIKeyAuthCacheInvalidator,
+	emailService *EmailService,
+	adminService AdminService,
+) *ContentModerationService {
+	svc := NewContentModerationService(settingRepo, repo, hashCache, groupRepo, userRepo, proxyRepo, authCacheInvalidator, emailService)
+	svc.SetUserResourceDeprovisioner(adminService)
+	return svc
+}
+
 // ProviderSet is the Wire provider set for all services
 var ProviderSet = wire.NewSet(
 	// Core services
@@ -918,6 +962,7 @@ var ProviderSet = wire.NewSet(
 	NewTencentCaptchaService,
 	NewAliyunCaptchaService,
 	NewSubscriptionService,
+	ProvideUserResourceService,
 	wire.Bind(new(DefaultSubscriptionAssigner), new(*SubscriptionService)),
 	ProvideConcurrencyService,
 	ProvideUserMessageQueueService,

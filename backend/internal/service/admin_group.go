@@ -47,6 +47,23 @@ func (s *adminServiceImpl) ListGroups(ctx context.Context, page, pageSize int, p
 	return groups, result.Total, nil
 }
 
+type groupOwnerScopeRepository interface {
+	ListWithOwnerScope(ctx context.Context, params pagination.PaginationParams, platform, status, search string, isExclusive *bool, ownerScope string) ([]Group, *pagination.PaginationResult, error)
+}
+
+func (s *adminServiceImpl) ListGroupsByOwnerScope(ctx context.Context, page, pageSize int, platform, status, search string, isExclusive *bool, ownerScope, sortBy, sortOrder string) ([]Group, int64, error) {
+	repo, ok := s.groupRepo.(groupOwnerScopeRepository)
+	if !ok {
+		return nil, 0, infraerrors.ServiceUnavailable("RESOURCE_OWNER_FILTER_UNAVAILABLE", "resource owner filter is not available")
+	}
+	params := pagination.PaginationParams{Page: page, PageSize: pageSize, SortBy: sortBy, SortOrder: sortOrder}
+	groups, result, err := repo.ListWithOwnerScope(ctx, params, platform, status, search, isExclusive, ownerScope)
+	if err != nil {
+		return nil, 0, err
+	}
+	return groups, result.Total, nil
+}
+
 func (s *adminServiceImpl) GetAllGroups(ctx context.Context) ([]Group, error) {
 	return s.groupRepo.ListActive(ctx)
 }
@@ -493,6 +510,9 @@ func (s *adminServiceImpl) CreateGroup(ctx context.Context, input *CreateGroupIn
 		if err := s.validateFallbackGroup(ctx, 0, *input.FallbackGroupID); err != nil {
 			return nil, err
 		}
+		if err := s.validateGroupReferenceOwner(ctx, nil, *input.FallbackGroupID); err != nil {
+			return nil, err
+		}
 	}
 	fallbackOnInvalidRequest := input.FallbackGroupIDOnInvalidRequest
 	if fallbackOnInvalidRequest != nil && *fallbackOnInvalidRequest <= 0 {
@@ -503,6 +523,12 @@ func (s *adminServiceImpl) CreateGroup(ctx context.Context, input *CreateGroupIn
 		if err := s.validateFallbackGroupOnInvalidRequest(ctx, 0, platform, subscriptionType, *fallbackOnInvalidRequest); err != nil {
 			return nil, err
 		}
+		if err := s.validateGroupReferenceOwner(ctx, nil, *fallbackOnInvalidRequest); err != nil {
+			return nil, err
+		}
+	}
+	if err := s.validateModelRoutingOwner(ctx, nil, input.ModelRouting); err != nil {
+		return nil, err
 	}
 
 	// MCPXMLInject：默认为 true，仅当显式传入 false 时关闭
@@ -535,6 +561,9 @@ func (s *adminServiceImpl) CreateGroup(ctx context.Context, input *CreateGroupIn
 			}
 			if !canCopyAccountsFromGroupPlatform(platform, srcGroup.Platform) {
 				return nil, fmt.Errorf("source group %d platform mismatch: expected %s, got %s", srcGroupID, platform, srcGroup.Platform)
+			}
+			if !sameResourceOwner(nil, srcGroup.OwnerUserID) {
+				return nil, fmt.Errorf("source group %d owner mismatch", srcGroupID)
 			}
 		}
 
@@ -709,6 +738,60 @@ func (s *adminServiceImpl) validateFallbackGroup(ctx context.Context, currentGro
 		}
 		nextID = *fallbackGroup.FallbackGroupID
 	}
+}
+
+func sameResourceOwner(expected, actual *int64) bool {
+	if expected == nil || actual == nil {
+		return expected == nil && actual == nil
+	}
+	return *expected == *actual
+}
+
+func (s *adminServiceImpl) validateGroupReferenceOwner(ctx context.Context, expectedOwner *int64, groupID int64) error {
+	if groupID <= 0 {
+		return nil
+	}
+	referenced, err := s.groupRepo.GetByIDLite(ctx, groupID)
+	if err != nil {
+		return err
+	}
+	if !sameResourceOwner(expectedOwner, referenced.OwnerUserID) {
+		return errors.New("referenced group owner does not match the current group owner")
+	}
+	return nil
+}
+
+func (s *adminServiceImpl) validateModelRoutingOwner(ctx context.Context, expectedOwner *int64, routing map[string][]int64) error {
+	if len(routing) == 0 {
+		return nil
+	}
+	seen := make(map[int64]struct{})
+	ids := make([]int64, 0)
+	for _, accountIDs := range routing {
+		for _, accountID := range accountIDs {
+			if accountID <= 0 {
+				return errors.New("model routing contains an invalid account id")
+			}
+			if _, ok := seen[accountID]; ok {
+				continue
+			}
+			seen[accountID] = struct{}{}
+			ids = append(ids, accountID)
+		}
+	}
+	accounts, err := s.accountRepo.GetByIDs(ctx, ids)
+	if err != nil {
+		return err
+	}
+	if len(accounts) != len(ids) {
+		return errors.New("model routing contains an unknown account")
+	}
+	for _, account := range accounts {
+		if !sameResourceOwner(expectedOwner, account.OwnerUserID) {
+			return errors.New("model routing account owner does not match the group owner")
+		}
+	}
+	return nil
 }
 
 // validateFallbackGroupOnInvalidRequest 校验无效请求兜底分组的有效性
@@ -934,6 +1017,9 @@ func (s *adminServiceImpl) UpdateGroup(ctx context.Context, id int64, input *Upd
 			if err := s.validateFallbackGroup(ctx, id, *input.FallbackGroupID); err != nil {
 				return nil, err
 			}
+			if err := s.validateGroupReferenceOwner(ctx, group.OwnerUserID, *input.FallbackGroupID); err != nil {
+				return nil, err
+			}
 			group.FallbackGroupID = input.FallbackGroupID
 		} else {
 			// 传入 0 或负数表示清除降级分组
@@ -952,11 +1038,17 @@ func (s *adminServiceImpl) UpdateGroup(ctx context.Context, id int64, input *Upd
 		if err := s.validateFallbackGroupOnInvalidRequest(ctx, id, group.Platform, group.SubscriptionType, *fallbackOnInvalidRequest); err != nil {
 			return nil, err
 		}
+		if err := s.validateGroupReferenceOwner(ctx, group.OwnerUserID, *fallbackOnInvalidRequest); err != nil {
+			return nil, err
+		}
 	}
 	group.FallbackGroupIDOnInvalidRequest = fallbackOnInvalidRequest
 
 	// 模型路由配置
 	if input.ModelRouting != nil {
+		if err := s.validateModelRoutingOwner(ctx, group.OwnerUserID, input.ModelRouting); err != nil {
+			return nil, err
+		}
 		group.ModelRouting = input.ModelRouting
 	}
 	if input.ModelRoutingEnabled != nil {

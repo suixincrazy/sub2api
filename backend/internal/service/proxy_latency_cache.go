@@ -24,6 +24,8 @@ type ProxyLatencyInfo struct {
 	UpdatedAt        time.Time `json:"updated_at"`
 }
 
+// proxyQualityEngineVersion distinguishes current quality results from cache
+// entries written before the runtime-backed probe was introduced.
 const proxyQualityEngineVersion = "runtime-v2"
 
 func hasCurrentProxyQuality(info *ProxyLatencyInfo) bool {

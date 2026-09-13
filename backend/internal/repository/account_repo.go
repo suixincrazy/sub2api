@@ -139,6 +139,7 @@ func createAccountRecord(ctx context.Context, client *dbent.Client, account *ser
 
 	builder := client.Account.Create().
 		SetName(account.Name).
+		SetNillableOwnerUserID(account.OwnerUserID).
 		SetNillableNotes(account.Notes).
 		SetPlatform(account.Platform).
 		SetType(account.Type).
@@ -533,6 +534,7 @@ func (r *accountRepository) updateLockedAccount(
 
 	builder := client.Account.UpdateOneID(account.ID).
 		SetName(account.Name).
+		SetNillableOwnerUserID(account.OwnerUserID).
 		SetNillableNotes(account.Notes).
 		SetPlatform(account.Platform).
 		SetType(account.Type).
@@ -1011,7 +1013,21 @@ func (r *accountRepository) accountListFilteredQuery(platform, accountType, stat
 }
 
 func (r *accountRepository) ListWithFilters(ctx context.Context, params pagination.PaginationParams, platform, accountType, status, search string, groupID int64, privacyMode string) ([]service.Account, *pagination.PaginationResult, error) {
+	return r.listWithFiltersAndOwnerScope(ctx, params, platform, accountType, status, search, groupID, privacyMode, "")
+}
+
+func (r *accountRepository) ListWithOwnerScope(ctx context.Context, params pagination.PaginationParams, platform, accountType, status, search string, groupID int64, privacyMode, ownerScope string) ([]service.Account, *pagination.PaginationResult, error) {
+	return r.listWithFiltersAndOwnerScope(ctx, params, platform, accountType, status, search, groupID, privacyMode, ownerScope)
+}
+
+func (r *accountRepository) listWithFiltersAndOwnerScope(ctx context.Context, params pagination.PaginationParams, platform, accountType, status, search string, groupID int64, privacyMode, ownerScope string) ([]service.Account, *pagination.PaginationResult, error) {
 	q := r.accountListFilteredQuery(platform, accountType, status, search, groupID, privacyMode)
+	switch ownerScope {
+	case service.ResourceOwnerScopeSystem:
+		q = q.Where(dbaccount.OwnerUserIDIsNil())
+	case service.ResourceOwnerScopeUser:
+		q = q.Where(dbaccount.OwnerUserIDNotNil())
+	}
 	// Clone before Count so interceptor-appended predicates (SoftDeleteMixin's
 	// deleted_at IS NULL) don't accumulate on the shared builder and pollute the
 	// subsequent list query. Same pattern used in group_repo/promo_code_repo/user_repo
@@ -1041,7 +1057,22 @@ func (r *accountRepository) ListWithFilters(ctx context.Context, params paginati
 }
 
 func (r *accountRepository) ListAllWithFilters(ctx context.Context, platform, accountType, status, search string, groupID int64, privacyMode string) ([]service.Account, error) {
-	accounts, err := r.accountListFilteredQuery(platform, accountType, status, search, groupID, privacyMode).All(ctx)
+	return r.listAllWithFiltersAndOwnerScope(ctx, platform, accountType, status, search, groupID, privacyMode, "")
+}
+
+func (r *accountRepository) ListAllWithOwnerScope(ctx context.Context, platform, accountType, status, search string, groupID int64, privacyMode, ownerScope string) ([]service.Account, error) {
+	return r.listAllWithFiltersAndOwnerScope(ctx, platform, accountType, status, search, groupID, privacyMode, ownerScope)
+}
+
+func (r *accountRepository) listAllWithFiltersAndOwnerScope(ctx context.Context, platform, accountType, status, search string, groupID int64, privacyMode, ownerScope string) ([]service.Account, error) {
+	q := r.accountListFilteredQuery(platform, accountType, status, search, groupID, privacyMode)
+	switch ownerScope {
+	case service.ResourceOwnerScopeSystem:
+		q = q.Where(dbaccount.OwnerUserIDIsNil())
+	case service.ResourceOwnerScopeUser:
+		q = q.Where(dbaccount.OwnerUserIDNotNil())
+	}
+	accounts, err := q.All(ctx)
 	if err != nil {
 		return nil, err
 	}
@@ -1927,6 +1958,7 @@ func (r *accountRepository) ListSchedulableAccountLoads(ctx context.Context) ([]
 func (r *accountRepository) schedulableAccountsQuery(now time.Time) *dbent.AccountQuery {
 	return r.client.Account.Query().
 		Where(
+			dbaccount.OwnerUserIDIsNil(),
 			dbaccount.StatusEQ(service.StatusActive),
 			dbaccount.SchedulableEQ(true),
 			tempUnschedulablePredicate(),
@@ -1983,6 +2015,9 @@ func (r *accountRepository) ListSchedulableCapacityByGroupIDs(ctx context.Contex
 			COALESCE(a.session_window_status, '') AS session_window_status
 		FROM account_groups ag
 		JOIN accounts a ON a.id = ag.account_id
+		JOIN groups g ON g.id = ag.group_id
+			AND g.deleted_at IS NULL
+			AND a.owner_user_id IS NOT DISTINCT FROM g.owner_user_id
 		WHERE ag.group_id = ANY($1)
 			AND a.deleted_at IS NULL
 			AND a.status = $2
@@ -2032,6 +2067,7 @@ func (r *accountRepository) ListSchedulableByPlatform(ctx context.Context, platf
 	now := time.Now()
 	accounts, err := r.client.Account.Query().
 		Where(
+			dbaccount.OwnerUserIDIsNil(),
 			dbaccount.PlatformEQ(platform),
 			dbaccount.StatusEQ(service.StatusActive),
 			dbaccount.SchedulableEQ(true),
@@ -2066,6 +2102,7 @@ func (r *accountRepository) ListSchedulableByPlatforms(ctx context.Context, plat
 	now := time.Now()
 	accounts, err := r.client.Account.Query().
 		Where(
+			dbaccount.OwnerUserIDIsNil(),
 			dbaccount.PlatformIn(platforms...),
 			dbaccount.StatusEQ(service.StatusActive),
 			dbaccount.SchedulableEQ(true),
@@ -2086,6 +2123,7 @@ func (r *accountRepository) ListSchedulableUngroupedByPlatform(ctx context.Conte
 	now := time.Now()
 	accounts, err := r.client.Account.Query().
 		Where(
+			dbaccount.OwnerUserIDIsNil(),
 			dbaccount.PlatformEQ(platform),
 			dbaccount.StatusEQ(service.StatusActive),
 			dbaccount.SchedulableEQ(true),
@@ -2110,6 +2148,7 @@ func (r *accountRepository) ListSchedulableUngroupedByPlatforms(ctx context.Cont
 	now := time.Now()
 	accounts, err := r.client.Account.Query().
 		Where(
+			dbaccount.OwnerUserIDIsNil(),
 			dbaccount.PlatformIn(platforms...),
 			dbaccount.StatusEQ(service.StatusActive),
 			dbaccount.SchedulableEQ(true),
@@ -3181,12 +3220,28 @@ type accountGroupQueryOptions struct {
 }
 
 func (r *accountRepository) queryAccountsByGroup(ctx context.Context, groupID int64, opts accountGroupQueryOptions) ([]service.Account, error) {
+	groupEntity, err := r.client.Group.Query().
+		Where(dbgroup.IDEQ(groupID)).
+		Select(dbgroup.FieldOwnerUserID).
+		Only(ctx)
+	if dbent.IsNotFound(err) {
+		return []service.Account{}, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+
 	q := r.client.AccountGroup.Query().
 		Where(dbaccountgroup.GroupIDEQ(groupID))
 
 	// 通过 account_groups 中间表查询账号，并按需叠加状态/平台/调度能力过滤。
 	preds := make([]dbpredicate.Account, 0, 6)
 	preds = append(preds, dbaccount.DeletedAtIsNil())
+	if groupEntity.OwnerUserID == nil {
+		preds = append(preds, dbaccount.OwnerUserIDIsNil())
+	} else {
+		preds = append(preds, dbaccount.OwnerUserIDEQ(*groupEntity.OwnerUserID))
+	}
 	if opts.status != "" {
 		preds = append(preds, dbaccount.StatusEQ(opts.status))
 	}
@@ -3499,6 +3554,7 @@ func accountEntityToService(m *dbent.Account) *service.Account {
 	return &service.Account{
 		ID:                      m.ID,
 		Name:                    m.Name,
+		OwnerUserID:             m.OwnerUserID,
 		Notes:                   m.Notes,
 		Platform:                m.Platform,
 		Type:                    m.Type,

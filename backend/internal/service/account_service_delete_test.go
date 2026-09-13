@@ -24,10 +24,12 @@ import (
 //   - deleteErr: 模拟 Delete 返回的错误
 //   - deletedIDs: 记录被调用删除的账号 ID，用于断言验证
 type accountRepoStub struct {
-	exists     bool    // ExistsByID 的返回值
-	existsErr  error   // ExistsByID 的错误返回值
-	deleteErr  error   // Delete 的错误返回值
-	deletedIDs []int64 // 记录已删除的账号 ID 列表
+	exists       bool    // ExistsByID 的返回值
+	existsErr    error   // ExistsByID 的错误返回值
+	deleteErr    error   // Delete 的错误返回值
+	deletedIDs   []int64 // 记录已删除的账号 ID 列表
+	accountsByID map[int64]*Account
+	getByIDsErr  error
 }
 
 // 以下方法在本测试中不应被调用，使用 panic 确保测试失败时能快速定位问题
@@ -41,7 +43,16 @@ func (s *accountRepoStub) GetByID(ctx context.Context, id int64) (*Account, erro
 }
 
 func (s *accountRepoStub) GetByIDs(ctx context.Context, ids []int64) ([]*Account, error) {
-	panic("unexpected GetByIDs call")
+	if s.getByIDsErr != nil {
+		return nil, s.getByIDsErr
+	}
+	accounts := make([]*Account, 0, len(ids))
+	for _, id := range ids {
+		if account := s.accountsByID[id]; account != nil {
+			accounts = append(accounts, account)
+		}
+	}
+	return accounts, nil
 }
 
 // ExistsByID 返回预设的存在性检查结果。

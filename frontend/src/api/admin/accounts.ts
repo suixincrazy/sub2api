@@ -49,6 +49,7 @@ export async function list(
     group?: string
     search?: string
     privacy_mode?: string
+    owner_scope?: 'system' | 'user'
     lite?: string
     include_scheduler_score?: string
     sort_by?: string
@@ -124,6 +125,7 @@ export async function listWithEtag(
     group?: string
     search?: string
     privacy_mode?: string
+    owner_scope?: 'system' | 'user'
     lite?: string
     include_scheduler_score?: string
     sort_by?: string
@@ -654,6 +656,8 @@ export interface SyncUpstreamPreviewParams {
   type: string
   base_url?: string
   api_key: string
+  account_mode?: string
+  api_protocol?: string
   model_mapping?: Record<string, string>
 }
 

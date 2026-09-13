@@ -30,6 +30,7 @@ type UserSubscriptionQuery struct {
 	withUser           *UserQuery
 	withGroup          *GroupQuery
 	withAssignedByUser *UserQuery
+	withRevokedByUser  *UserQuery
 	withUsageLogs      *UsageLogQuery
 	modifiers          []func(*sql.Selector)
 	// intermediate query (i.e. traversal path).
@@ -127,6 +128,28 @@ func (_q *UserSubscriptionQuery) QueryAssignedByUser() *UserQuery {
 			sqlgraph.From(usersubscription.Table, usersubscription.FieldID, selector),
 			sqlgraph.To(user.Table, user.FieldID),
 			sqlgraph.Edge(sqlgraph.M2O, true, usersubscription.AssignedByUserTable, usersubscription.AssignedByUserColumn),
+		)
+		fromU = sqlgraph.SetNeighbors(_q.driver.Dialect(), step)
+		return fromU, nil
+	}
+	return query
+}
+
+// QueryRevokedByUser chains the current query on the "revoked_by_user" edge.
+func (_q *UserSubscriptionQuery) QueryRevokedByUser() *UserQuery {
+	query := (&UserClient{config: _q.config}).Query()
+	query.path = func(ctx context.Context) (fromU *sql.Selector, err error) {
+		if err := _q.prepareQuery(ctx); err != nil {
+			return nil, err
+		}
+		selector := _q.sqlQuery(ctx)
+		if err := selector.Err(); err != nil {
+			return nil, err
+		}
+		step := sqlgraph.NewStep(
+			sqlgraph.From(usersubscription.Table, usersubscription.FieldID, selector),
+			sqlgraph.To(user.Table, user.FieldID),
+			sqlgraph.Edge(sqlgraph.M2O, true, usersubscription.RevokedByUserTable, usersubscription.RevokedByUserColumn),
 		)
 		fromU = sqlgraph.SetNeighbors(_q.driver.Dialect(), step)
 		return fromU, nil
@@ -351,6 +374,7 @@ func (_q *UserSubscriptionQuery) Clone() *UserSubscriptionQuery {
 		withUser:           _q.withUser.Clone(),
 		withGroup:          _q.withGroup.Clone(),
 		withAssignedByUser: _q.withAssignedByUser.Clone(),
+		withRevokedByUser:  _q.withRevokedByUser.Clone(),
 		withUsageLogs:      _q.withUsageLogs.Clone(),
 		// clone intermediate query.
 		sql:  _q.sql.Clone(),
@@ -388,6 +412,17 @@ func (_q *UserSubscriptionQuery) WithAssignedByUser(opts ...func(*UserQuery)) *U
 		opt(query)
 	}
 	_q.withAssignedByUser = query
+	return _q
+}
+
+// WithRevokedByUser tells the query-builder to eager-load the nodes that are connected to
+// the "revoked_by_user" edge. The optional arguments are used to configure the query builder of the edge.
+func (_q *UserSubscriptionQuery) WithRevokedByUser(opts ...func(*UserQuery)) *UserSubscriptionQuery {
+	query := (&UserClient{config: _q.config}).Query()
+	for _, opt := range opts {
+		opt(query)
+	}
+	_q.withRevokedByUser = query
 	return _q
 }
 
@@ -480,10 +515,11 @@ func (_q *UserSubscriptionQuery) sqlAll(ctx context.Context, hooks ...queryHook)
 	var (
 		nodes       = []*UserSubscription{}
 		_spec       = _q.querySpec()
-		loadedTypes = [4]bool{
+		loadedTypes = [5]bool{
 			_q.withUser != nil,
 			_q.withGroup != nil,
 			_q.withAssignedByUser != nil,
+			_q.withRevokedByUser != nil,
 			_q.withUsageLogs != nil,
 		}
 	)
@@ -523,6 +559,12 @@ func (_q *UserSubscriptionQuery) sqlAll(ctx context.Context, hooks ...queryHook)
 	if query := _q.withAssignedByUser; query != nil {
 		if err := _q.loadAssignedByUser(ctx, query, nodes, nil,
 			func(n *UserSubscription, e *User) { n.Edges.AssignedByUser = e }); err != nil {
+			return nil, err
+		}
+	}
+	if query := _q.withRevokedByUser; query != nil {
+		if err := _q.loadRevokedByUser(ctx, query, nodes, nil,
+			func(n *UserSubscription, e *User) { n.Edges.RevokedByUser = e }); err != nil {
 			return nil, err
 		}
 	}
@@ -626,6 +668,38 @@ func (_q *UserSubscriptionQuery) loadAssignedByUser(ctx context.Context, query *
 	}
 	return nil
 }
+func (_q *UserSubscriptionQuery) loadRevokedByUser(ctx context.Context, query *UserQuery, nodes []*UserSubscription, init func(*UserSubscription), assign func(*UserSubscription, *User)) error {
+	ids := make([]int64, 0, len(nodes))
+	nodeids := make(map[int64][]*UserSubscription)
+	for i := range nodes {
+		if nodes[i].RevokedByUserID == nil {
+			continue
+		}
+		fk := *nodes[i].RevokedByUserID
+		if _, ok := nodeids[fk]; !ok {
+			ids = append(ids, fk)
+		}
+		nodeids[fk] = append(nodeids[fk], nodes[i])
+	}
+	if len(ids) == 0 {
+		return nil
+	}
+	query.Where(user.IDIn(ids...))
+	neighbors, err := query.All(ctx)
+	if err != nil {
+		return err
+	}
+	for _, n := range neighbors {
+		nodes, ok := nodeids[n.ID]
+		if !ok {
+			return fmt.Errorf(`unexpected foreign-key "revoked_by_user_id" returned %v`, n.ID)
+		}
+		for i := range nodes {
+			assign(nodes[i], n)
+		}
+	}
+	return nil
+}
 func (_q *UserSubscriptionQuery) loadUsageLogs(ctx context.Context, query *UsageLogQuery, nodes []*UserSubscription, init func(*UserSubscription), assign func(*UserSubscription, *UsageLog)) error {
 	fks := make([]driver.Value, 0, len(nodes))
 	nodeids := make(map[int64]*UserSubscription)
@@ -696,6 +770,9 @@ func (_q *UserSubscriptionQuery) querySpec() *sqlgraph.QuerySpec {
 		}
 		if _q.withAssignedByUser != nil {
 			_spec.Node.AddColumnOnce(usersubscription.FieldAssignedBy)
+		}
+		if _q.withRevokedByUser != nil {
+			_spec.Node.AddColumnOnce(usersubscription.FieldRevokedByUserID)
 		}
 	}
 	if ps := _q.predicates; len(ps) > 0 {

@@ -28,12 +28,12 @@
         <div
           v-for="subscription in subscriptions"
           :key="subscription.id"
-          class="overflow-hidden rounded-2xl border bg-white dark:bg-dark-800"
+          class="overflow-hidden rounded-lg border bg-white dark:bg-dark-800"
           :class="platformBorderClass(subscription.group?.platform || '')"
         >
           <!-- Header -->
           <div
-            class="flex items-center justify-between border-b border-gray-100 p-4 dark:border-dark-700"
+            class="flex flex-col gap-3 border-b border-gray-100 p-4 dark:border-dark-700 sm:flex-row sm:items-start sm:justify-between"
           >
             <div class="flex items-center gap-3">
               <div :class="['h-1.5 w-1.5 shrink-0 rounded-full', platformAccentDotClass(subscription.group?.platform || '')]" />
@@ -51,13 +51,16 @@
                 </p>
                 <div class="mt-1 flex flex-wrap gap-x-3 gap-y-1 text-[11px] text-gray-400 dark:text-gray-500">
                   <span>{{ t('payment.planCard.rate') }}: ×{{ subscription.group?.rate_multiplier ?? 1 }}</span>
+                  <span v-if="subscription.managed_by_user_id || subscription.group?.owner_user_id">
+                    {{ t('userSubscriptions.creator', { id: subscription.managed_by_user_id || subscription.group?.owner_user_id }) }}
+                  </span>
                   <span v-if="subscriptionHasPeakRate(subscription)" class="text-amber-700 dark:text-amber-300">
                     {{ t('payment.planCard.peakRate') }}: {{ subscriptionPeakRateLabel(subscription) }}
                   </span>
                 </div>
               </div>
             </div>
-            <div class="flex items-center gap-2">
+            <div class="flex flex-wrap items-center gap-2 sm:shrink-0 sm:justify-end">
               <span
                 :class="[
                   'rounded-full px-2 py-0.5 text-xs font-medium',
@@ -76,6 +79,13 @@
                 @click="router.push({ path: '/purchase', query: { tab: 'subscription', group: String(subscription.group_id) } })"
               >
                 {{ t('payment.renewNow') }}
+              </button>
+              <button
+                v-if="subscription.status === 'active'"
+                class="rounded-lg border border-red-200 px-3 py-1.5 text-xs font-semibold text-red-600 transition-colors hover:bg-red-50 dark:border-red-900/60 dark:text-red-300 dark:hover:bg-red-900/20"
+                @click="unsubscribe(subscription)"
+              >
+                {{ t('userSubscriptions.unsubscribe') }}
               </button>
             </div>
           </div>
@@ -98,6 +108,23 @@
               <span class="text-gray-700 dark:text-gray-300">{{
                 t('userSubscriptions.noExpiration')
               }}</span>
+            </div>
+
+            <div v-if="subscription.pool_health" class="space-y-2 rounded-lg border border-gray-100 p-3 dark:border-dark-700">
+              <div class="flex items-center justify-between text-sm">
+                <span class="font-medium text-gray-700 dark:text-gray-200">{{ t('userSubscriptions.poolHealth') }}</span>
+                <span class="text-xs text-gray-500">
+                  {{ subscription.pool_health.available }}/{{ subscription.pool_health.rate_limited }}/{{ subscription.pool_health.total }}
+                </span>
+              </div>
+              <div class="flex h-2 overflow-hidden rounded-full bg-gray-200 dark:bg-dark-700">
+                <div class="bg-emerald-500" :style="{ width: healthWidth(subscription.pool_health.available, subscription.pool_health.total) }"></div>
+                <div class="bg-amber-500" :style="{ width: healthWidth(subscription.pool_health.rate_limited, subscription.pool_health.total) }"></div>
+                <div class="bg-red-500" :style="{ width: healthWidth(subscription.pool_health.error + subscription.pool_health.disabled, subscription.pool_health.total) }"></div>
+              </div>
+              <p v-if="subscription.pool_health.reasons?.length" class="line-clamp-2 text-xs text-gray-500 dark:text-dark-400">
+                {{ subscription.pool_health.reasons.map(reason => reason.reason).join(', ') }}
+              </p>
             </div>
 
             <!-- Daily Usage -->
@@ -253,6 +280,7 @@ import { useI18n } from 'vue-i18n'
 import { useRouter } from 'vue-router'
 import { useAppStore } from '@/stores/app'
 import subscriptionsAPI from '@/api/subscriptions'
+import { unsubscribeSubscription } from '@/api/myResources'
 import type { UserSubscription } from '@/types'
 import AppLayout from '@/components/layout/AppLayout.vue'
 import Icon from '@/components/icons/Icon.vue'
@@ -315,6 +343,23 @@ function getProgressBarClass(used: number | undefined, limit: number | null | un
   if (percentage >= 90) return 'bg-red-500'
   if (percentage >= 70) return 'bg-orange-500'
   return 'bg-green-500'
+}
+
+function healthWidth(value: number, total: number): string {
+  if (!total) return '0%'
+  return `${Math.max(0, Math.min(100, (value / total) * 100))}%`
+}
+
+async function unsubscribe(subscription: UserSubscription): Promise<void> {
+  if (!window.confirm(t('userSubscriptions.unsubscribeConfirm'))) return
+  try {
+    await unsubscribeSubscription(subscription.id)
+    appStore.showSuccess(t('userSubscriptions.unsubscribeSuccess'))
+    await loadSubscriptions()
+  } catch (error) {
+    console.error('Failed to unsubscribe:', error)
+    appStore.showError(t('userSubscriptions.unsubscribeFailed'))
+  }
 }
 
 function formatExpirationDate(expiresAt: string): string {

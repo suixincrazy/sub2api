@@ -1,8 +1,11 @@
 package service
 
 import (
+	"context"
 	"fmt"
+	"net"
 	"net/http"
+	"strings"
 	"testing"
 	"time"
 
@@ -23,6 +26,65 @@ func TestCoderOpenAIWSClientDialer_ProxyHTTPClientReuse(t *testing.T) {
 	c3, err := impl.proxyHTTPClient("http://127.0.0.1:8081")
 	require.NoError(t, err)
 	require.NotSame(t, c1, c3, "不同代理地址应分离客户端")
+}
+
+func TestCoderOpenAIWSClientDialer_PublicOnlyDirectDialBlocksLoopback(t *testing.T) {
+	dialer := newDefaultOpenAIWSClientDialer()
+	ctx := WithHTTPUpstreamNetworkPolicy(context.Background(), HTTPUpstreamNetworkPolicy{PublicOnly: true})
+
+	conn, _, _, err := dialer.Dial(ctx, "ws://127.0.0.1:1/v1/responses", nil, "")
+	require.Nil(t, conn)
+	require.Error(t, err)
+	require.Contains(t, strings.ToLower(err.Error()), "blocked by outbound policy")
+}
+
+func TestCoderOpenAIWSClientDialer_ProxyCacheSeparatesNetworkPolicies(t *testing.T) {
+	dialer := newDefaultOpenAIWSClientDialer()
+	impl, ok := dialer.(*coderOpenAIWSClientDialer)
+	require.True(t, ok)
+
+	systemClient, err := impl.proxyHTTPClient("http://127.0.0.1:8080")
+	require.NoError(t, err)
+	policy := HTTPUpstreamNetworkPolicy{PublicOnly: true}
+	protectedClient, err := impl.proxyHTTPClient("http://127.0.0.1:8080", policy)
+	require.NoError(t, err)
+	protectedAgain, err := impl.proxyHTTPClient("http://127.0.0.1:8080", policy)
+	require.NoError(t, err)
+
+	require.NotSame(t, systemClient, protectedClient)
+	require.Same(t, protectedClient, protectedAgain)
+	systemTransport, ok := systemClient.Transport.(*http.Transport)
+	require.True(t, ok)
+	require.Nil(t, systemTransport.DialContext)
+	protectedTransport, ok := protectedClient.Transport.(*http.Transport)
+	require.True(t, ok)
+	require.NotNil(t, protectedTransport.DialContext)
+}
+
+func TestNewOpenAIWSHTTPTransport_AllowsExactXrayListener(t *testing.T) {
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	require.NoError(t, err)
+	defer func() { _ = listener.Close() }()
+
+	accepted := make(chan struct{})
+	go func() {
+		conn, acceptErr := listener.Accept()
+		if acceptErr == nil {
+			_ = conn.Close()
+		}
+		close(accepted)
+	}()
+
+	address := listener.Addr().String()
+	transport := newOpenAIWSHTTPTransport(nil, HTTPUpstreamNetworkPolicy{
+		PublicOnly:           true,
+		AllowedDialAddresses: []string{address},
+	})
+	require.NotNil(t, transport.DialContext)
+	conn, err := transport.DialContext(context.Background(), "tcp", address)
+	require.NoError(t, err)
+	require.NoError(t, conn.Close())
+	<-accepted
 }
 
 func TestCoderOpenAIWSClientDialer_ProxyHTTPClientInvalidURL(t *testing.T) {

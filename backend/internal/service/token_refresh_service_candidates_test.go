@@ -114,6 +114,73 @@ func (r *tokenRefreshTestRefresher) Refresh(context.Context, *Account) (map[stri
 	return map[string]any{"access_token": "new-access-token", "refresh_token": "new-refresh-token"}, nil
 }
 
+type refreshNowRepo struct {
+	AccountRepository
+	account     *Account
+	updateCalls int
+}
+
+func (r *refreshNowRepo) GetByID(context.Context, int64) (*Account, error) {
+	return r.account, nil
+}
+
+func (r *refreshNowRepo) UpdateCredentials(_ context.Context, _ int64, credentials map[string]any) error {
+	r.updateCalls++
+	r.account.Credentials = shallowCopyMap(credentials)
+	return nil
+}
+
+type refreshNowRefresher struct {
+	calls int
+}
+
+func (r *refreshNowRefresher) CanRefresh(account *Account) bool {
+	return account != nil && account.Type == AccountTypeOAuth
+}
+
+func (r *refreshNowRefresher) NeedsRefresh(*Account, time.Duration) bool {
+	return false
+}
+
+func (r *refreshNowRefresher) Refresh(context.Context, *Account) (map[string]any, error) {
+	r.calls++
+	return map[string]any{"access_token": "forced-access-token", "refresh_token": "forced-refresh-token"}, nil
+}
+
+func (r *refreshNowRefresher) CacheKey(account *Account) string {
+	return "refresh-now-test:" + account.Platform
+}
+
+func TestTokenRefreshService_RefreshAccountNowForcesOAuthRefreshAPI(t *testing.T) {
+	account := &Account{
+		ID:          77,
+		Platform:    PlatformOpenAI,
+		Type:        AccountTypeOAuth,
+		Status:      StatusActive,
+		Schedulable: true,
+		Credentials: map[string]any{"access_token": "old-access-token", "refresh_token": "old-refresh-token"},
+	}
+	repo := &refreshNowRepo{account: account}
+	refresher := &refreshNowRefresher{}
+	svc := &TokenRefreshService{
+		accountRepo: repo,
+		registrations: []tokenRefreshRegistration{
+			{platform: PlatformOpenAI, refresher: refresher, executor: refresher},
+		},
+		refreshPolicy: DefaultBackgroundRefreshPolicy(),
+		cfg:           &config.TokenRefreshConfig{MaxRetries: 1},
+		refreshAPI:    NewOAuthRefreshAPI(repo, nil),
+	}
+
+	updated, err := svc.RefreshAccountNow(context.Background(), account.ID)
+
+	require.NoError(t, err)
+	require.NotNil(t, updated)
+	require.Equal(t, 1, refresher.calls)
+	require.Equal(t, 1, repo.updateCalls)
+	require.Equal(t, "forced-access-token", updated.GetCredential("access_token"))
+}
+
 func TestTokenRefreshService_ProcessRefreshUsesOAuthRefreshCandidates(t *testing.T) {
 	future := time.Now().Add(10 * time.Minute)
 	repo := &tokenRefreshCandidateRepo{

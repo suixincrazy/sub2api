@@ -156,10 +156,19 @@
             </span>
           </template>
 
-          <template #cell-used_by="{ value, row }">
+          <template #cell-owner_user_id="{ value }">
             <span class="text-sm text-gray-500 dark:text-dark-400">
-              {{ row.user?.email || (value ? t('admin.redeem.userPrefix', { id: value }) : '-') }}
+              {{ value ? t('admin.redeem.userPrefix', { id: value }) : t('admin.redeem.systemOwner') }}
             </span>
+          </template>
+
+          <template #cell-redemptions="{ row }">
+            <div class="text-sm text-gray-500 dark:text-dark-400">
+              <span class="font-medium text-gray-700 dark:text-dark-200">{{ row.used_count || 0 }} / {{ row.max_uses || 1 }}</span>
+              <span v-if="row.user?.email" class="mt-0.5 block max-w-48 truncate" :title="row.user.email">
+                {{ t('admin.redeem.latestRedeemer') }}: {{ row.user.email }}
+              </span>
+            </div>
           </template>
 
           <template #cell-used_at="{ value }">
@@ -733,7 +742,8 @@ const columns = computed<Column[]>(() => [
   { key: 'type', label: t('admin.redeem.columns.type'), sortable: true },
   { key: 'value', label: t('admin.redeem.columns.value'), sortable: true },
   { key: 'status', label: t('admin.redeem.columns.status'), sortable: true },
-  { key: 'used_by', label: t('admin.redeem.columns.usedBy') },
+  { key: 'owner_user_id', label: t('admin.redeem.columns.owner') },
+  { key: 'redemptions', label: t('admin.redeem.columns.redemptions') },
   { key: 'used_at', label: t('admin.redeem.columns.usedAt'), sortable: true },
   { key: 'expires_at', label: t('admin.redeem.columns.expiresAt'), sortable: true },
   { key: 'actions', label: t('admin.redeem.columns.actions') }

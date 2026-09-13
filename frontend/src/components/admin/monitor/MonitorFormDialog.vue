@@ -598,7 +598,7 @@ async function loadLinkedAccounts(search = '') {
     const res = await adminAPI.accounts.list(
       1,
       50,
-      { platform: form.provider, ...(search ? { search } : {}) },
+      { platform: form.provider, owner_scope: 'system', ...(search ? { search } : {}) },
       { signal: controller.signal },
     )
     if (seq !== accountSearchSeq) return
@@ -625,7 +625,7 @@ async function ensureSelectedAccountHydrated() {
   try {
     const account = await adminAPI.accounts.getById(id)
     if (form.account_id !== id) return
-    if (String(account.platform) !== form.provider) {
+    if (String(account.platform) !== form.provider || account.owner_user_id != null) {
       form.account_id = null
       pinnedAccount.value = null
       accountHydrationFailed.value = true

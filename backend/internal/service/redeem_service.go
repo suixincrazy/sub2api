@@ -22,6 +22,7 @@ var (
 	ErrInsufficientBalance = infraerrors.BadRequest("INSUFFICIENT_BALANCE", "insufficient balance")
 	ErrRedeemRateLimited   = infraerrors.TooManyRequests("REDEEM_RATE_LIMITED", "too many failed attempts, please try again later")
 	ErrRedeemCodeLocked    = infraerrors.Conflict("REDEEM_CODE_LOCKED", "redeem code is being processed, please try again")
+	ErrRedeemCodeUserUsed  = infraerrors.Conflict("REDEEM_CODE_USER_USED", "you have already used this redeem code")
 )
 
 const (
@@ -72,6 +73,14 @@ type RedeemCodeRepository interface {
 	ListByUserPaginated(ctx context.Context, userID int64, params pagination.PaginationParams, codeType string) ([]RedeemCode, *pagination.PaginationResult, error)
 	// SumPositiveBalanceByUser returns the total recharged amount (sum of positive balance values) for a user.
 	SumPositiveBalanceByUser(ctx context.Context, userID int64) (float64, error)
+}
+
+// RepeatableRedeemCodeRepository extends the long-standing redeem repository
+// without forcing unrelated auth and admin test doubles to implement usage history.
+type RepeatableRedeemCodeRepository interface {
+	GetByCodeForUpdate(ctx context.Context, code string) (*RedeemCode, error)
+	GetUsageByRedeemCodeAndUser(ctx context.Context, redeemCodeID, userID int64) (*RedeemCodeUsage, error)
+	ListUsagesByRedeemCode(ctx context.Context, redeemCodeID int64, params pagination.PaginationParams) ([]RedeemCodeUsage, *pagination.PaginationResult, error)
 }
 
 // GenerateCodesRequest 生成兑换码请求
@@ -477,6 +486,30 @@ func (s *RedeemService) redeem(ctx context.Context, userID int64, code string, r
 	// 将事务放入 context，使 repository 方法能够使用同一事务
 	txCtx := dbent.NewTxContext(ctx, tx)
 
+	// Re-read with a row lock. Repeatable codes can be used by different users,
+	// but never more than max_uses and never twice by the same user.
+	repeatRepo, ok := s.redeemRepo.(RepeatableRedeemCodeRepository)
+	if !ok {
+		return nil, fmt.Errorf("redeem repository does not support repeatable redeem codes")
+	}
+	redeemCode, err = repeatRepo.GetByCodeForUpdate(txCtx, code)
+	if err != nil {
+		return nil, fmt.Errorf("lock redeem code: %w", err)
+	}
+	if redeemCode.IsExpired() {
+		return nil, ErrRedeemCodeExpired
+	}
+	if !redeemCode.CanUse() {
+		return nil, ErrRedeemCodeUsed
+	}
+	existingUsage, err := repeatRepo.GetUsageByRedeemCodeAndUser(txCtx, redeemCode.ID, userID)
+	if err != nil {
+		return nil, fmt.Errorf("check redeem code usage: %w", err)
+	}
+	if existingUsage != nil {
+		return nil, ErrRedeemCodeUserUsed
+	}
+
 	// 【关键】先标记兑换码为已使用，确保并发安全
 	// 利用数据库乐观锁（WHERE status = 'unused'）保证原子性
 	if err := s.redeemRepo.Use(txCtx, redeemCode.ID, userID); err != nil {
@@ -525,12 +558,22 @@ func (s *RedeemService) redeem(ctx context.Context, userID int64, code string, r
 			if validityDays == 0 {
 				validityDays = 30
 			}
+			var sourceRedeemCodeID *int64
+			var managedByUserID *int64
+			if redeemCode.OwnerUserID != nil {
+				id := redeemCode.ID
+				sourceRedeemCodeID = &id
+				managedByUserID = redeemCode.OwnerUserID
+			}
 			_, _, err := s.subscriptionService.AssignOrExtendSubscription(txCtx, &AssignSubscriptionInput{
-				UserID:       userID,
-				GroupID:      *redeemCode.GroupID,
-				ValidityDays: validityDays,
-				AssignedBy:   0, // 系统分配
-				Notes:        fmt.Sprintf("通过兑换码 %s 兑换", redeemCode.Code),
+				UserID:             userID,
+				GroupID:            *redeemCode.GroupID,
+				ValidityDays:       validityDays,
+				ManagedByUserID:    managedByUserID,
+				SourceType:         "redeem_code",
+				SourceRedeemCodeID: sourceRedeemCodeID,
+				AssignedBy:         0, // 系统分配
+				Notes:              fmt.Sprintf("通过兑换码 %s 兑换", redeemCode.Code),
 			})
 			if err != nil {
 				return nil, fmt.Errorf("assign or extend subscription: %w", err)

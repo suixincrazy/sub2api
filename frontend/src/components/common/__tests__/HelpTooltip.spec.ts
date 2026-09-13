@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, it } from 'vitest'
+import { afterEach, describe, expect, it, vi } from 'vitest'
 import { mount } from '@vue/test-utils'
 import { nextTick } from 'vue'
 import HelpTooltip from '@/components/common/HelpTooltip.vue'
@@ -13,6 +13,7 @@ function getTooltipElement(): HTMLDivElement {
 
 describe('HelpTooltip', () => {
   afterEach(() => {
+    vi.restoreAllMocks()
     document.body.innerHTML = ''
   })
 
@@ -28,6 +29,7 @@ describe('HelpTooltip', () => {
     const tooltip = getTooltipElement()
 
     expect(tooltip.style.display).toBe('none')
+    expect(tooltip.classList.contains('max-w-[calc(100vw-1rem)]')).toBe(true)
 
     await trigger.trigger('mouseenter')
     await nextTick()
@@ -36,6 +38,51 @@ describe('HelpTooltip', () => {
     await trigger.trigger('mouseleave')
     await nextTick()
     expect(tooltip.style.display).toBe('none')
+
+    wrapper.unmount()
+  })
+
+  it('clamps a wide tooltip to the viewport edge', async () => {
+    const wrapper = mount(HelpTooltip, {
+      attachTo: document.body,
+      props: {
+        content: 'edge details',
+      },
+    })
+
+    const trigger = wrapper.get('.group')
+    const tooltip = getTooltipElement()
+    const viewportWidth = document.documentElement.clientWidth || window.innerWidth
+    const tooltipWidth = 256
+
+    vi.spyOn(trigger.element, 'getBoundingClientRect').mockReturnValue({
+      top: 100,
+      right: viewportWidth,
+      bottom: 116,
+      left: viewportWidth - 16,
+      width: 16,
+      height: 16,
+      x: viewportWidth - 16,
+      y: 100,
+      toJSON: () => ({}),
+    })
+    vi.spyOn(tooltip, 'getBoundingClientRect').mockReturnValue({
+      top: 0,
+      right: tooltipWidth,
+      bottom: 80,
+      left: 0,
+      width: tooltipWidth,
+      height: 80,
+      x: 0,
+      y: 0,
+      toJSON: () => ({}),
+    })
+
+    await trigger.trigger('mouseenter')
+    await nextTick()
+
+    expect(tooltip.style.left).toBe(`${viewportWidth - 8 - tooltipWidth / 2}px`)
+    expect(tooltip.style.top).toBe('calc(92px)')
 
     wrapper.unmount()
   })

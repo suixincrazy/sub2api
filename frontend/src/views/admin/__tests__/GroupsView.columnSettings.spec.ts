@@ -8,9 +8,9 @@ const {
   listGroups,
   getAllGroups,
   getModelAllowlistCandidates,
+  getLiveCapability,
   getUsageSummary,
   getCapacitySummary,
-  getLiveCapability,
   listAccounts,
   showError,
   showSuccess,
@@ -21,9 +21,9 @@ const {
   listGroups: vi.fn(),
   getAllGroups: vi.fn(),
   getModelAllowlistCandidates: vi.fn(),
+  getLiveCapability: vi.fn(),
   getUsageSummary: vi.fn(),
   getCapacitySummary: vi.fn(),
-  getLiveCapability: vi.fn(),
   listAccounts: vi.fn(),
   showError: vi.fn(),
   showSuccess: vi.fn(),
@@ -56,9 +56,9 @@ vi.mock('@/api/admin', () => ({
       list: listGroups,
       getAll: getAllGroups,
       getModelAllowlistCandidates,
+      getLiveCapability,
       getUsageSummary,
       getCapacitySummary,
-      getLiveCapability,
       create: vi.fn(),
       update: vi.fn(),
       delete: vi.fn(),
@@ -292,6 +292,7 @@ describe('admin GroupsView column settings', () => {
 
     expect(columnKeys(wrapper)).toEqual([
       'name',
+      'owner_user_id',
       'platform',
       'billing_type',
       'rate_multiplier',
@@ -318,6 +319,7 @@ describe('admin GroupsView column settings', () => {
     expect(columnKeys(wrapper)).toEqual([
       'name',
       'id',
+      'owner_user_id',
       'platform',
       'billing_type',
       'rate_multiplier',
@@ -336,6 +338,7 @@ describe('admin GroupsView column settings', () => {
 
     expect(columnKeys(wrapper)).toEqual([
       'name',
+      'owner_user_id',
       'platform',
       'billing_type',
       'rate_multiplier',
@@ -359,6 +362,7 @@ describe('admin GroupsView column settings', () => {
 
     expect(columnKeys(wrapper)).toEqual([
       'name',
+      'owner_user_id',
       'platform',
       'billing_type',
       'rate_multiplier',
@@ -382,6 +386,7 @@ describe('admin GroupsView column settings', () => {
     expect(columnKeys(wrapper)).toEqual([
       'name',
       'id',
+      'owner_user_id',
       'platform',
       'billing_type',
       'rate_multiplier',
