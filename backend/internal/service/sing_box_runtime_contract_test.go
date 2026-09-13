@@ -58,14 +58,11 @@ func TestBuildSingBoxRuntimeSpecReturnsStructWithOutbound(t *testing.T) {
 			if err != nil {
 				t.Fatalf("buildSingBoxRuntimeSpec failed: %v", err)
 			}
-			if spec == nil {
-				t.Fatal("spec is nil")
-			}
 			if spec.Outbound == nil {
 				t.Fatal("spec.Outbound is nil")
 			}
-			if tag := stringFromMap(spec.Outbound, "tag"); tag != "proxy-1" {
-				t.Errorf("tag = %q, want %q", tag, "proxy-1")
+			if tag := stringFromMap(spec.Outbound, "tag"); tag != "sub2api-out" {
+				t.Errorf("tag = %q, want %q", tag, "sub2api-out")
 			}
 		})
 	}

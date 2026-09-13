@@ -393,7 +393,6 @@ func (s *AccountTestService) TestAccountConnection(c *gin.Context, accountID int
 		return s.routeAntigravityTest(c, account, modelID, prompt)
 	}
 
-<<<<<<< HEAD
 	if account.IsOpenCodeGo() {
 		return s.testOpenCodeGoAccountConnection(c, account, modelID, prompt)
 	}
@@ -422,15 +421,15 @@ func (s *AccountTestService) testOpenCodeGoAccountConnection(c *gin.Context, acc
 	}
 	switch proto {
 	case APIProtocolAnthropic:
-		return s.testCNProviderAnthropicConnection(c, account, testModelID)
+		return s.testCNProviderAnthropicConnection(c, account, testModelID, prompt)
 	case APIProtocolResponses:
-		return s.testOpenCodeGoResponsesConnection(c, account, testModelID)
+		return s.testOpenCodeGoResponsesConnection(c, account, testModelID, prompt)
 	default:
 		return s.testCNProviderChatCompletionsConnection(c, account, testModelID, prompt)
 	}
 }
 
-func (s *AccountTestService) testOpenCodeGoResponsesConnection(c *gin.Context, account *Account, testModelID string) error {
+func (s *AccountTestService) testOpenCodeGoResponsesConnection(c *gin.Context, account *Account, testModelID string, prompt string) error {
 	authToken := strings.TrimSpace(account.GetOpenAIProtocolAPIKey())
 	if authToken == "" {
 		return s.sendErrorAndEnd(c, "No API key available")
@@ -441,7 +440,7 @@ func (s *AccountTestService) testOpenCodeGoResponsesConnection(c *gin.Context, a
 	c.Writer.Header().Set("X-Accel-Buffering", "no")
 	c.Writer.Flush()
 	s.sendEvent(c, TestEvent{Type: "test_start", Model: testModelID})
-	return s.testCNProviderAdaptiveResponsesConnection(c, account, testModelID, authToken)
+	return s.testCNProviderAdaptiveResponsesConnection(c, account, testModelID, authToken, prompt)
 }
 
 func (s *AccountTestService) testCNProviderChatCompletionsConnection(c *gin.Context, account *Account, modelID string, prompt string) error {

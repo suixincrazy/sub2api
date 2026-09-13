@@ -112,9 +112,6 @@ func (m *mockProxyRepoForOAuth) CountExpired(ctx context.Context) (int64, error)
 func (m *mockProxyRepoForOAuth) CountExpiringSoon(ctx context.Context, now time.Time) (int64, error) {
 	panic("CountExpiringSoon not implemented")
 }
-func (m *mockProxyRepoForOAuth) CountFallbackReferencesByProxyID(ctx context.Context, proxyID int64) (int64, error) {
-	return 0, nil
-}
 
 // =====================
 // 测试用例

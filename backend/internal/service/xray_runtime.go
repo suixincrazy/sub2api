@@ -776,6 +776,9 @@ func buildVMessOutbound(raw string) (map[string]any, error) {
 	if len(payload) >= len("vmess://") && strings.EqualFold(payload[:len("vmess://")], "vmess://") {
 		payload = payload[len("vmess://"):]
 	}
+	if index := strings.IndexAny(payload, "?#"); index >= 0 {
+		payload = payload[:index]
+	}
 	decoded, ok := decodeShareBase64(payload)
 	if !ok {
 		return nil, errors.New("invalid vmess payload")
@@ -1258,18 +1261,56 @@ func firstQuery(q url.Values, keys ...string) string {
 	return ""
 }
 
-<<<<<<< HEAD
 func intQuery(q url.Values, keys ...string) int {
 	raw := firstQuery(q, keys...)
 	if raw == "" {
 		return 0
 	}
-	value, _ := strconv.Atoi(raw)
-	return value
+	return parseProxyInt(raw)
 }
 
-=======
->>>>>>> xray/main
+// parseProxyInt accepts the plain integers emitted by URI schemes and the
+// bandwidth forms commonly found in Clash exports (for example, "50 Mbps").
+func parseProxyInt(raw string) int {
+	raw = strings.ToLower(strings.TrimSpace(raw))
+	if raw == "" {
+		return 0
+	}
+	if value, err := strconv.Atoi(raw); err == nil {
+		return value
+	}
+	fields := strings.Fields(raw)
+	number := raw
+	unit := ""
+	if len(fields) > 0 {
+		number = fields[0]
+		if len(fields) > 1 {
+			unit = strings.Join(fields[1:], "")
+		}
+	}
+	for _, suffix := range []string{"gbps", "gbit/s", "mbps", "mbit/s", "kbps", "kbit/s"} {
+		if strings.HasSuffix(number, suffix) {
+			unit = suffix + unit
+			number = strings.TrimSuffix(number, suffix)
+			break
+		}
+	}
+	value, err := strconv.ParseFloat(strings.TrimSpace(number), 64)
+	if err != nil || value <= 0 {
+		return 0
+	}
+	switch {
+	case strings.HasPrefix(unit, "gb") || strings.HasPrefix(unit, "gbit"):
+		value *= 1000
+	case strings.HasPrefix(unit, "kb") || strings.HasPrefix(unit, "kbit"):
+		value /= 1000
+	}
+	if value < 1 {
+		return 1
+	}
+	return int(value + 0.5)
+}
+
 func copyValue(q url.Values, key, value string) {
 	value = strings.TrimSpace(value)
 	if value != "" {

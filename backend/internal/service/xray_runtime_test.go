@@ -65,6 +65,22 @@ func TestBuildXrayOutboundVMess(t *testing.T) {
 	}
 }
 
+func TestBuildXrayOutboundVMessWithFragment(t *testing.T) {
+	node := map[string]any{
+		"add":  "vmess.example.com",
+		"port": 443,
+		"id":   "11111111-1111-1111-1111-111111111111",
+	}
+	raw, err := json.Marshal(node)
+	if err != nil {
+		t.Fatal(err)
+	}
+	share := "vmess://" + base64.RawStdEncoding.EncodeToString(raw) + "#named-node"
+	if _, err := buildXrayOutbound(share, &Proxy{Kind: "xray"}); err != nil {
+		t.Fatalf("buildXrayOutbound rejected a named VMess share: %v", err)
+	}
+}
+
 func TestBuildXrayOutboundVLESSReality(t *testing.T) {
 	out, err := buildXrayOutbound("vless://11111111-1111-1111-1111-111111111111@vless.example.com:443?security=reality&type=grpc&sni=sni.example.com&pbk=pub&sid=abc&serviceName=svc", &Proxy{Kind: "xray"})
 	if err != nil {

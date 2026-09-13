@@ -893,31 +893,6 @@ func (s *TokenRefreshService) refreshWithRetry(ctx context.Context, account *Acc
 	return s.refreshWithRetryWithRateGate(ctx, account, refresher, executor, refreshWindow, nil)
 }
 
-func (s *TokenRefreshService) RefreshAccountNow(ctx context.Context, accountID int64) (*Account, error) {
-	if s == nil || s.accountRepo == nil {
-		return nil, infraerrors.ServiceUnavailable("TOKEN_REFRESH_UNAVAILABLE", "token refresh service is unavailable")
-	}
-	account, err := s.accountRepo.GetByID(ctx, accountID)
-	if err != nil {
-		return nil, err
-	}
-	if account == nil {
-		return nil, infraerrors.NotFound("ACCOUNT_NOT_FOUND", "account not found")
-	}
-	refresher, executor := s.matchRefresher(account.Platform)
-	if refresher == nil || executor == nil {
-		return nil, infraerrors.BadRequest("ACCOUNT_NOT_REFRESHABLE", "account platform does not support token refresh")
-	}
-	if err := s.refreshWithRetry(ctx, account, refresher, executor, 0); err != nil {
-		return nil, err
-	}
-	refreshed, err := s.accountRepo.GetByID(ctx, accountID)
-	if err != nil {
-		return nil, err
-	}
-	return refreshed, nil
-}
-
 func (s *TokenRefreshService) refreshWithRetryWithRateGate(
 	ctx context.Context,
 	account *Account,

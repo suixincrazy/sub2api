@@ -739,11 +739,6 @@ func copyIntQuery(out map[string]any, q url.Values, target string, keys ...strin
 	}
 }
 
-func intQuery(q url.Values, keys ...string) int {
-	value, _ := strconv.Atoi(firstQuery(q, keys...))
-	return value
-}
-
 func parseReservedBytes(raw string) []int {
 	parts := strings.FieldsFunc(raw, func(r rune) bool { return r == ',' || r == '.' || r == '-' || r == ' ' })
 	if len(parts) != 3 {

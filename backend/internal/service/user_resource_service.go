@@ -6548,8 +6548,19 @@ func decodeProxySubscriptionPayload(raw string) (string, bool) {
 	if !ok {
 		return "", false
 	}
-	if strings.Contains(decoded, "://") || strings.Contains(decoded, "proxies:") || strings.Contains(decoded, "\n- name:") {
-		return decoded, true
+	trimmed := strings.TrimSpace(decoded)
+	if strings.Contains(trimmed, "://") || strings.Contains(strings.ToLower(trimmed), "proxies:") {
+		return trimmed, true
+	}
+	// A sing-box subscription can be a JSON document containing only
+	// outbounds/endpoints, so URI/YAML string heuristics are insufficient.
+	if strings.HasPrefix(trimmed, "{") || strings.HasPrefix(trimmed, "[") {
+		var document any
+		if err := json.Unmarshal([]byte(trimmed), &document); err == nil {
+			if len(singBoxOutboundItems(document)) > 0 {
+				return trimmed, true
+			}
+		}
 	}
 	return "", false
 }
@@ -6595,7 +6606,7 @@ func parseClashProxyNode(proxy map[string]any) parsedProxyNode {
 	}
 
 	switch protocol {
-	case "http", "https", "socks5":
+	case "http", "https", "socks5", "socks5h":
 		username := clashString(proxy, "username", "user")
 		password := clashString(proxy, "password", "pass")
 		raw := buildClashStandardURI(protocol, host, port, username, password, name)
@@ -6631,11 +6642,14 @@ func parseClashProxyNode(proxy map[string]any) parsedProxyNode {
 		return parsedProxyNode{Name: name, Kind: "xray", Protocol: "trojan", Host: host, Port: port, Password: password, Network: clashString(proxy, "network"), Raw: raw}
 	case "hysteria":
 		auth := clashString(proxy, "auth-str", "auth_str", "auth", "password")
-		upMbps := clashString(proxy, "up", "up-mbps", "up_mbps")
-		downMbps := clashString(proxy, "down", "down-mbps", "down_mbps")
-		if auth == "" || upMbps == "" || downMbps == "" {
+		upMbps := parseProxyInt(clashString(proxy, "up", "up-mbps", "up_mbps"))
+		downMbps := parseProxyInt(clashString(proxy, "down", "down-mbps", "down_mbps"))
+		if auth == "" || upMbps <= 0 || downMbps <= 0 {
 			return parsedProxyNode{Name: name, Err: "hysteria node missing authentication or bandwidth"}
 		}
+		proxy = cloneProxyMap(proxy)
+		proxy["up"] = strconv.Itoa(upMbps)
+		proxy["down"] = strconv.Itoa(downMbps)
 		raw := buildClashHysteriaURI(proxy, host, port, auth, name)
 		return parsedProxyNode{Name: name, Kind: "xray", Protocol: "hysteria", Host: host, Port: port, Password: auth, Raw: raw}
 	case "hysteria2", "hy2":
@@ -6770,6 +6784,14 @@ func clashString(proxy map[string]any, keys ...string) string {
 		}
 	}
 	return ""
+}
+
+func cloneProxyMap(proxy map[string]any) map[string]any {
+	clone := make(map[string]any, len(proxy))
+	for key, value := range proxy {
+		clone[key] = value
+	}
+	return clone
 }
 
 func clashNestedString(proxy map[string]any, mapKey string, keys ...string) string {

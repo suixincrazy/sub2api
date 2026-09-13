@@ -518,7 +518,7 @@ func (s *AccountTestService) ProbeClaudeStreamHealth(ctx context.Context, accoun
 		return errStreamProbeUnsupported
 	}
 
-	payload, err := createTestPayload(modelID)
+	payload, err := createTestPayload(modelID, "")
 	if err != nil {
 		return fmt.Errorf("%w: build payload: %v", errStreamProbeInconclusive, err)
 	}
