@@ -399,49 +399,21 @@ const bedrockPresetMappings = [
 // Antigravity 默认映射（从后端 API 获取，与 constants.go 保持一致）
 // 使用 fetchAntigravityDefaultMappings() 异步获取
 import { getAntigravityDefaultModelMapping } from '@/api/admin/accounts'
-import { myResourcesApi } from '@/api/myResources'
 
-export type ModelWhitelistScope = 'admin' | 'user'
-export interface AntigravityMappingFetchOptions {
-  scope?: ModelWhitelistScope
-  fetcher?: () => Promise<Record<string, string>>
-  forceRefresh?: boolean
-}
+let _antigravityDefaultMappingsCache: { from: string; to: string }[] | null = null
 
-const _antigravityDefaultMappingsCache: Record<ModelWhitelistScope, { from: string; to: string }[] | null> = {
-  admin: null,
-  user: null
-}
-
-export async function fetchAntigravityDefaultMappings(
-  options: ModelWhitelistScope | AntigravityMappingFetchOptions = 'admin'
-): Promise<{ from: string; to: string }[]> {
-  const normalized = typeof options === 'string' ? { scope: options } : options
-  const scope = normalized.scope || 'admin'
-  const hasCustomFetcher = Boolean(normalized.fetcher)
-  if (!hasCustomFetcher && !normalized.forceRefresh && _antigravityDefaultMappingsCache[scope] !== null) {
-    return _antigravityDefaultMappingsCache[scope] || []
+export async function fetchAntigravityDefaultMappings(): Promise<{ from: string; to: string }[]> {
+  if (_antigravityDefaultMappingsCache !== null) {
+    return _antigravityDefaultMappingsCache
   }
   try {
-    const mapping = normalized.fetcher
-      ? await normalized.fetcher()
-      : scope === 'user'
-        ? await myResourcesApi.accounts.getAntigravityDefaultModelMapping()
-        : await getAntigravityDefaultModelMapping()
-    const entries = Object.entries(mapping || {})
-      .filter(([, to]) => typeof to === 'string' && to.trim())
-      .map(([from, to]) => ({ from, to: to.trim() }))
-    if (!hasCustomFetcher) {
-      _antigravityDefaultMappingsCache[scope] = entries
-    }
-    return entries
+    const mapping = await getAntigravityDefaultModelMapping()
+    _antigravityDefaultMappingsCache = Object.entries(mapping).map(([from, to]) => ({ from, to }))
   } catch (e) {
     console.warn('[fetchAntigravityDefaultMappings] API failed, using empty fallback', e)
-    if (!hasCustomFetcher) {
-      _antigravityDefaultMappingsCache[scope] = []
-    }
-    return []
+    _antigravityDefaultMappingsCache = []
   }
+  return _antigravityDefaultMappingsCache
 }
 
 // =====================

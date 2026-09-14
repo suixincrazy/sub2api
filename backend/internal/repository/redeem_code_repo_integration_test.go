@@ -404,18 +404,30 @@ func (s *RedeemCodeRepoSuite) TestListByUser() {
 	base := time.Date(2025, 1, 1, 12, 0, 0, 0, time.UTC)
 
 	usedAt1 := base
-	code1 := &service.RedeemCode{
-		Code: "USER-1", Type: service.RedeemTypeBalance, Status: service.StatusUsed,
-		UsedBy: &user.ID, UsedAt: &usedAt1,
-	}
-	s.Require().NoError(s.repo.Create(s.ctx, code1))
+	_, err := s.client.RedeemCode.Create().
+		SetCode("USER-1").
+		SetType(service.RedeemTypeBalance).
+		SetStatus(service.StatusUsed).
+		SetValue(0).
+		SetNotes("").
+		SetValidityDays(30).
+		SetUsedBy(user.ID).
+		SetUsedAt(usedAt1).
+		Save(s.ctx)
+	s.Require().NoError(err)
 
 	usedAt2 := base.Add(1 * time.Hour)
-	code2 := &service.RedeemCode{
-		Code: "USER-2", Type: service.RedeemTypeBalance, Status: service.StatusUsed,
-		UsedBy: &user.ID, UsedAt: &usedAt2,
-	}
-	s.Require().NoError(s.repo.Create(s.ctx, code2))
+	_, err = s.client.RedeemCode.Create().
+		SetCode("USER-2").
+		SetType(service.RedeemTypeBalance).
+		SetStatus(service.StatusUsed).
+		SetValue(0).
+		SetNotes("").
+		SetValidityDays(30).
+		SetUsedBy(user.ID).
+		SetUsedAt(usedAt2).
+		Save(s.ctx)
+	s.Require().NoError(err)
 
 	codes, err := s.repo.ListByUser(s.ctx, user.ID, 10)
 	s.Require().NoError(err, "ListByUser")
@@ -429,12 +441,18 @@ func (s *RedeemCodeRepoSuite) TestListByUser_WithGroupPreload() {
 	user := s.createUser(uniqueTestValue(s.T(), "grp") + "@example.com")
 	group := s.createGroup(uniqueTestValue(s.T(), "g-listby"))
 
-	usedAt := time.Now()
-	code := &service.RedeemCode{
-		Code: "WITH-GRP", Type: service.RedeemTypeSubscription, Status: service.StatusUsed,
-		UsedBy: &user.ID, UsedAt: &usedAt, GroupID: &group.ID,
-	}
-	s.Require().NoError(s.repo.Create(s.ctx, code))
+	_, err := s.client.RedeemCode.Create().
+		SetCode("WITH-GRP").
+		SetType(service.RedeemTypeSubscription).
+		SetStatus(service.StatusUsed).
+		SetValue(0).
+		SetNotes("").
+		SetValidityDays(30).
+		SetUsedBy(user.ID).
+		SetUsedAt(time.Now()).
+		SetGroupID(group.ID).
+		Save(s.ctx)
+	s.Require().NoError(err)
 
 	codes, err := s.repo.ListByUser(s.ctx, user.ID, 10)
 	s.Require().NoError(err)
@@ -445,12 +463,17 @@ func (s *RedeemCodeRepoSuite) TestListByUser_WithGroupPreload() {
 
 func (s *RedeemCodeRepoSuite) TestListByUser_DefaultLimit() {
 	user := s.createUser(uniqueTestValue(s.T(), "deflimit") + "@example.com")
-	usedAt := time.Now()
-	code := &service.RedeemCode{
-		Code: "DEF-LIM", Type: service.RedeemTypeBalance, Status: service.StatusUsed,
-		UsedBy: &user.ID, UsedAt: &usedAt,
-	}
-	s.Require().NoError(s.repo.Create(s.ctx, code))
+	_, err := s.client.RedeemCode.Create().
+		SetCode("DEF-LIM").
+		SetType(service.RedeemTypeBalance).
+		SetStatus(service.StatusUsed).
+		SetValue(0).
+		SetNotes("").
+		SetValidityDays(30).
+		SetUsedBy(user.ID).
+		SetUsedAt(time.Now()).
+		Save(s.ctx)
+	s.Require().NoError(err)
 
 	// limit <= 0 should default to 10
 	codes, err := s.repo.ListByUser(s.ctx, user.ID, 0)

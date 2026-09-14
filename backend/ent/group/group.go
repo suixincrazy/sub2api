@@ -24,8 +24,6 @@ const (
 	FieldDeletedAt = "deleted_at"
 	// FieldName holds the string denoting the name field in the database.
 	FieldName = "name"
-	// FieldOwnerUserID holds the string denoting the owner_user_id field in the database.
-	FieldOwnerUserID = "owner_user_id"
 	// FieldDescription holds the string denoting the description field in the database.
 	FieldDescription = "description"
 	// FieldRateMultiplier holds the string denoting the rate_multiplier field in the database.
@@ -229,7 +227,6 @@ var Columns = []string{
 	FieldUpdatedAt,
 	FieldDeletedAt,
 	FieldName,
-	FieldOwnerUserID,
 	FieldDescription,
 	FieldRateMultiplier,
 	FieldPeakRateEnabled,
@@ -465,11 +462,6 @@ func ByDeletedAt(opts ...sql.OrderTermOption) OrderOption {
 // ByName orders the results by the name field.
 func ByName(opts ...sql.OrderTermOption) OrderOption {
 	return sql.OrderByField(FieldName, opts...).ToFunc()
-}
-
-// ByOwnerUserID orders the results by the owner_user_id field.
-func ByOwnerUserID(opts ...sql.OrderTermOption) OrderOption {
-	return sql.OrderByField(FieldOwnerUserID, opts...).ToFunc()
 }
 
 // ByDescription orders the results by the description field.

@@ -1,8 +1,6 @@
 package handler
 
 import (
-	"strconv"
-
 	"github.com/Wei-Shaw/sub2api/internal/handler/dto"
 	"github.com/Wei-Shaw/sub2api/internal/pkg/response"
 	middleware2 "github.com/Wei-Shaw/sub2api/internal/server/middleware"
@@ -32,48 +30,16 @@ type SubscriptionProgressInfo struct {
 	Progress     *service.SubscriptionProgress `json:"progress"`
 }
 
-type UserSubscriptionWithHealth struct {
-	dto.UserSubscription
-	PoolHealth *service.SubscriptionPoolHealth `json:"pool_health,omitempty"`
-}
-
 // SubscriptionHandler handles user subscription operations
 type SubscriptionHandler struct {
 	subscriptionService *service.SubscriptionService
-	userResourceService *service.UserResourceService
 }
 
 // NewSubscriptionHandler creates a new user subscription handler
-func NewSubscriptionHandler(subscriptionService *service.SubscriptionService, userResourceService *service.UserResourceService) *SubscriptionHandler {
+func NewSubscriptionHandler(subscriptionService *service.SubscriptionService) *SubscriptionHandler {
 	return &SubscriptionHandler{
 		subscriptionService: subscriptionService,
-		userResourceService: userResourceService,
 	}
-}
-
-func (h *SubscriptionHandler) withPoolHealth(c *gin.Context, subscriptions []service.UserSubscription) []UserSubscriptionWithHealth {
-	out := make([]UserSubscriptionWithHealth, 0, len(subscriptions))
-	groupIDs := make([]int64, 0, len(subscriptions))
-	for i := range subscriptions {
-		groupIDs = append(groupIDs, subscriptions[i].GroupID)
-	}
-	healthByGroup := map[int64]*service.SubscriptionPoolHealth{}
-	if h.userResourceService != nil {
-		if health, err := h.userResourceService.GetPoolHealthMap(c.Request.Context(), groupIDs); err == nil {
-			healthByGroup = health
-		}
-	}
-	for i := range subscriptions {
-		item := dto.UserSubscriptionFromService(&subscriptions[i])
-		if item == nil {
-			continue
-		}
-		out = append(out, UserSubscriptionWithHealth{
-			UserSubscription: *item,
-			PoolHealth:       service.RedactPoolHealthForSubscriber(healthByGroup[subscriptions[i].GroupID]),
-		})
-	}
-	return out
 }
 
 // List handles listing current user's subscriptions
@@ -91,7 +57,11 @@ func (h *SubscriptionHandler) List(c *gin.Context) {
 		return
 	}
 
-	response.Success(c, h.withPoolHealth(c, subscriptions))
+	out := make([]dto.UserSubscription, 0, len(subscriptions))
+	for i := range subscriptions {
+		out = append(out, *dto.UserSubscriptionFromService(&subscriptions[i]))
+	}
+	response.Success(c, out)
 }
 
 // GetActive handles getting current user's active subscriptions
@@ -109,7 +79,11 @@ func (h *SubscriptionHandler) GetActive(c *gin.Context) {
 		return
 	}
 
-	response.Success(c, h.withPoolHealth(c, subscriptions))
+	out := make([]dto.UserSubscription, 0, len(subscriptions))
+	for i := range subscriptions {
+		out = append(out, *dto.UserSubscriptionFromService(&subscriptions[i]))
+	}
+	response.Success(c, out)
 }
 
 // GetProgress handles getting subscription progress for current user
@@ -211,28 +185,4 @@ func (h *SubscriptionHandler) GetSummary(c *gin.Context) {
 	}
 
 	response.Success(c, summary)
-}
-
-// Unsubscribe revokes one of the current user's own subscriptions.
-// POST /api/v1/subscriptions/:id/unsubscribe
-func (h *SubscriptionHandler) Unsubscribe(c *gin.Context) {
-	subject, ok := middleware2.GetAuthSubjectFromContext(c)
-	if !ok {
-		response.Unauthorized(c, "User not found in context")
-		return
-	}
-	if h.userResourceService == nil {
-		response.InternalError(c, "User resource service is not available")
-		return
-	}
-	subscriptionID, err := strconv.ParseInt(c.Param("id"), 10, 64)
-	if err != nil || subscriptionID <= 0 {
-		response.BadRequest(c, "Invalid subscription ID")
-		return
-	}
-	if err := h.userResourceService.UnsubscribeOwnSubscription(c.Request.Context(), subject.UserID, subscriptionID); err != nil {
-		response.ErrorFrom(c, err)
-		return
-	}
-	response.Success(c, gin.H{"message": "Subscription unsubscribed successfully"})
 }

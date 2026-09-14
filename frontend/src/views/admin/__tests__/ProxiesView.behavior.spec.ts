@@ -339,9 +339,9 @@ describe('admin ProxiesView behavior', () => {
   })
 
   it.each([
-    { ownerScope: 'system', action: 'admin-proxy-batch-test-button', method: testProxy },
-    { ownerScope: 'user', action: 'admin-proxy-batch-quality-button', method: checkProxyQuality },
-  ])('keeps every active filter on each $ownerScope batch page', async ({ ownerScope, action, method }) => {
+    { protocol: 'https', action: 'admin-proxy-batch-test-button', method: testProxy },
+    { protocol: 'socks5', action: 'admin-proxy-batch-quality-button', method: checkProxyQuality },
+  ])('keeps every active filter on each $protocol batch page', async ({ protocol, action, method }) => {
     listProxies.mockImplementation(async (page: number, pageSize: number) => {
       if (pageSize === 200) {
         return paginated([createProxy(200 + page)], page, 2, 2)
@@ -352,9 +352,8 @@ describe('admin ProxiesView behavior', () => {
     const wrapper = mountView()
     await flushPromises()
 
-    await wrapper.get('[data-test="admin-proxy-protocol-filter"]').setValue('https')
+    await wrapper.get('[data-test="admin-proxy-protocol-filter"]').setValue(protocol)
     await wrapper.get('[data-test="admin-proxy-status-filter"]').setValue('active')
-    await wrapper.get('[data-test="admin-proxy-owner-scope-filter"]').setValue(ownerScope)
     await wrapper.get('[data-test="admin-proxy-search-input"]').setValue('needle')
     await wrapper.get('[data-test="sort-name"]').trigger('click')
     await flushPromises()
@@ -369,9 +368,8 @@ describe('admin ProxiesView behavior', () => {
     expect(batchCalls.map(([page]) => page)).toEqual([1, 2])
     for (const [, , query] of batchCalls) {
       expect(query).toEqual({
-        protocol: 'https',
+        protocol,
         status: 'active',
-        owner_scope: ownerScope,
         search: 'needle',
         sort_by: 'name',
         sort_order: 'asc',

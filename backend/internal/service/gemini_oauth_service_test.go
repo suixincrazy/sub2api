@@ -802,9 +802,6 @@ func (m *mockGeminiProxyRepo) ExistsByHostPortAuth(ctx context.Context, host str
 func (m *mockGeminiProxyRepo) CountAccountsByProxyID(ctx context.Context, proxyID int64) (int64, error) {
 	panic("not impl")
 }
-func (m *mockGeminiProxyRepo) CountFallbackReferencesByProxyID(context.Context, int64) (int64, error) {
-	return 0, nil
-}
 func (m *mockGeminiProxyRepo) ListAccountSummariesByProxyID(ctx context.Context, proxyID int64) ([]ProxyAccountSummary, error) {
 	panic("not impl")
 }
@@ -1487,4 +1484,8 @@ func credKeys(m map[string]any) []string {
 		keys = append(keys, k)
 	}
 	return keys
+}
+
+func (m *mockGeminiProxyRepo) CountFallbackReferencesByProxyID(context.Context, int64) (int64, error) {
+	return 0, nil
 }

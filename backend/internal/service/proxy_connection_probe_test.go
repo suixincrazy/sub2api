@@ -5,9 +5,6 @@ import (
 	"errors"
 	"sync"
 	"testing"
-	"time"
-
-	"github.com/DATA-DOG/go-sqlmock"
 )
 
 type connectionProbeProxyRepoStub struct {
@@ -96,47 +93,5 @@ func TestAdminTestProxyReleasesProbeRuntimeAfterEveryRequest(t *testing.T) {
 	active, maxActive, resolveCalls, cleanupCalls := resolver.snapshot()
 	if active != 0 || maxActive != 1 || resolveCalls != 32 || cleanupCalls != 32 {
 		t.Fatalf("probe runtime lifecycle mismatch: active=%d max=%d resolves=%d cleanups=%d", active, maxActive, resolveCalls, cleanupCalls)
-	}
-}
-
-func TestUserTestProxyReleasesProbeRuntimeWhenProbeFails(t *testing.T) {
-	db, mock, err := sqlmock.New()
-	if err != nil {
-		t.Fatalf("create sqlmock: %v", err)
-	}
-	defer func() { _ = db.Close() }()
-
-	now := time.Now()
-	rows := sqlmock.NewRows([]string{
-		"id", "owner_user_id", "is_public", "kind", "name", "protocol", "host", "port",
-		"username", "password", "has_auth", "status", "expires_at", "fallback_mode",
-		"backup_proxy_id", "expiry_warn_days", "extra", "created_at", "updated_at",
-	}).AddRow(
-		int64(81), int64(99), false, "xray", "owned-node", "hysteria2", "", 0,
-		"", "", false, StatusActive, nil, FallbackModeNone,
-		nil, 7, `{"raw":"hy2://node"}`, now, now,
-	)
-	mock.ExpectQuery(`(?s)FROM proxies p.*WHERE p\.id = \$1.*p\.owner_user_id = \$2`).
-		WithArgs(int64(81), int64(99)).
-		WillReturnRows(rows)
-
-	resolver := &connectionProbeResolverStub{limit: 16}
-	svc := NewUserResourceService(db, nil, nil, nil)
-	svc.SetProxyProbeResolver(resolver)
-	svc.SetProxyObservabilityServices(&connectionProbeProberStub{err: errors.New("probe failed")}, nil)
-
-	result, err := svc.TestProxy(context.Background(), 99, 81)
-	if err != nil {
-		t.Fatalf("TestProxy returned error: %v", err)
-	}
-	if result["success"] != false {
-		t.Fatalf("expected failed probe result, got %#v", result)
-	}
-	active, maxActive, resolveCalls, cleanupCalls := resolver.snapshot()
-	if active != 0 || maxActive != 1 || resolveCalls != 1 || cleanupCalls != 1 {
-		t.Fatalf("probe runtime lifecycle mismatch: active=%d max=%d resolves=%d cleanups=%d", active, maxActive, resolveCalls, cleanupCalls)
-	}
-	if err := mock.ExpectationsWereMet(); err != nil {
-		t.Fatalf("unmet SQL expectations: %v", err)
 	}
 }

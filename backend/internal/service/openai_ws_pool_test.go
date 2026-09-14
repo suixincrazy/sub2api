@@ -290,6 +290,7 @@ func TestOpenAIWSConnPool_AcquireQueueWaitMetrics(t *testing.T) {
 	accountID := int64(99)
 	account := &Account{ID: accountID, Platform: PlatformOpenAI, Type: AccountTypeAPIKey}
 	conn := newOpenAIWSConn("busy", accountID, &openAIWSFakeConn{}, nil)
+	conn.handshakeCompatibility.wsURL = "wss://example.com/v1/responses"
 	require.True(t, conn.tryAcquire()) // 占用连接，触发后续排队
 
 	ap := pool.ensureAccountPoolLocked(accountID)
@@ -333,7 +334,9 @@ func TestOpenAIWSConnPool_AcquireAtCapacityWakesWhenAnotherConnReleases(t *testi
 	account := &Account{ID: accountID, Platform: PlatformOpenAI, Type: AccountTypeAPIKey}
 	req := openAIWSAcquireRequest{Account: account, WSURL: "wss://example.com/v1/responses"}
 	target := newOpenAIWSConn("target", accountID, &openAIWSFakeConn{}, nil)
+	target.handshakeCompatibility.wsURL = "wss://example.com/v1/responses"
 	other := newOpenAIWSConn("other", accountID, &openAIWSFakeConn{}, nil)
+	other.handshakeCompatibility.wsURL = "wss://example.com/v1/responses"
 	require.True(t, target.tryAcquire())
 	require.True(t, other.tryAcquire())
 	// other 上已有一个等待者，新来的等待者会挂到 target 上。
@@ -393,7 +396,9 @@ func TestOpenAIWSConnPool_AcquireAtCapacityWakesWhenCapacityFreedByEviction(t *t
 	account := &Account{ID: accountID, Platform: PlatformOpenAI, Type: AccountTypeAPIKey}
 	req := openAIWSAcquireRequest{Account: account, WSURL: "wss://example.com/v1/responses"}
 	target := newOpenAIWSConn("target", accountID, &openAIWSFakeConn{}, nil)
+	target.handshakeCompatibility.wsURL = "wss://example.com/v1/responses"
 	other := newOpenAIWSConn("other", accountID, &openAIWSFakeConn{}, nil)
+	other.handshakeCompatibility.wsURL = "wss://example.com/v1/responses"
 	require.True(t, target.tryAcquire())
 	require.True(t, other.tryAcquire())
 	other.waiters.Add(1)
@@ -451,7 +456,9 @@ func TestOpenAIWSConnPool_AcquireAtCapacityCanceledWaiterDoesNotTakeReleasedConn
 	req := openAIWSAcquireRequest{Account: account, WSURL: "wss://example.com/v1/responses"}
 	pool := newOpenAIWSConnPool(cfg)
 	target := newOpenAIWSConn("target", accountID, &openAIWSFakeConn{}, nil)
+	target.handshakeCompatibility.wsURL = "wss://example.com/v1/responses"
 	other := newOpenAIWSConn("other", accountID, &openAIWSFakeConn{}, nil)
+	other.handshakeCompatibility.wsURL = "wss://example.com/v1/responses"
 	require.True(t, target.tryAcquire())
 	require.True(t, other.tryAcquire())
 	other.waiters.Add(1)
@@ -1116,6 +1123,7 @@ func TestOpenAIWSConnPool_AcquireForcePreferredConnUnavailable(t *testing.T) {
 	account := &Account{ID: 124, Platform: PlatformOpenAI, Type: AccountTypeAPIKey}
 	ap := pool.getOrCreateAccountPool(account.ID)
 	otherConn := newOpenAIWSConn("other_conn", account.ID, &openAIWSFakeConn{}, nil)
+	otherConn.handshakeCompatibility.wsURL = "wss://example.com/v1/responses"
 	ap.mu.Lock()
 	ap.conns[otherConn.id] = otherConn
 	ap.mu.Unlock()
@@ -1147,7 +1155,9 @@ func TestOpenAIWSConnPool_AcquireForcePreferredConnQueuesOnPreferredOnly(t *test
 	account := &Account{ID: 125, Platform: PlatformOpenAI, Type: AccountTypeAPIKey}
 	ap := pool.getOrCreateAccountPool(account.ID)
 	preferredConn := newOpenAIWSConn("preferred_conn", account.ID, &openAIWSFakeConn{}, nil)
+	preferredConn.handshakeCompatibility.wsURL = "wss://example.com/v1/responses"
 	otherConn := newOpenAIWSConn("other_conn_idle", account.ID, &openAIWSFakeConn{}, nil)
+	otherConn.handshakeCompatibility.wsURL = "wss://example.com/v1/responses"
 	require.True(t, preferredConn.tryAcquire(), "先占用 preferred 连接，触发排队获取")
 	ap.mu.Lock()
 	ap.conns[preferredConn.id] = preferredConn
@@ -1188,7 +1198,9 @@ func TestOpenAIWSConnPool_AcquireForcePreferredConnDirectAndQueueFull(t *testing
 	account := &Account{ID: 127, Platform: PlatformOpenAI, Type: AccountTypeAPIKey}
 	ap := pool.getOrCreateAccountPool(account.ID)
 	preferredConn := newOpenAIWSConn("preferred_conn_direct", account.ID, &openAIWSFakeConn{}, nil)
+	preferredConn.handshakeCompatibility.wsURL = "wss://example.com/v1/responses"
 	otherConn := newOpenAIWSConn("other_conn_direct", account.ID, &openAIWSFakeConn{}, nil)
+	otherConn.handshakeCompatibility.wsURL = "wss://example.com/v1/responses"
 	ap.mu.Lock()
 	ap.conns[preferredConn.id] = preferredConn
 	ap.conns[otherConn.id] = otherConn
@@ -2221,6 +2233,7 @@ func TestOpenAIWSConnPool_TargetConnCountAndPrewarmBranches(t *testing.T) {
 	cfg.Gateway.OpenAIWS.MinIdlePerAccount = 0
 	cfg.Gateway.OpenAIWS.PoolTargetUtilization = 0.9
 	busy := newOpenAIWSConn("busy_target", 2, &openAIWSFakeConn{}, nil)
+	busy.handshakeCompatibility.wsURL = "wss://example.com/v1/responses"
 	require.True(t, busy.tryAcquire())
 	busy.waiters.Store(1)
 	ap.conns[busy.id] = busy
@@ -2283,6 +2296,7 @@ func TestOpenAIWSConnPool_Acquire_ErrorBranches(t *testing.T) {
 	account2 := &Account{ID: 2002, Platform: PlatformOpenAI, Type: AccountTypeAPIKey}
 	ap2 := fullPool.getOrCreateAccountPool(account2.ID)
 	conn := newOpenAIWSConn("queue_full", account2.ID, &openAIWSFakeConn{}, nil)
+	conn.handshakeCompatibility.wsURL = "wss://example.com/v1/responses"
 	require.True(t, conn.tryAcquire())
 	conn.waiters.Store(1)
 	ap2.mu.Lock()

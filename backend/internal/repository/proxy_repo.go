@@ -3,12 +3,14 @@ package repository
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"sort"
 	"strconv"
 	"strings"
 	"time"
 
 	dbent "github.com/Wei-Shaw/sub2api/ent"
+	"github.com/Wei-Shaw/sub2api/ent/account"
 	"github.com/Wei-Shaw/sub2api/ent/proxy"
 	"github.com/Wei-Shaw/sub2api/internal/pkg/logger"
 	"github.com/Wei-Shaw/sub2api/internal/pkg/pagination"
@@ -129,22 +131,24 @@ func (r *proxyRepository) Update(ctx context.Context, proxyIn *service.Proxy) er
 }
 
 type proxyProbeIdentity struct {
-	protocol string
-	host     string
-	port     int
-	username string
-	password string
-	status   string
+	connectionKey string
+	protocol      string
+	host          string
+	port          int
+	username      string
+	password      string
+	status        string
 }
 
 func proxyProbeIdentityFromService(proxyIn *service.Proxy) proxyProbeIdentity {
 	return proxyProbeIdentity{
-		protocol: proxyIn.Protocol,
-		host:     proxyIn.Host,
-		port:     proxyIn.Port,
-		username: proxyIn.Username,
-		password: proxyIn.Password,
-		status:   proxyIn.Status,
+		connectionKey: service.ProxyConnectionKey(proxyIn),
+		protocol:      proxyIn.Protocol,
+		host:          proxyIn.Host,
+		port:          proxyIn.Port,
+		username:      proxyIn.Username,
+		password:      proxyIn.Password,
+		status:        proxyIn.Status,
 	}
 }
 
@@ -193,10 +197,12 @@ func updateProxyAndInvalidateProbeSnapshots(ctx context.Context, client *dbent.C
 	if err != nil {
 		return nil, err
 	}
-	if currentIdentity == proxyProbeIdentityFromService(proxyIn) {
-		return updated, nil
+	if currentIdentity != proxyProbeIdentityFromService(proxyIn) {
+		if _, err := invalidateProxyProbeSnapshots(ctx, client, proxyIn.ID); err != nil {
+			return nil, err
+		}
 	}
-	accountIDs, err := invalidateProxyProbeSnapshots(ctx, client, proxyIn.ID)
+	accountIDs, err := client.Account.Query().Where(account.ProxyIDEQ(proxyIn.ID)).IDs(ctx)
 	if err != nil {
 		return nil, err
 	}
@@ -208,7 +214,7 @@ func updateProxyAndInvalidateProbeSnapshots(ctx context.Context, client *dbent.C
 
 func lockProxyProbeIdentity(ctx context.Context, client *dbent.Client, proxyID int64) (proxyProbeIdentity, error) {
 	rows, err := client.QueryContext(ctx, `
-		SELECT protocol, host, port, COALESCE(username, ''), COALESCE(password, ''), status
+		SELECT protocol, host, port, COALESCE(username, ''), COALESCE(password, ''), status, kind, COALESCE(extra, '{}'::jsonb), owner_user_id
 		FROM proxies
 		WHERE id = $1 AND deleted_at IS NULL
 		FOR NO KEY UPDATE
@@ -224,9 +230,17 @@ func lockProxyProbeIdentity(ctx context.Context, client *dbent.Client, proxyID i
 		return proxyProbeIdentity{}, service.ErrProxyNotFound
 	}
 	var identity proxyProbeIdentity
-	if err := rows.Scan(&identity.protocol, &identity.host, &identity.port, &identity.username, &identity.password, &identity.status); err != nil {
+	var kind string
+	var extra []byte
+	var ownerID *int64
+	if err := rows.Scan(&identity.protocol, &identity.host, &identity.port, &identity.username, &identity.password, &identity.status, &kind, &extra, &ownerID); err != nil {
 		return proxyProbeIdentity{}, err
 	}
+	var config map[string]any
+	if err := json.Unmarshal(extra, &config); err != nil {
+		return proxyProbeIdentity{}, err
+	}
+	identity.connectionKey = service.ProxyConnectionKey(&service.Proxy{Kind: kind, Protocol: identity.protocol, Host: identity.host, Port: identity.port, Username: identity.username, Password: identity.password, Status: identity.status, Extra: config, OwnerUserID: ownerID})
 	return identity, rows.Err()
 }
 
@@ -535,16 +549,6 @@ func (r *proxyRepository) CountAccountsByProxyID(ctx context.Context, proxyID in
 func (r *proxyRepository) CountFallbackReferencesByProxyID(ctx context.Context, proxyID int64) (int64, error) {
 	var count int64
 	if err := scanSingleRow(ctx, r.sql, "SELECT COUNT(*) FROM proxies WHERE backup_proxy_id = $1 AND deleted_at IS NULL", []any{proxyID}, &count); err != nil {
-		return 0, err
-	}
-	return count, nil
-}
-
-// CountUserOwnedAccountsByProxyID returns the number of active user-owned accounts
-// that rely on a public system proxy.
-func (r *proxyRepository) CountUserOwnedAccountsByProxyID(ctx context.Context, proxyID int64) (int64, error) {
-	var count int64
-	if err := scanSingleRow(ctx, r.sql, "SELECT COUNT(*) FROM accounts WHERE proxy_id = $1 AND owner_user_id IS NOT NULL AND deleted_at IS NULL", []any{proxyID}, &count); err != nil {
 		return 0, err
 	}
 	return count, nil

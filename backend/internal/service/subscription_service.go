@@ -174,29 +174,12 @@ func (s *SubscriptionService) StartSubCacheInvalidationSubscriber(ctx context.Co
 }
 
 func (s *SubscriptionService) invalidateSubscriptionCaches(userID, groupID int64) error {
-	return s.invalidateSubscriptionCachesWithContext(context.Background(), userID, groupID)
-}
-
-// InvalidateSubscriptionCaches is the shared post-commit invalidation path for
-// admin and user-resource subscription mutations. It synchronously clears the
-// local cache, removes the billing cache and publishes the cross-instance
-// invalidation event.
-func (s *SubscriptionService) InvalidateSubscriptionCaches(ctx context.Context, userID, groupID int64) error {
-	if s == nil {
-		return nil
-	}
-	return s.invalidateSubscriptionCachesWithContext(ctx, userID, groupID)
-}
-
-func (s *SubscriptionService) invalidateSubscriptionCachesWithContext(ctx context.Context, userID, groupID int64) error {
 	s.InvalidateSubCacheSync(userID, groupID)
 	if s.billingCacheService == nil {
 		return nil
 	}
-	if ctx == nil {
-		ctx = context.Background()
-	}
-	cacheCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+
+	cacheCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	if err := s.billingCacheService.InvalidateSubscription(cacheCtx, userID, groupID); err != nil {
 		return fmt.Errorf("invalidate billing subscription cache: %w", err)
@@ -209,14 +192,11 @@ func (s *SubscriptionService) invalidateSubscriptionCachesWithContext(ctx contex
 
 // AssignSubscriptionInput 分配订阅输入
 type AssignSubscriptionInput struct {
-	UserID             int64
-	GroupID            int64
-	ValidityDays       int
-	AssignedBy         int64
-	ManagedByUserID    *int64
-	SourceType         string
-	SourceRedeemCodeID *int64
-	Notes              string
+	UserID       int64
+	GroupID      int64
+	ValidityDays int
+	AssignedBy   int64
+	Notes        string
 }
 
 // AssignSubscription 分配订阅给用户（不允许重复分配）
@@ -265,7 +245,7 @@ func (s *SubscriptionService) assignOrExtendSubscription(ctx context.Context, in
 
 	// 已有订阅，执行续期（在事务中完成所有更新）
 	if existingSub != nil {
-		if err := s.updateExistingSubscriptionTerm(ctx, existingSub.ID, validityDays, input, false); err != nil {
+		if err := s.updateExistingSubscriptionTerm(ctx, existingSub.ID, validityDays, input.Notes, false); err != nil {
 			return nil, false, err
 		}
 
@@ -311,7 +291,7 @@ func (s *SubscriptionService) updateExistingSubscriptionTerm(
 	ctx context.Context,
 	subscriptionID int64,
 	validityDays int,
-	input *AssignSubscriptionInput,
+	notes string,
 	assignmentSemantics bool,
 ) error {
 	return s.withSubscriptionUpdateTx(ctx, func(txCtx context.Context) error {
@@ -339,17 +319,12 @@ func (s *SubscriptionService) updateExistingSubscriptionTerm(
 		if newExpiresAt.After(MaxExpiresAt) {
 			newExpiresAt = MaxExpiresAt
 		}
-		notes := ""
-		if input != nil {
-			notes = input.Notes
-		}
 		if assignmentSemantics && strings.TrimSpace(existingSub.Notes) == strings.TrimSpace(notes) {
 			notes = ""
 		}
 
 		if isExpired {
 			renewed := renewedSubscriptionTerm(existingSub, notes, now, newExpiresAt)
-			applySubscriptionAttribution(renewed, input)
 			if err := s.userSubRepo.Update(txCtx, renewed); err != nil {
 				return fmt.Errorf("renew expired subscription: %w", err)
 			}
@@ -372,16 +347,6 @@ func (s *SubscriptionService) updateExistingSubscriptionTerm(
 		if notes != "" {
 			if err := s.userSubRepo.UpdateNotes(txCtx, existingSub.ID, appendSubscriptionNotes(existingSub.Notes, notes)); err != nil {
 				return fmt.Errorf("update subscription notes: %w", err)
-			}
-		}
-		if input != nil && (input.ManagedByUserID != nil || input.SourceType != "" || input.SourceRedeemCodeID != nil) {
-			updated, err := s.userSubRepo.GetByID(txCtx, existingSub.ID)
-			if err != nil {
-				return fmt.Errorf("reload subscription for attribution: %w", err)
-			}
-			applySubscriptionAttribution(updated, input)
-			if err := s.userSubRepo.Update(txCtx, updated); err != nil {
-				return fmt.Errorf("update subscription attribution: %w", err)
 			}
 		}
 
@@ -442,21 +407,6 @@ func appendSubscriptionNotes(existingNotes, newNotes string) string {
 	return existingNotes + "\n" + newNotes
 }
 
-func applySubscriptionAttribution(sub *UserSubscription, input *AssignSubscriptionInput) {
-	if sub == nil || input == nil {
-		return
-	}
-	if input.ManagedByUserID != nil {
-		sub.ManagedByUserID = input.ManagedByUserID
-	}
-	if input.SourceType != "" {
-		sub.SourceType = input.SourceType
-	}
-	if input.SourceRedeemCodeID != nil {
-		sub.SourceRedeemCodeID = input.SourceRedeemCodeID
-	}
-}
-
 // createSubscription 创建新订阅（内部方法）
 func (s *SubscriptionService) createSubscription(ctx context.Context, input *AssignSubscriptionInput) (*UserSubscription, error) {
 	validityDays := input.ValidityDays
@@ -484,7 +434,6 @@ func (s *SubscriptionService) createSubscription(ctx context.Context, input *Ass
 		CreatedAt:  now,
 		UpdatedAt:  now,
 	}
-	applySubscriptionAttribution(sub, input)
 	// 只有当 AssignedBy > 0 时才设置（0 表示系统分配，如兑换码）
 	if input.AssignedBy > 0 {
 		sub.AssignedBy = &input.AssignedBy
@@ -578,7 +527,7 @@ func (s *SubscriptionService) assignSubscriptionWithReuse(ctx context.Context, i
 		if sub.Status == SubscriptionStatusExpired ||
 			(sub.Status != SubscriptionStatusSuspended && !sub.ExpiresAt.After(now)) {
 			validityDays := normalizeAssignValidityDays(input.ValidityDays)
-			if err := s.updateExistingSubscriptionTerm(ctx, sub.ID, validityDays, input, true); err != nil {
+			if err := s.updateExistingSubscriptionTerm(ctx, sub.ID, validityDays, input.Notes, true); err != nil {
 				return nil, false, err
 			}
 			s.maybeInvalidateAssignmentCaches(input.UserID, input.GroupID, false)
@@ -660,7 +609,7 @@ func (s *SubscriptionService) RevokeSubscription(ctx context.Context, subscripti
 	}
 
 	if err := s.invalidateSubscriptionCaches(sub.UserID, sub.GroupID); err != nil {
-		log.Printf("Warning: post-commit revoked subscription cache invalidation failed for user %d group %d: %v", sub.UserID, sub.GroupID, err)
+		return err
 	}
 
 	return nil
@@ -696,7 +645,7 @@ func (s *SubscriptionService) RestoreSubscription(ctx context.Context, subscript
 	}
 
 	if err := s.invalidateSubscriptionCaches(restored.UserID, restored.GroupID); err != nil {
-		log.Printf("Warning: post-commit restored subscription cache invalidation failed for user %d group %d: %v", restored.UserID, restored.GroupID, err)
+		return nil, err
 	}
 	return restored, nil
 }

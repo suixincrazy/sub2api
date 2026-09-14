@@ -9,7 +9,7 @@ vi.mock('vue-i18n', async () => {
   return {
     ...actual,
     useI18n: () => ({
-      t: (key: string) => key === 'myResources.states.publicDetailsHidden'
+      t: (key: string) => key === 'admin.proxies.detailsHidden'
         ? 'Public proxy hidden'
         : key
     })

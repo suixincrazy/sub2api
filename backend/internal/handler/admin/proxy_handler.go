@@ -15,8 +15,8 @@ import (
 
 // ProxyHandler handles admin proxy management
 type ProxyHandler struct {
-	adminService        service.AdminService
-	userResourceService *service.UserResourceService
+	adminService       service.AdminService
+	proxySourceService *service.ProxySourceService
 }
 
 // NewProxyHandler creates a new admin proxy handler
@@ -25,10 +25,10 @@ func NewProxyHandler(adminService service.AdminService) *ProxyHandler {
 }
 
 // ProvideProxyHandler creates an admin proxy handler with system proxy resource support.
-func ProvideProxyHandler(adminService service.AdminService, userResourceService *service.UserResourceService) *ProxyHandler {
+func ProvideProxyHandler(adminService service.AdminService, proxySourceService *service.ProxySourceService) *ProxyHandler {
 	return &ProxyHandler{
-		adminService:        adminService,
-		userResourceService: userResourceService,
+		adminService:       adminService,
+		proxySourceService: proxySourceService,
 	}
 }
 

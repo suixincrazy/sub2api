@@ -86,9 +86,9 @@ func parseAdminProxyImportRequest(c *gin.Context, payload map[string]any) (admin
 	}, true
 }
 
-func adminProxySourceListOptions(c *gin.Context) service.UserResourceListOptions {
+func adminProxySourceListOptions(c *gin.Context) service.ProxySourceListOptions {
 	page, pageSize := response.ParsePagination(c)
-	return service.UserResourceListOptions{
+	return service.ProxySourceListOptions{
 		Page:      page,
 		PageSize:  pageSize,
 		Search:    c.Query("search"),
@@ -107,12 +107,12 @@ func parseAdminProxySourceID(c *gin.Context) (int64, bool) {
 	return sourceID, true
 }
 
-func (h *ProxyHandler) systemProxyResourceService(c *gin.Context) (*service.UserResourceService, bool) {
-	if h.userResourceService == nil {
+func (h *ProxyHandler) systemProxyResourceService(c *gin.Context) (*service.ProxySourceService, bool) {
+	if h.proxySourceService == nil {
 		response.InternalError(c, "System proxy resource service is not available")
 		return nil, false
 	}
-	return h.userResourceService, true
+	return h.proxySourceService, true
 }
 
 // ImportProxyNodes imports standard proxies, modern share links, or proxy client configuration.

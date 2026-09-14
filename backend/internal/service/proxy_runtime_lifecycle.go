@@ -6,7 +6,8 @@ import (
 	"time"
 )
 
-const defaultProxyRuntimeIdleTTL = 15 * time.Minute
+// Connections may carry long streams without another ProxyURL call.
+const defaultProxyRuntimeIdleTTL time.Duration = 0
 
 func parseProxyRuntimeIdleTTL(raw string) time.Duration {
 	raw = strings.TrimSpace(raw)

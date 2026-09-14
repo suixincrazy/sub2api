@@ -70,10 +70,5 @@ declare module 'vue-router' {
      * i18n key for the page description
      */
     descriptionKey?: string
-
-    /**
-     * User resource workspace page kind.
-     */
-    resource?: string
   }
 }

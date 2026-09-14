@@ -2,7 +2,6 @@ package service
 
 import (
 	"context"
-	"crypto/sha256"
 	"fmt"
 	"log/slog"
 	"net/http"
@@ -33,7 +32,7 @@ func (s *RateLimitService) maybeHandleOpenAITeamLinkedError(ctx context.Context,
 	if teamID == "" {
 		return
 	}
-	if !s.markOpenAITeamLinkedFired(account.OwnerUserID, teamID) {
+	if !s.markOpenAITeamLinkedFired(teamID) {
 		return
 	}
 	// 上游报错场景请求 ctx 往往已被取消，落库需要独立生命周期。
@@ -48,7 +47,7 @@ func (s *RateLimitService) maybeHandleOpenAITeamLinkedError(ctx context.Context,
 	var targets []*Account
 	for i := range accounts {
 		acc := &accounts[i]
-		if acc.ID == account.ID || acc.IsShadow() || !isOpenAIOAuthAccount(acc) || !sameResourceOwner(account.OwnerUserID, acc.OwnerUserID) || strings.TrimSpace(acc.GetChatGPTAccountID()) != teamID {
+		if acc.ID == account.ID || acc.IsShadow() || strings.TrimSpace(acc.GetChatGPTAccountID()) != teamID {
 			continue
 		}
 		targets = append(targets, acc)
@@ -73,19 +72,18 @@ func (s *RateLimitService) maybeHandleOpenAITeamLinkedError(ctx context.Context,
 	}
 	slog.Warn("openai_team_linked_error_fanout",
 		"trigger_account_id", account.ID,
-		"team_fingerprint", openAITeamIDFingerprint(teamID),
+		"chatgpt_account_id", teamID,
 		"affected", marked,
 		"targets", len(targets),
 	)
 }
 
-// markOpenAITeamLinkedFired 按资源归属和 teamID 做进程内去重。
-func (s *RateLimitService) markOpenAITeamLinkedFired(ownerUserID *int64, teamID string) bool {
+// markOpenAITeamLinkedFired 以 teamID 为键做进程内去重：TTL 内同一 Team 只允许一次 fan-out。
+func (s *RateLimitService) markOpenAITeamLinkedFired(teamID string) bool {
 	now := time.Now()
-	key := openAITeamLinkedDedupKey(ownerUserID, teamID)
 	s.openaiTeamLinkedMu.Lock()
 	defer s.openaiTeamLinkedMu.Unlock()
-	if expiry, ok := s.openaiTeamLinkedRecent[key]; ok && expiry.After(now) {
+	if expiry, ok := s.openaiTeamLinkedRecent[teamID]; ok && expiry.After(now) {
 		return false
 	}
 	if s.openaiTeamLinkedRecent == nil {
@@ -96,19 +94,6 @@ func (s *RateLimitService) markOpenAITeamLinkedFired(ownerUserID *int64, teamID 
 			delete(s.openaiTeamLinkedRecent, k)
 		}
 	}
-	s.openaiTeamLinkedRecent[key] = now.Add(openAITeamLinkedErrorDedupTTL)
+	s.openaiTeamLinkedRecent[teamID] = now.Add(openAITeamLinkedErrorDedupTTL)
 	return true
-}
-
-func openAITeamLinkedDedupKey(ownerUserID *int64, teamID string) string {
-	if ownerUserID == nil {
-		return "system:" + teamID
-	}
-	return fmt.Sprintf("user:%d:%s", *ownerUserID, teamID)
-}
-
-func openAITeamIDFingerprint(teamID string) string {
-	normalized := strings.ToLower(strings.TrimSpace(teamID))
-	sum := sha256.Sum256([]byte(normalized))
-	return fmt.Sprintf("%x", sum[:6])
 }

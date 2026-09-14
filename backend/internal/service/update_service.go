@@ -30,7 +30,7 @@ var (
 const (
 	updateCacheKey = "update_check_cache"
 	updateCacheTTL = 1200 // 20 minutes
-	githubRepo     = "smmooooonn/sub2api-xray"
+	githubRepo     = "suixincrazy/sub2api"
 
 	// Security: allowed download domains for updates
 	allowedDownloadHost = "github.com"
@@ -637,51 +637,32 @@ func (s *UpdateService) saveToCache(ctx context.Context, info *UpdateInfo) {
 	_ = s.cache.SetUpdateInfo(ctx, string(data), time.Duration(updateCacheTTL)*time.Second)
 }
 
-// compareVersions compares upstream semantic versions and Xray fork revisions.
+// compareVersions compares two semantic versions
 func compareVersions(current, latest string) int {
 	currentParts := parseVersion(current)
 	latestParts := parseVersion(latest)
 
 	for i := 0; i < 3; i++ {
-		if currentParts.core[i] < latestParts.core[i] {
+		if currentParts[i] < latestParts[i] {
 			return -1
 		}
-		if currentParts.core[i] > latestParts.core[i] {
+		if currentParts[i] > latestParts[i] {
 			return 1
 		}
-	}
-	if currentParts.xray < latestParts.xray {
-		return -1
-	}
-	if currentParts.xray > latestParts.xray {
-		return 1
 	}
 	return 0
 }
 
-type parsedVersion struct {
-	core [3]int
-	xray int
-}
-
-func parseVersion(v string) parsedVersion {
+func parseVersion(v string) [3]int {
 	v = strings.TrimPrefix(v, "v")
-	core, suffix, hasSuffix := strings.Cut(v, "-xray")
-	// 官方 0.1.184 新增：剥离非 -xray 的预发布后缀（-beta1、-rc1 等）。
-	// 不剥离时 Atoi("184-rc1") 会失败并把该段静默算成 0。
-	if idx := strings.IndexByte(core, '-'); idx != -1 {
-		core = core[:idx]
+	if idx := strings.IndexByte(v, '-'); idx != -1 {
+		v = v[:idx]
 	}
-	parts := strings.Split(core, ".")
-	result := parsedVersion{}
+	parts := strings.Split(v, ".")
+	result := [3]int{0, 0, 0}
 	for i := 0; i < len(parts) && i < 3; i++ {
 		if parsed, err := strconv.Atoi(parts[i]); err == nil {
-			result.core[i] = parsed
-		}
-	}
-	if hasSuffix {
-		if parsed, err := strconv.Atoi(suffix); err == nil && parsed >= 0 {
-			result.xray = parsed
+			result[i] = parsed
 		}
 	}
 	return result

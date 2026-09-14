@@ -363,11 +363,6 @@ func (h *GroupHandler) List(c *gin.Context) {
 	isExclusiveStr := c.Query("is_exclusive")
 	sortBy := c.DefaultQuery("sort_by", "sort_order")
 	sortOrder := c.DefaultQuery("sort_order", "asc")
-	ownerScope, err := service.NormalizeResourceOwnerScope(c.Query("owner_scope"))
-	if err != nil {
-		response.ErrorFrom(c, err)
-		return
-	}
 
 	var isExclusive *bool
 	if !h.isSimpleMode() && isExclusiveStr != "" {
@@ -375,16 +370,7 @@ func (h *GroupHandler) List(c *gin.Context) {
 		isExclusive = &val
 	}
 
-	var groups []service.Group
-	var total int64
-	if ownerScope == "" {
-		groups, total, err = h.adminService.ListGroups(c.Request.Context(), page, pageSize, platform, status, search, isExclusive, sortBy, sortOrder)
-	} else if scoped, ok := h.adminService.(groupOwnerScopeLister); ok {
-		groups, total, err = scoped.ListGroupsByOwnerScope(c.Request.Context(), page, pageSize, platform, status, search, isExclusive, ownerScope, sortBy, sortOrder)
-	} else {
-		response.InternalError(c, "Resource owner filter is not available")
-		return
-	}
+	groups, total, err := h.adminService.ListGroups(c.Request.Context(), page, pageSize, platform, status, search, isExclusive, sortBy, sortOrder)
 	if err != nil {
 		response.ErrorFrom(c, err)
 		return

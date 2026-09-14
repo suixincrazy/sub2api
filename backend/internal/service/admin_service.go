@@ -2,7 +2,6 @@ package service
 
 import (
 	"context"
-	"database/sql"
 	"net/http"
 	"time"
 
@@ -20,9 +19,6 @@ type AdminService interface {
 	CreateUser(ctx context.Context, input *CreateUserInput) (*User, error)
 	UpdateUser(ctx context.Context, id int64, input *UpdateUserInput) (*User, error)
 	DeleteUser(ctx context.Context, id int64) error
-	// DisableUserAndOwnedResources atomically disables the user and every
-	// private resource owned or managed by that user.
-	DisableUserAndOwnedResources(ctx context.Context, userID int64) error
 	UpdateUserBalance(ctx context.Context, userID int64, balance float64, operation string, notes string) (*User, error)
 	BatchUpdateConcurrency(ctx context.Context, userIDs []int64, value int, mode string) (int, error)
 	BatchUpdateLimits(ctx context.Context, userIDs []int64, concurrency, rpmLimit *int) (int, error)
@@ -711,14 +707,12 @@ type adminServiceImpl struct {
 	proxyLatencyCache    ProxyLatencyCache
 	proxyProbeResolver   ProxyProbeURLResolver
 	authCacheInvalidator APIKeyAuthCacheInvalidator
-	db                   *sql.DB
 	entClient            *dbent.Client // 用于开启数据库事务
 	settingService       *SettingService
 	defaultSubAssigner   DefaultSubscriptionAssigner
 	userSubRepo          UserSubscriptionRepository
 	privacyClientFactory PrivacyClientFactory
 	runtimeBlocker       AccountRuntimeBlocker
-	tokenRefreshService  *TokenRefreshService
 	affiliateService     adminRechargeAffiliateAccruer
 	compositeRouteRepo   CompositeModelRouteRepository
 	compositeResolver    *CompositeRouteResolver
@@ -755,7 +749,6 @@ func NewAdminService(
 	proxyProber ProxyExitInfoProber,
 	proxyLatencyCache ProxyLatencyCache,
 	authCacheInvalidator APIKeyAuthCacheInvalidator,
-	db *sql.DB,
 	entClient *dbent.Client,
 	settingService *SettingService,
 	defaultSubAssigner DefaultSubscriptionAssigner,
@@ -786,7 +779,6 @@ func NewAdminService(
 		proxyLatencyCache:    proxyLatencyCache,
 		proxyProbeResolver:   DefaultProxyProbeRuntimeResolver(),
 		authCacheInvalidator: authCacheInvalidator,
-		db:                   db,
 		entClient:            entClient,
 		settingService:       settingService,
 		defaultSubAssigner:   defaultSubAssigner,
@@ -799,11 +791,4 @@ func NewAdminService(
 
 		channelCacheInvalidator: channelCacheInvalidator,
 	}
-}
-
-func (s *adminServiceImpl) SetTokenRefreshService(tokenRefreshService *TokenRefreshService) {
-	if s == nil {
-		return
-	}
-	s.tokenRefreshService = tokenRefreshService
 }

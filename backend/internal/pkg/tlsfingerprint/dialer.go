@@ -5,6 +5,7 @@ package tlsfingerprint
 import (
 	"bufio"
 	"context"
+	"crypto/tls"
 	"encoding/base64"
 	"fmt"
 	"log/slog"
@@ -158,7 +159,7 @@ func NewHTTPProxyDialer(profile *Profile, proxyURL *url.URL) *HTTPProxyDialer {
 
 func NewHTTPProxyDialerWithBaseDialer(profile *Profile, proxyURL *url.URL, baseDialer func(context.Context, string, string) (net.Conn, error)) *HTTPProxyDialer {
 	if baseDialer == nil {
-		baseDialer = (&net.Dialer{}).DialContext
+		baseDialer = newFingerprintDialer().DialContext
 	}
 	return &HTTPProxyDialer{profile: profile, proxyURL: proxyURL, baseDialer: baseDialer}
 }
@@ -172,7 +173,7 @@ func NewSOCKS5ProxyDialer(profile *Profile, proxyURL *url.URL) *SOCKS5ProxyDiale
 
 func NewSOCKS5ProxyDialerWithBaseDialer(profile *Profile, proxyURL *url.URL, baseDialer func(context.Context, string, string) (net.Conn, error)) *SOCKS5ProxyDialer {
 	if baseDialer == nil {
-		baseDialer = (&net.Dialer{}).DialContext
+		baseDialer = newFingerprintDialer().DialContext
 	}
 	return &SOCKS5ProxyDialer{profile: profile, proxyURL: proxyURL, baseDialer: baseDialer}
 }
@@ -192,6 +193,8 @@ func (d contextProxyDialer) DialContext(ctx context.Context, network, address st
 // DialTLSContext establishes a TLS connection through SOCKS5 proxy with the configured fingerprint.
 // Flow: SOCKS5 CONNECT to target -> TLS handshake with utls on the tunnel
 func (d *SOCKS5ProxyDialer) DialTLSContext(ctx context.Context, network, addr string) (net.Conn, error) {
+	ctx, cancel := context.WithTimeout(ctx, fingerprintDialTimeout)
+	defer cancel()
 	slog.Debug("tls_fingerprint_socks5_connecting", "proxy", d.proxyURL.Host, "target", addr)
 
 	// Step 1: Create SOCKS5 dialer
@@ -221,7 +224,7 @@ func (d *SOCKS5ProxyDialer) DialTLSContext(ctx context.Context, network, addr st
 
 	// Step 2: Establish SOCKS5 tunnel to target
 	slog.Debug("tls_fingerprint_socks5_establishing_tunnel", "target", addr)
-	conn, err := socksDialer.Dial("tcp", addr)
+	conn, err := socksDialer.(proxy.ContextDialer).DialContext(ctx, "tcp", addr)
 	if err != nil {
 		slog.Debug("tls_fingerprint_socks5_connect_failed", "error", err)
 		return nil, fmt.Errorf("SOCKS5 connect: %w", err)
@@ -235,6 +238,8 @@ func (d *SOCKS5ProxyDialer) DialTLSContext(ctx context.Context, network, addr st
 // DialTLSContext establishes a TLS connection through HTTP proxy with the configured fingerprint.
 // Flow: TCP connect to proxy -> CONNECT tunnel -> TLS handshake with utls
 func (d *HTTPProxyDialer) DialTLSContext(ctx context.Context, network, addr string) (net.Conn, error) {
+	ctx, cancel := context.WithTimeout(ctx, fingerprintDialTimeout)
+	defer cancel()
 	slog.Debug("tls_fingerprint_http_proxy_connecting", "proxy", d.proxyURL.Host, "target", addr)
 
 	// Step 1: TCP connect to proxy server
@@ -254,6 +259,17 @@ func (d *HTTPProxyDialer) DialTLSContext(ctx context.Context, network, addr stri
 	if err != nil {
 		slog.Debug("tls_fingerprint_http_proxy_connect_failed", "error", err)
 		return nil, fmt.Errorf("connect to proxy: %w", err)
+	}
+	baseConn := conn
+	stopClose := context.AfterFunc(ctx, func() { _ = baseConn.Close() })
+	defer stopClose()
+	if d.proxyURL.Scheme == "https" {
+		proxyTLS := tls.Client(conn, &tls.Config{ServerName: d.proxyURL.Hostname(), MinVersion: tls.VersionTLS12})
+		if err := proxyTLS.HandshakeContext(ctx); err != nil {
+			_ = conn.Close()
+			return nil, fmt.Errorf("TLS handshake with proxy: %w", err)
+		}
+		conn = proxyTLS
 	}
 	slog.Debug("tls_fingerprint_http_proxy_connected", "proxy_addr", proxyAddr)
 
@@ -305,6 +321,8 @@ func (d *HTTPProxyDialer) DialTLSContext(ctx context.Context, network, addr stri
 // DialTLSContext establishes a TLS connection with the configured fingerprint.
 // This method is designed to be used as http.Transport.DialTLSContext.
 func (d *Dialer) DialTLSContext(ctx context.Context, network, addr string) (net.Conn, error) {
+	ctx, cancel := context.WithTimeout(ctx, fingerprintDialTimeout)
+	defer cancel()
 	// Establish TCP connection using base dialer (supports proxy)
 	slog.Debug("tls_fingerprint_dialing_tcp", "addr", addr)
 	conn, err := d.baseDialer(ctx, network, addr)

@@ -204,7 +204,6 @@ func TestRecordCyberPolicyEvent_RespectsContentModerationScope(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			repo := &banCountArgsTestRepo{}
 			userRepo := &contentModerationTestUserRepo{user: &User{ID: 1, Role: RoleUser, Status: StatusActive}}
-			deprovisioner := &contentModerationTestDeprovisioner{repo: userRepo}
 			svc := NewContentModerationService(
 				&contentModerationTestSettingRepo{values: map[string]string{
 					SettingKeyRiskControlEnabled:      "true",
@@ -212,7 +211,6 @@ func TestRecordCyberPolicyEvent_RespectsContentModerationScope(t *testing.T) {
 				}},
 				repo, nil, nil, userRepo, nil, nil, nil,
 			)
-			svc.SetUserResourceDeprovisioner(deprovisioner)
 
 			svc.RecordCyberPolicyEvent(context.Background(), CyberPolicyRecordInput{
 				UserID:  1,
@@ -228,11 +226,10 @@ func TestRecordCyberPolicyEvent_RespectsContentModerationScope(t *testing.T) {
 			require.Len(t, repo.snapshotLogs(), tt.wantLogs)
 			require.Equal(t, tt.wantBanned, userRepo.user.Status == StatusDisabled)
 			if tt.wantBanned {
-				require.Equal(t, []int64{1}, deprovisioner.calls)
+				require.Len(t, userRepo.updated, 1)
 			} else {
-				require.Empty(t, deprovisioner.calls)
+				require.Empty(t, userRepo.updated)
 			}
-			require.Empty(t, userRepo.updated, "auto-ban must use the atomic resource lifecycle")
 		})
 	}
 }

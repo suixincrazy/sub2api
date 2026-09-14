@@ -1,15 +1,13 @@
-import { existsSync, readFileSync } from 'node:fs'
+import { readFileSync } from 'node:fs'
 import { resolve } from 'node:path'
 
 import { describe, expect, it } from 'vitest'
 
 const source = readFileSync(resolve(process.cwd(), 'src/views/admin/ProxiesView.vue'), 'utf8')
 const apiSource = readFileSync(resolve(process.cwd(), 'src/api/admin/proxies.ts'), 'utf8')
-const createAccountSource = readFileSync(resolve(process.cwd(), 'src/components/account/CreateAccountModal.vue'), 'utf8')
-const editAccountSource = readFileSync(resolve(process.cwd(), 'src/components/account/EditAccountModal.vue'), 'utf8')
 
 describe('admin proxy modern mode support', () => {
-  it('keeps official create tabs and uses the same four add methods as My Proxies', () => {
+  it('keeps official create tabs and provides the four proxy import methods', () => {
     expect(source).toContain('data-test="admin-proxy-create-mode-standard"')
     expect(source).toContain('data-test="admin-proxy-create-mode-batch"')
     expect(source).toContain('data-test="admin-proxy-input-mode-selector"')
@@ -19,10 +17,10 @@ describe('admin proxy modern mode support', () => {
     expect(source).toContain("{ value: 'xray', label:")
     expect(source).toContain("{ value: 'source', label:")
     expect(source).toContain("{ value: 'config', label:")
-    expect(source).toContain("t('myResources.proxyEditor.standardProxy')")
-    expect(source).toContain("t('myResources.proxyEditor.xrayShare')")
-    expect(source).toContain("t('myResources.proxyEditor.providerSubscription')")
-    expect(source).toContain("t('myResources.proxyEditor.nodeConfig')")
+    expect(source).toContain("t('admin.proxies.standardProxy')")
+    expect(source).toContain("t('admin.proxies.nodeShareLink')")
+    expect(source).toContain("t('admin.proxies.subscriptionSource')")
+    expect(source).toContain("t('admin.proxies.clientNodeConfig')")
     expect(source).not.toContain(':options="createModeOptions"')
     expect(source).not.toContain('data-test="admin-proxy-mode-direct"')
   })
@@ -46,13 +44,6 @@ describe('admin proxy modern mode support', () => {
     expect(source).toContain("appStore.showError(t('admin.proxies.configFileReadFailed'))")
   })
 
-  it('removes the proxy promotion component and every account-form reference', () => {
-    expect(existsSync(resolve(process.cwd(), 'src/components/common/ProxyAdBanner.vue'))).toBe(false)
-    expect(source).not.toContain('ProxyAdBanner')
-    expect(createAccountSource).not.toContain('ProxyAdBanner')
-    expect(editAccountSource).not.toContain('ProxyAdBanner')
-    expect(source).not.toContain('sub2api.io/proxyip')
-  })
 
   it('routes imports and subscription sources through admin-only APIs', () => {
     expect(source).toContain('adminAPI.proxies.importNodes({')

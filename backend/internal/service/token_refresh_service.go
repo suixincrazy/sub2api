@@ -85,14 +85,6 @@ type TokenRefreshService struct {
 	attemptTimeoutOverride time.Duration
 }
 
-type forceOAuthRefreshExecutor struct {
-	OAuthRefreshExecutor
-}
-
-func (e forceOAuthRefreshExecutor) NeedsRefresh(account *Account, _ time.Duration) bool {
-	return e.OAuthRefreshExecutor != nil && e.CanRefresh(account)
-}
-
 // NewTokenRefreshService 创建token刷新服务
 func NewTokenRefreshService(
 	accountRepo AccountRepository,
@@ -158,15 +150,6 @@ func (s *TokenRefreshService) eligiblePlatforms() []string {
 		}
 	}
 	return platforms
-}
-
-func (s *TokenRefreshService) matchRefresher(platform string) (TokenRefresher, OAuthRefreshExecutor) {
-	for _, reg := range s.registrations {
-		if reg.platform == platform {
-			return reg.refresher, reg.executor
-		}
-	}
-	return nil, nil
 }
 
 func (s *TokenRefreshService) candidateAfterID() int64 {
@@ -838,54 +821,6 @@ func (s *TokenRefreshService) maxRetries() int {
 		return min(s.cfg.MaxRetries, maxTokenRefreshMaxRetries)
 	}
 	return defaultTokenRefreshMaxRetries
-}
-
-// RefreshAccountNow forces one account through the normal OAuth refresh path.
-func (s *TokenRefreshService) RefreshAccountNow(ctx context.Context, accountID int64) (*Account, error) {
-	if s == nil || s.accountRepo == nil {
-		return nil, infraerrors.ServiceUnavailable("TOKEN_REFRESH_UNAVAILABLE", "token refresh service is not available")
-	}
-	if accountID <= 0 {
-		return nil, infraerrors.BadRequest("ACCOUNT_ID_INVALID", "account_id is invalid")
-	}
-
-	account, err := s.accountRepo.GetByID(ctx, accountID)
-	if err != nil {
-		return nil, err
-	}
-	if account == nil {
-		return nil, ErrAccountNotFound
-	}
-
-	for i := range s.registrations {
-		registration := &s.registrations[i]
-		if registration.platform != account.Platform || registration.refresher == nil || !registration.refresher.CanRefresh(account) {
-			continue
-		}
-		executor := registration.executor
-		if executor != nil {
-			executor = forceOAuthRefreshExecutor{OAuthRefreshExecutor: executor}
-		}
-		gate := &tokenRefreshProviderState{
-			service:      s,
-			registration: *registration,
-			rateGate:     s.providerRateGate(registration.platform),
-			poolGate:     s.providerConcurrencyGate(registration.platform),
-		}
-		if err := s.refreshWithRetryWithRateGate(ctx, account, registration.refresher, executor, 0, gate); err != nil {
-			return nil, err
-		}
-		updated, getErr := s.accountRepo.GetByID(ctx, accountID)
-		if getErr != nil {
-			return nil, getErr
-		}
-		if updated == nil {
-			return nil, ErrAccountNotFound
-		}
-		return updated, nil
-	}
-
-	return nil, infraerrors.BadRequest("ACCOUNT_NOT_REFRESHABLE", "account is not refreshable")
 }
 
 // refreshWithRetry 带重试的刷新

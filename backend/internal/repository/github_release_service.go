@@ -22,8 +22,6 @@ type githubReleaseClient struct {
 	updateGitHubToken  string
 }
 
-const githubReleaseDownloadTimeout = 45 * time.Minute
-
 type githubReleaseClientError struct {
 	err error
 }
@@ -52,7 +50,7 @@ func NewGitHubReleaseClient(proxyURL string, allowDirectOnProxyError bool) servi
 
 	// 下载客户端需要更长的超时时间
 	downloadClient, err := httpclient.GetClient(httpclient.Options{
-		Timeout:  githubReleaseDownloadTimeout,
+		Timeout:  10 * time.Minute,
 		ProxyURL: proxyURL,
 	})
 	if err != nil {
@@ -60,7 +58,7 @@ func NewGitHubReleaseClient(proxyURL string, allowDirectOnProxyError bool) servi
 			slog.Warn("proxy download client init failed, all requests will fail", "service", "github_release", "error", err)
 			return &githubReleaseClientError{err: fmt.Errorf("proxy client init failed and direct fallback is disabled; set security.proxy_fallback.allow_direct_on_error=true to allow fallback: %w", err)}
 		}
-		downloadClient = &http.Client{Timeout: githubReleaseDownloadTimeout}
+		downloadClient = &http.Client{Timeout: 10 * time.Minute}
 	}
 	downloadClient = cloneHTTPClient(downloadClient)
 

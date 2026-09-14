@@ -111,8 +111,6 @@ export default {
         opencode_go: 'OpenCode',
       },
       cnProviders: {
-        baseUrlHint: 'Leave empty to use the official endpoint for the selected account type and API protocol.',
-        apiKeyHint: 'The API key issued by the selected provider console.',
         accountMode: {
           title: 'Account Type',
           payg: 'Pay-as-you-go',
@@ -201,7 +199,6 @@ export default {
       status: {
         active: 'Active',
         inactive: 'Inactive',
-        disabled: 'Disabled',
         expired: 'Expired',
         error: 'Error',
         cooldown: 'Cooldown',
@@ -225,7 +222,6 @@ export default {
       columns: {
         name: 'Name',
         id: 'Account ID',
-        owner: 'Resource Owner',
         platformType: 'Platform/Type',
         platform: 'Platform',
         type: 'Type',
@@ -247,11 +243,6 @@ export default {
         expiresAt: 'Expires At',
         actions: 'Actions'
       },
-      allResourceOwners: 'All Resource Owners',
-      systemResources: 'System Resources',
-      userResources: 'User Resources',
-      systemResource: 'System',
-      userResourceOwner: 'User #{id}',
       schedulerScore: {
         baseShort: 'Base',
         stickyShort: 'Sticky',
@@ -1496,10 +1487,9 @@ export default {
       connectingToApi: 'Connecting to API...',
       testCompleted: 'Test completed successfully!',
       testFailed: 'Test failed',
-      testCancelled: 'Test cancelled or timed out',
       connectedToApi: 'Connected to API',
       usingModel: 'Using model: {model}',
-      sendingTestMessage: 'Sending test message: "{prompt}"',
+      sendingTestMessage: 'Sending test message: "hi"',
       sendingImageRequest: 'Sending image generation test request...',
       response: 'Response:',
       startTest: 'Start Test',
@@ -1511,9 +1501,7 @@ export default {
       testAccountTypeLabel: 'Account type: {type}',
       selectTestModel: 'Select Test Model',
       testModel: 'Test model',
-      testPrompt: 'Prompt: "{prompt}"',
-      testPromptLabel: 'Test prompt',
-      testPromptPlaceholder: 'Enter the prompt used for the connection test',
+      testPrompt: 'Prompt: "hi"',
       imagePromptLabel: 'Image prompt',
       imagePromptPlaceholder: 'Example: Generate an orange cat astronaut sticker in pixel-art style on a solid background.',
       imagePromptDefault: 'Generate a cute orange cat astronaut sticker on a clean pastel background.',

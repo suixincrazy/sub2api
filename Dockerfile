@@ -139,9 +139,9 @@ RUN apk add --no-cache ca-certificates curl tar && \
 FROM ${ALPINE_IMAGE}
 
 # Labels
-LABEL maintainer="smmooooonn <github.com/smmooooonn>"
-LABEL description="Sub2API Xray - AI API Gateway Platform"
-LABEL org.opencontainers.image.source="https://github.com/smmooooonn/sub2api-xray"
+LABEL maintainer="suixincrazy <github.com/suixincrazy>"
+LABEL description="Sub2API - AI API Gateway Platform"
+LABEL org.opencontainers.image.source="https://github.com/suixincrazy/sub2api"
 
 # Install runtime dependencies
 RUN apk add --no-cache \
@@ -175,12 +175,12 @@ ENV XRAY_BIN=/usr/local/bin/xray \
     XRAY_WORK_DIR=/app/data/xray \
     XRAY_MAX_INSTANCES=64 \
     XRAY_MAX_INSTANCES_PER_USER=16 \
-    XRAY_RUNTIME_IDLE_TTL=15m \
+    XRAY_RUNTIME_IDLE_TTL=0 \
     SING_BOX_BIN=/usr/local/bin/sing-box \
     SING_BOX_WORK_DIR=/app/data/sing-box \
     SING_BOX_MAX_INSTANCES=64 \
     SING_BOX_MAX_INSTANCES_PER_USER=16 \
-    SING_BOX_RUNTIME_IDLE_TTL=15m
+    SING_BOX_RUNTIME_IDLE_TTL=0
 
 # Copy binary/resources with ownership to avoid extra full-layer chown copy
 COPY --from=backend-builder --chown=sub2api:sub2api /app/sub2api /app/sub2api

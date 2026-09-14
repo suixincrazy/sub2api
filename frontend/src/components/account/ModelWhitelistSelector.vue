@@ -150,8 +150,6 @@ import { useI18n } from 'vue-i18n'
 import { useAppStore } from '@/stores/app'
 import { accountsAPI } from '@/api/admin/accounts'
 import type { SyncUpstreamPreviewParams } from '@/api/admin/accounts'
-import { myResourcesApi } from '@/api/myResources'
-import type { SyncUpstreamModelsResult, SyncUpstreamPreviewParams as UserSyncUpstreamPreviewParams } from '@/api/myResources'
 import { useClipboard } from '@/composables/useClipboard'
 import ModelIcon from '@/components/common/ModelIcon.vue'
 import Icon from '@/components/icons/Icon.vue'
@@ -159,29 +157,18 @@ import { allModels, getModelsByPlatform } from '@/composables/useModelWhitelist'
 
 const { t } = useI18n()
 
-type ResourceScope = 'admin' | 'user'
-type SyncUpstreamModels = (accountId: number) => Promise<SyncUpstreamModelsResult>
-type SyncUpstreamModelsPreview = (credentials: SyncUpstreamPreviewParams) => Promise<SyncUpstreamModelsResult>
-
-const props = withDefaults(defineProps<{
+const props = defineProps<{
   modelValue: string[]
   platform?: string
   platforms?: string[]
   accountId?: number
-  scope?: ResourceScope
-  syncAccountModels?: SyncUpstreamModels
-  syncPreviewModels?: SyncUpstreamModelsPreview
   syncCredentials?: {
     platform: string
     type: string
     base_url?: string
     api_key: string
-    account_mode?: string
-    api_protocol?: string
   }
-}>(), {
-  scope: 'admin'
-})
+}>()
 
 const emit = defineEmits<{
   'update:modelValue': [value: string[]]
@@ -315,21 +302,9 @@ const syncUpstreamModels = async () => {
   try {
     let result
     if (props.accountId) {
-      if (props.syncAccountModels) {
-        result = await props.syncAccountModels(props.accountId)
-      } else if (props.scope === 'user') {
-        result = await myResourcesApi.accounts.syncUpstreamModels(props.accountId)
-      } else {
-        result = await accountsAPI.syncUpstreamModels(props.accountId)
-      }
+      result = await accountsAPI.syncUpstreamModels(props.accountId)
     } else if (props.syncCredentials) {
-      if (props.syncPreviewModels) {
-        result = await props.syncPreviewModels(props.syncCredentials as SyncUpstreamPreviewParams)
-      } else if (props.scope === 'user') {
-        result = await myResourcesApi.accounts.syncUpstreamModelsPreview(props.syncCredentials as UserSyncUpstreamPreviewParams)
-      } else {
-        result = await accountsAPI.syncUpstreamModelsPreview(props.syncCredentials as SyncUpstreamPreviewParams)
-      }
+      result = await accountsAPI.syncUpstreamModelsPreview(props.syncCredentials as SyncUpstreamPreviewParams)
     } else {
       return
     }

@@ -55,7 +55,7 @@ func (h *ProxyHandler) ExportData(c *gin.Context) {
 	dataProxies := make([]DataProxy, 0, len(proxies))
 	for i := range proxies {
 		p := proxies[i]
-		key := buildProxyKey(p.Protocol, p.Host, p.Port, p.Username, p.Password)
+		key := buildProxyDataKey(p.Protocol, p.Host, p.Port, p.Username, p.Password, p.Kind, p.Extra)
 
 		var expiresAt *int64
 		if p.ExpiresAt != nil {
@@ -67,6 +67,9 @@ func (h *ProxyHandler) ExportData(c *gin.Context) {
 			backupProxyName = proxyNameByID[*p.BackupProxyID]
 		}
 		dataProxies = append(dataProxies, DataProxy{
+			Kind:            p.Kind,
+			IsPublic:        p.IsPublic,
+			Extra:           p.Extra,
 			ProxyKey:        key,
 			Name:            p.Name,
 			Protocol:        p.Protocol,
@@ -122,7 +125,7 @@ func (h *ProxyHandler) ImportData(c *gin.Context) {
 	proxyNameToID := make(map[string]int64, len(existingProxies))
 	for i := range existingProxies {
 		p := existingProxies[i]
-		key := buildProxyKey(p.Protocol, p.Host, p.Port, p.Username, p.Password)
+		key := buildProxyDataKey(p.Protocol, p.Host, p.Port, p.Username, p.Password, p.Kind, p.Extra)
 		proxyByKey[key] = p
 		if p.Name != "" {
 			proxyNameToID[p.Name] = p.ID
@@ -134,7 +137,7 @@ func (h *ProxyHandler) ImportData(c *gin.Context) {
 		item := req.Data.Proxies[i]
 		key := item.ProxyKey
 		if key == "" {
-			key = buildProxyKey(item.Protocol, item.Host, item.Port, item.Username, item.Password)
+			key = buildProxyDataKey(item.Protocol, item.Host, item.Port, item.Username, item.Password, item.Kind, item.Extra)
 		}
 
 		if err := validateDataProxy(item); err != nil {
@@ -224,6 +227,9 @@ func (h *ProxyHandler) ImportData(c *gin.Context) {
 		}
 
 		created, err := h.adminService.CreateProxy(ctx, &service.CreateProxyInput{
+			Kind:           item.Kind,
+			IsPublic:       item.IsPublic,
+			Extra:          item.Extra,
 			Name:           defaultProxyName(item.Name),
 			Protocol:       item.Protocol,
 			Host:           item.Host,

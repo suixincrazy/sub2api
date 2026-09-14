@@ -8,6 +8,21 @@ import (
 
 const proxyRuntimeStopAttempts = 3
 
+func CloseProxyRuntimes() error {
+	errs := []error{
+		DefaultXrayRuntimeManager().Close(),
+		DefaultSingBoxRuntimeManager().Close(),
+	}
+	if resolver := defaultProxyProbeRuntime; resolver != nil {
+		for _, runtime := range []proxyProbeRuntime{resolver.xray, resolver.singBox} {
+			if closer, ok := runtime.(interface{ Close() error }); ok {
+				errs = append(errs, closer.Close())
+			}
+		}
+	}
+	return errors.Join(errs...)
+}
+
 func stopProxyRuntimesWithRetry(proxyID int64) error {
 	if proxyID <= 0 {
 		return nil

@@ -1,46 +1,12 @@
 import { describe, expect, it, vi } from 'vitest'
 
-const { adminMappingMock, userMappingMock } = vi.hoisted(() => ({
-  adminMappingMock: vi.fn(),
-  userMappingMock: vi.fn()
-}))
-
 vi.mock('@/api/admin/accounts', () => ({
-  getAntigravityDefaultModelMapping: adminMappingMock
+  getAntigravityDefaultModelMapping: vi.fn()
 }))
 
-vi.mock('@/api/myResources', () => ({
-  myResourcesApi: {
-    accounts: {
-      getAntigravityDefaultModelMapping: userMappingMock
-    }
-  }
-}))
-
-import {
-  buildModelMappingObject,
-  fetchAntigravityDefaultMappings,
-  getModelsByPlatform,
-  getPresetMappingsByPlatform,
-  splitModelMappingObject
-} from '../useModelWhitelist'
+import { buildModelMappingObject, getModelsByPlatform, getPresetMappingsByPlatform, splitModelMappingObject } from '../useModelWhitelist'
 
 describe('useModelWhitelist', () => {
-  it('loads Antigravity mappings from the selected scope without crossing into admin APIs', async () => {
-    adminMappingMock.mockResolvedValueOnce({ 'admin-model': 'admin-target' })
-    userMappingMock.mockResolvedValueOnce({ 'user-model': 'user-target' })
-
-    await expect(fetchAntigravityDefaultMappings({ scope: 'admin', forceRefresh: true })).resolves.toEqual([
-      { from: 'admin-model', to: 'admin-target' }
-    ])
-    await expect(fetchAntigravityDefaultMappings({ scope: 'user', forceRefresh: true })).resolves.toEqual([
-      { from: 'user-model', to: 'user-target' }
-    ])
-
-    expect(adminMappingMock).toHaveBeenCalledTimes(1)
-    expect(userMappingMock).toHaveBeenCalledTimes(1)
-  })
-
   it('openai 模型列表包含 GPT-5.4 官方快照', () => {
     const models = getModelsByPlatform('openai')
 

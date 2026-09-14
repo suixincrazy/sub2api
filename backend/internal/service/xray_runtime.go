@@ -862,7 +862,11 @@ func buildTrojanOutbound(u *url.URL) (map[string]any, error) {
 		server["flow"] = flow
 	}
 	settings := map[string]any{"servers": []map[string]any{server}}
-	stream, err := xrayStreamSettings(u.Query())
+	q := u.Query()
+	if firstQuery(q, "security") == "" {
+		q.Set("security", "tls")
+	}
+	stream, err := xrayStreamSettings(q)
 	if err != nil {
 		return nil, err
 	}
@@ -1251,10 +1255,7 @@ func padBase64(s string) string {
 
 func firstQuery(q url.Values, keys ...string) string {
 	for _, key := range keys {
-		if value := strings.TrimSpace(q.Get(key)); value != "" {
-			if decoded, err := url.QueryUnescape(value); err == nil {
-				return decoded
-			}
+		if value := q.Get(key); strings.TrimSpace(value) != "" {
 			return value
 		}
 	}

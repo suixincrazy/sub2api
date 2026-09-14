@@ -94,9 +94,6 @@ func (m *mockProxyRepoForOAuth) ExistsByHostPortAuth(ctx context.Context, host s
 func (m *mockProxyRepoForOAuth) CountAccountsByProxyID(ctx context.Context, proxyID int64) (int64, error) {
 	panic("CountAccountsByProxyID not implemented")
 }
-func (m *mockProxyRepoForOAuth) CountFallbackReferencesByProxyID(context.Context, int64) (int64, error) {
-	return 0, nil
-}
 func (m *mockProxyRepoForOAuth) ListAccountSummariesByProxyID(ctx context.Context, proxyID int64) ([]ProxyAccountSummary, error) {
 	panic("ListAccountSummariesByProxyID not implemented")
 }
@@ -620,4 +617,8 @@ func TestOAuthService_Stop_NoPanic(t *testing.T) {
 
 	// 多次调用也不应 panic
 	svc.Stop()
+}
+
+func (m *mockProxyRepoForOAuth) CountFallbackReferencesByProxyID(context.Context, int64) (int64, error) {
+	return 0, nil
 }

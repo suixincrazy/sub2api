@@ -16,13 +16,13 @@ func TestProxyHandlerConstructors(t *testing.T) {
 	legacy := NewProxyHandler(nil)
 	require.NotNil(t, legacy)
 	require.Nil(t, legacy.adminService)
-	require.Nil(t, legacy.userResourceService)
+	require.Nil(t, legacy.proxySourceService)
 
-	resourceService := &service.UserResourceService{}
+	resourceService := &service.ProxySourceService{}
 	provided := ProvideProxyHandler(nil, resourceService)
 	require.NotNil(t, provided)
 	require.Nil(t, provided.adminService)
-	require.Same(t, resourceService, provided.userResourceService)
+	require.Same(t, resourceService, provided.proxySourceService)
 }
 
 func TestBindAdminProxyJSONMapAcceptsOneObject(t *testing.T) {
@@ -88,7 +88,7 @@ func TestImportProxyNodesRejectsInvalidContentFields(t *testing.T) {
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
 			context, recorder := newAdminProxyJSONTestContext(test.body)
-			handler := ProvideProxyHandler(nil, &service.UserResourceService{})
+			handler := ProvideProxyHandler(nil, &service.ProxySourceService{})
 
 			handler.ImportProxyNodes(context)
 
@@ -113,7 +113,7 @@ func TestImportProxyNodesRejectsNonStringNamePrefix(t *testing.T) {
 		t.Run(test.name, func(t *testing.T) {
 			body := `{"content":"ss://example","name_prefix":` + test.value + `}`
 			context, recorder := newAdminProxyJSONTestContext(body)
-			handler := ProvideProxyHandler(nil, &service.UserResourceService{})
+			handler := ProvideProxyHandler(nil, &service.ProxySourceService{})
 
 			handler.ImportProxyNodes(context)
 
@@ -138,7 +138,7 @@ func TestImportProxyNodesRejectsNonBooleanIsPublic(t *testing.T) {
 		t.Run(test.name, func(t *testing.T) {
 			body := `{"content":"ss://example","is_public":` + test.value + `}`
 			context, recorder := newAdminProxyJSONTestContext(body)
-			handler := ProvideProxyHandler(nil, &service.UserResourceService{})
+			handler := ProvideProxyHandler(nil, &service.ProxySourceService{})
 
 			handler.ImportProxyNodes(context)
 

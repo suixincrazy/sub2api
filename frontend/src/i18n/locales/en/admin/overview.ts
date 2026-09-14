@@ -686,11 +686,6 @@ export default {
       // Settings Dropdowns
       filterSettings: 'Filter Settings',
       columnSettings: 'Column Settings',
-      allResourceOwners: 'All Resource Owners',
-      systemResources: 'System Resources',
-      userResources: 'User Resources',
-      systemResource: 'System',
-      userResourceOwner: 'User #{id}',
       filterValue: 'Enter value',
       // User Attributes
       attributes: {
@@ -793,11 +788,6 @@ export default {
     groups: {
       title: 'Group Management',
       description: 'Manage API key groups and rate multipliers',
-      allResourceOwners: 'All Resource Owners',
-      systemResources: 'System Resources',
-      userResources: 'User Resources',
-      systemResource: 'System',
-      userResourceOwner: 'User #{id}',
       searchGroups: 'Search groups...',
       createGroup: 'Create Group',
       editGroup: 'Edit Group',
@@ -821,7 +811,6 @@ export default {
       columns: {
         name: 'Name',
         id: 'ID',
-        owner: 'Resource Owner',
         platform: 'Platform',
         rateMultiplier: 'Rate Multiplier',
         rpmOverride: 'RPM Override',

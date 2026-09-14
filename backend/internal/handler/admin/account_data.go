@@ -2,6 +2,9 @@ package admin
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"strconv"
@@ -36,18 +39,21 @@ type DataPayload struct {
 }
 
 type DataProxy struct {
-	ProxyKey        string `json:"proxy_key"`
-	Name            string `json:"name"`
-	Protocol        string `json:"protocol"`
-	Host            string `json:"host"`
-	Port            int    `json:"port"`
-	Username        string `json:"username,omitempty"`
-	Password        string `json:"password,omitempty"`
-	Status          string `json:"status"`
-	ExpiresAt       *int64 `json:"expires_at,omitempty"`        // unix 秒，与 DataAccount.ExpiresAt 风格一致
-	FallbackMode    string `json:"fallback_mode,omitempty"`     // none/direct/proxy
-	BackupProxyName string `json:"backup_proxy_name,omitempty"` // 备用代理 name（跨实例按 name 反查）
-	ExpiryWarnDays  int    `json:"expiry_warn_days,omitempty"`
+	Kind            string         `json:"kind,omitempty"`
+	IsPublic        bool           `json:"is_public,omitempty"`
+	Extra           map[string]any `json:"extra,omitempty"`
+	ProxyKey        string         `json:"proxy_key"`
+	Name            string         `json:"name"`
+	Protocol        string         `json:"protocol"`
+	Host            string         `json:"host"`
+	Port            int            `json:"port"`
+	Username        string         `json:"username,omitempty"`
+	Password        string         `json:"password,omitempty"`
+	Status          string         `json:"status"`
+	ExpiresAt       *int64         `json:"expires_at,omitempty"`        // unix 秒，与 DataAccount.ExpiresAt 风格一致
+	FallbackMode    string         `json:"fallback_mode,omitempty"`     // none/direct/proxy
+	BackupProxyName string         `json:"backup_proxy_name,omitempty"` // 备用代理 name（跨实例按 name 反查）
+	ExpiryWarnDays  int            `json:"expiry_warn_days,omitempty"`
 }
 
 // DataAccount 是管理员显式备份导出使用的账号结构，故意不走 dto.Account 的脱敏路径，
@@ -95,6 +101,22 @@ type DataImportError struct {
 
 func buildProxyKey(protocol, host string, port int, username, password string) string {
 	return fmt.Sprintf("%s|%s|%d|%s|%s", strings.TrimSpace(protocol), strings.TrimSpace(host), port, strings.TrimSpace(username), strings.TrimSpace(password))
+}
+
+func buildProxyDataKey(protocol, host string, port int, username, password, kind string, extra map[string]any) string {
+	key := buildProxyKey(protocol, host, port, username, password)
+	if !strings.EqualFold(kind, "xray") {
+		return key
+	}
+	config := make(map[string]any)
+	for _, name := range []string{"raw", "uri", "node", "node_uri", "share_link", "outbound", "xray_outbound", "sing_box_outbound", "sing_box_endpoint"} {
+		if value, ok := extra[name]; ok {
+			config[name] = value
+		}
+	}
+	encoded, _ := json.Marshal(config)
+	digest := sha256.Sum256(append([]byte(key+"\x00"), encoded...))
+	return "xray:" + hex.EncodeToString(digest[:])
 }
 
 func (h *AccountHandler) ExportData(c *gin.Context) {
@@ -157,7 +179,7 @@ func (h *AccountHandler) ExportData(c *gin.Context) {
 	dataProxies := make([]DataProxy, 0, len(proxies))
 	for i := range proxies {
 		p := proxies[i]
-		key := buildProxyKey(p.Protocol, p.Host, p.Port, p.Username, p.Password)
+		key := buildProxyDataKey(p.Protocol, p.Host, p.Port, p.Username, p.Password, p.Kind, p.Extra)
 		proxyKeyByID[p.ID] = key
 
 		var expiresAt *int64
@@ -170,6 +192,9 @@ func (h *AccountHandler) ExportData(c *gin.Context) {
 			backupProxyName = proxyNameByID[*p.BackupProxyID]
 		}
 		dataProxies = append(dataProxies, DataProxy{
+			Kind:            p.Kind,
+			IsPublic:        p.IsPublic,
+			Extra:           p.Extra,
 			ProxyKey:        key,
 			Name:            p.Name,
 			Protocol:        p.Protocol,
@@ -261,7 +286,7 @@ func (h *AccountHandler) importData(ctx context.Context, req DataImportRequest) 
 	proxyNameToID := make(map[string]int64, len(existingProxies))
 	for i := range existingProxies {
 		p := existingProxies[i]
-		key := buildProxyKey(p.Protocol, p.Host, p.Port, p.Username, p.Password)
+		key := buildProxyDataKey(p.Protocol, p.Host, p.Port, p.Username, p.Password, p.Kind, p.Extra)
 		proxyKeyToID[key] = p.ID
 		if p.Name != "" {
 			proxyNameToID[p.Name] = p.ID
@@ -272,7 +297,7 @@ func (h *AccountHandler) importData(ctx context.Context, req DataImportRequest) 
 		item := dataPayload.Proxies[i]
 		key := item.ProxyKey
 		if key == "" {
-			key = buildProxyKey(item.Protocol, item.Host, item.Port, item.Username, item.Password)
+			key = buildProxyDataKey(item.Protocol, item.Host, item.Port, item.Username, item.Password, item.Kind, item.Extra)
 		}
 		if err := validateDataProxy(item); err != nil {
 			result.ProxyFailed++
@@ -352,6 +377,9 @@ func (h *AccountHandler) importData(ctx context.Context, req DataImportRequest) 
 		}
 
 		created, createErr := h.adminService.CreateProxy(ctx, &service.CreateProxyInput{
+			Kind:           item.Kind,
+			IsPublic:       item.IsPublic,
+			Extra:          item.Extra,
 			Name:           defaultProxyName(item.Name),
 			Protocol:       item.Protocol,
 			Host:           item.Host,
@@ -665,10 +693,24 @@ func validateDataProxy(item DataProxy) error {
 	if item.Port <= 0 || item.Port > 65535 {
 		return errors.New("proxy port is invalid")
 	}
-	switch item.Protocol {
-	case "http", "https", "socks5", "socks5h":
-	default:
-		return fmt.Errorf("proxy protocol is invalid: %s", item.Protocol)
+	if item.Kind == "xray" {
+		switch item.Protocol {
+		case "vmess", "vless", "trojan", "ss", "shadowsocks", "hysteria", "hysteria2", "hy2", "tuic", "anytls", "naive", "wireguard", "wg":
+		default:
+			return fmt.Errorf("proxy protocol is invalid: %s", item.Protocol)
+		}
+		if len(item.Extra) == 0 {
+			return errors.New("proxy node configuration is required")
+		}
+	} else {
+		if item.Kind != "" && item.Kind != "standard" {
+			return errors.New("proxy kind is invalid")
+		}
+		switch item.Protocol {
+		case "http", "https", "socks5", "socks5h":
+		default:
+			return fmt.Errorf("proxy protocol is invalid: %s", item.Protocol)
+		}
 	}
 	if item.Status != "" {
 		normalizedStatus := normalizeProxyStatus(item.Status)

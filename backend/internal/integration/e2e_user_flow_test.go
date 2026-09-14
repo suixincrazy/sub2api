@@ -33,7 +33,7 @@ func TestUserRegistrationAndLogin(t *testing.T) {
 		}
 		body, _ := json.Marshal(payload)
 
-		resp, err := doRequest(t, "POST", "/api/v1/auth/register", body, "")
+		resp, err := doRequest(t, "POST", "/api/auth/register", body, "")
 		if err != nil {
 			t.Skipf("注册接口不可用，跳过用户流程测试: %v", err)
 			return
@@ -64,10 +64,9 @@ func TestUserRegistrationAndLogin(t *testing.T) {
 		}
 		body, _ := json.Marshal(payload)
 
-		resp, err := doRequest(t, "POST", "/api/v1/auth/login", body, "")
+		resp, err := doRequest(t, "POST", "/api/auth/login", body, "")
 		if err != nil {
-			t.Skipf("登录接口不可用，跳过用户流程测试: %v", err)
-			return
+			t.Fatalf("登录请求失败: %v", err)
 		}
 		defer resp.Body.Close()
 
@@ -112,7 +111,7 @@ func TestUserRegistrationAndLogin(t *testing.T) {
 
 	// 步骤 3: 使用 JWT 获取当前用户信息
 	t.Run("获取当前用户信息", func(t *testing.T) {
-		resp, err := doRequest(t, "GET", "/api/v1/auth/me", nil, accessToken)
+		resp, err := doRequest(t, "GET", "/api/user/me", nil, accessToken)
 		if err != nil {
 			t.Fatalf("请求失败: %v", err)
 		}
@@ -145,7 +144,7 @@ func TestAPIKeyLifecycle(t *testing.T) {
 		}
 		body, _ := json.Marshal(payload)
 
-		resp, err := doRequest(t, "POST", "/api/v1/keys", body, accessToken)
+		resp, err := doRequest(t, "POST", "/api/keys", body, accessToken)
 		if err != nil {
 			t.Fatalf("创建 API Key 请求失败: %v", err)
 		}
@@ -216,7 +215,7 @@ func TestAPIKeyLifecycle(t *testing.T) {
 
 	// 步骤 3: 查询用量记录
 	t.Run("查询用量记录", func(t *testing.T) {
-		resp, err := doRequest(t, "GET", "/api/v1/usage/dashboard/stats", nil, accessToken)
+		resp, err := doRequest(t, "GET", "/api/usage/dashboard", nil, accessToken)
 		if err != nil {
 			t.Fatalf("用量查询请求失败: %v", err)
 		}
@@ -280,7 +279,7 @@ func loginTestUser(t *testing.T) string {
 	}
 	body, _ := json.Marshal(payload)
 
-	resp, err := doRequest(t, "POST", "/api/v1/auth/login", body, "")
+	resp, err := doRequest(t, "POST", "/api/auth/login", body, "")
 	if err != nil {
 		return ""
 	}

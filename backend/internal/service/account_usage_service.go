@@ -274,12 +274,11 @@ type ClaudeUsageResponse struct {
 
 // ClaudeUsageFetchOptions 包含获取 Claude 用量数据所需的所有选项
 type ClaudeUsageFetchOptions struct {
-	AccessToken   string                  // OAuth access token
-	ProxyURL      string                  // 代理 URL（可选）
-	AccountID     int64                   // 账号 ID（用于连接池隔离）
-	TLSProfile    *tlsfingerprint.Profile // TLS 指纹 Profile（nil 表示不启用）
-	Fingerprint   *Fingerprint            // 缓存的指纹信息（User-Agent 等）
-	NetworkPolicy HTTPUpstreamNetworkPolicy
+	AccessToken string                  // OAuth access token
+	ProxyURL    string                  // 代理 URL（可选）
+	AccountID   int64                   // 账号 ID（用于连接池隔离）
+	TLSProfile  *tlsfingerprint.Profile // TLS 指纹 Profile（nil 表示不启用）
+	Fingerprint *Fingerprint            // 缓存的指纹信息（User-Agent 等）
 }
 
 // ClaudeUsageFetcher fetches usage data from Anthropic OAuth API
@@ -841,7 +840,7 @@ func (s *AccountUsageService) probeOpenAICodexSnapshot(ctx context.Context, acco
 		return nil, fmt.Errorf("no access token available")
 	}
 	modelID := openaipkg.CodexUsageProbeModel
-	payload := createOpenAITestPayload(modelID, true, "")
+	payload := createOpenAITestPayload(modelID, true)
 	payloadBytes, err := json.Marshal(payload)
 	if err != nil {
 		return nil, fmt.Errorf("marshal openai probe payload: %w", err)
@@ -1576,11 +1575,10 @@ func (s *AccountUsageService) fetchOAuthUsageRaw(ctx context.Context, account *A
 
 	// 构建完整的选项
 	opts := &ClaudeUsageFetchOptions{
-		AccessToken:   accessToken,
-		ProxyURL:      proxyURL,
-		AccountID:     account.ID,
-		TLSProfile:    s.tlsFPProfileService.ResolveTLSProfile(account),
-		NetworkPolicy: HTTPUpstreamNetworkPolicyForAccount(account, proxyURL),
+		AccessToken: accessToken,
+		ProxyURL:    proxyURL,
+		AccountID:   account.ID,
+		TLSProfile:  s.tlsFPProfileService.ResolveTLSProfile(account),
 	}
 
 	// 尝试获取缓存的 Fingerprint（包含 User-Agent 等信息）

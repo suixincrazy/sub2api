@@ -40,10 +40,6 @@ type proxyOwnerScopeRepository interface {
 	ListWithAccountCountAndOwnerScope(ctx context.Context, params pagination.PaginationParams, protocol, status, search, ownerScope string, sourceID int64) ([]ProxyWithAccountCount, *pagination.PaginationResult, error)
 }
 
-type proxyUserOwnedAccountCounter interface {
-	CountUserOwnedAccountsByProxyID(ctx context.Context, proxyID int64) (int64, error)
-}
-
 func (s *adminServiceImpl) ListProxiesWithAccountCountByOwnerScope(ctx context.Context, page, pageSize int, protocol, status, search, ownerScope string, sourceID int64, sortBy, sortOrder string) ([]ProxyWithAccountCount, int64, error) {
 	repo, ok := s.proxyRepo.(proxyOwnerScopeRepository)
 	if !ok {
@@ -140,6 +136,7 @@ func (s *adminServiceImpl) UpdateProxy(ctx context.Context, id int64, input *Upd
 	if err != nil {
 		return nil, err
 	}
+	previousConnection := ProxyConnectionKey(proxy)
 	kind := proxy.Kind
 	if strings.TrimSpace(input.Kind) != "" {
 		kind = normalizeAdminProxyKind(input.Kind)
@@ -162,19 +159,6 @@ func (s *adminServiceImpl) UpdateProxy(ctx context.Context, id int64, input *Upd
 	}
 	if input.IsPublic != nil && *input.IsPublic && proxy.OwnerUserID != nil {
 		return nil, infraerrors.BadRequest("PROXY_PUBLIC_OWNER_INVALID", "only system proxies can be public")
-	}
-	if input.IsPublic != nil && proxy.OwnerUserID == nil && proxy.IsPublic && !*input.IsPublic {
-		counter, ok := s.proxyRepo.(proxyUserOwnedAccountCounter)
-		if !ok {
-			return nil, infraerrors.ServiceUnavailable("PROXY_PUBLIC_USAGE_CHECK_UNAVAILABLE", "cannot verify public proxy usage")
-		}
-		count, err := counter.CountUserOwnedAccountsByProxyID(ctx, id)
-		if err != nil {
-			return nil, err
-		}
-		if count > 0 {
-			return nil, infraerrors.Conflict("PROXY_PUBLIC_IN_USE", "public proxy is still used by user-owned accounts")
-		}
 	}
 	if err := s.validateProxyFallbackOwner(ctx, proxy, input.BackupProxyID); err != nil {
 		return nil, err
@@ -229,11 +213,13 @@ func (s *adminServiceImpl) UpdateProxy(ctx context.Context, id int64, input *Upd
 		proxy.ExpiryWarnDays = *input.ExpiryWarnDays
 	}
 
-	if err := stopProxyRuntimesWithRetry(id); err != nil {
-		return nil, fmt.Errorf("stop previous proxy runtime: %w", err)
-	}
 	if err := s.proxyRepo.Update(ctx, proxy); err != nil {
 		return nil, err
+	}
+	if previousConnection != ProxyConnectionKey(proxy) {
+		if err := stopProxyRuntimesWithRetry(id); err != nil {
+			return nil, fmt.Errorf("stop previous proxy runtime: %w", err)
+		}
 	}
 	return proxy, nil
 }

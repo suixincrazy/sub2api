@@ -281,7 +281,6 @@ export interface PublicSettings {
   subscription_enabled: boolean
   /** Mirrors payment config BALANCE_PAYMENT_DISABLED; true = balance top-up closed (subscription-only site). */
   payment_balance_disabled: boolean
-  enable_user_resources?: boolean
   model_plaza_enabled: boolean
   model_plaza_require_auth: boolean
   plugin_management_enabled: boolean
@@ -563,7 +562,6 @@ export interface ReasoningEffortMapping {
 
 export interface Group {
   id: number
-  owner_user_id?: number | null
   name: string
   description: string | null
   platform: GroupPlatform
@@ -955,7 +953,7 @@ export interface Proxy {
   is_owned?: boolean
   details_hidden?: boolean
   name: string
-  kind: ProxyKind
+  kind?: ProxyKind
   protocol: ProxyProtocol
   host: string
   port: number
@@ -1017,34 +1015,6 @@ export interface ProxyQualityCheckResult {
   challenge_count: number
   checked_at: number
   items: ProxyQualityCheckItem[]
-}
-
-/**
- * One line of a "refresh every subscription source" run. Counts only — node
- * payloads are deliberately absent so a bulk response cannot leak credentials.
- * `skipped` means auto-sync is paused for that source; `deferred` means the
- * request ran out of its time budget and the scheduler will pick the source up.
- */
-export interface ProxySourceSyncAllItem {
-  source_id: number
-  name: string
-  status: 'success' | 'partial' | 'error' | 'skipped' | 'deferred'
-  imported_count: number
-  created_count: number
-  updated_count: number
-  error?: string
-}
-
-export interface ProxySourceSyncAllResult {
-  total: number
-  success_count: number
-  partial_count: number
-  failed_count: number
-  skipped_count: number
-  deferred_count: number
-  created_count: number
-  updated_count: number
-  items: ProxySourceSyncAllItem[]
 }
 
 // Gemini credentials structure for OAuth and API Key authentication
@@ -1221,7 +1191,6 @@ export interface AccountCredentialsReveal {
 
 export interface Account {
   id: number
-  owner_user_id?: number | null
   name: string
   notes?: string | null
   platform: AccountPlatform
@@ -1272,7 +1241,7 @@ export interface Account {
   scheduler_scores?: AccountSchedulerGroupScore[] | null
   priority: number
   rate_multiplier?: number // Account billing multiplier (>=0, 0 means free)
-  status: 'active' | 'inactive' | 'disabled' | 'error'
+  status: 'active' | 'inactive' | 'error'
   error_message: string | null
   last_used_at: string | null
   expires_at: number | null
@@ -1885,7 +1854,6 @@ export interface UsageCleanupTask {
 
 export interface RedeemCode {
   id: number
-  owner_user_id?: number | null
   code: string
   type: RedeemCodeType
   value: number
@@ -1898,8 +1866,6 @@ export interface RedeemCode {
   notes?: string
   group_id?: number | null // 订阅类型专用
   validity_days?: number // 订阅类型专用
-  max_uses: number
-  used_count: number
   user?: User
   group?: Group // 关联的分组
 }
@@ -2131,8 +2097,6 @@ export interface UserSubscription {
   daily_usage_usd: number
   weekly_usage_usd: number
   monthly_usage_usd: number
-  managed_by_user_id?: number | null
-  source_type?: string
   daily_window_start: string | null
   weekly_window_start: string | null
   monthly_window_start: string | null
@@ -2142,23 +2106,6 @@ export interface UserSubscription {
   expires_at: string | null
   user?: User
   group?: Group
-  pool_health?: SubscriptionPoolHealth
-}
-
-export interface SubscriptionPoolHealth {
-  group_id: number
-  available: number
-  rate_limited: number
-  error: number
-  disabled: number
-  total: number
-  reasons?: Array<{
-    account_id: number
-    name: string
-    status: string
-    reason: string
-  }>
-  by_status?: Record<string, number>
 }
 
 export interface SubscriptionProgress {
@@ -2536,3 +2483,27 @@ export type {
   PlatformQuotaWindow,
   PlatformQuotasResponse,
 } from '@/api/admin/users'
+
+
+export interface ProxySourceSyncAllItem {
+  source_id: number
+  name: string
+  status: 'success' | 'partial' | 'error' | 'skipped' | 'deferred'
+  imported_count: number
+  created_count: number
+  updated_count: number
+  error?: string
+}
+
+
+export interface ProxySourceSyncAllResult {
+  total: number
+  success_count: number
+  partial_count: number
+  failed_count: number
+  skipped_count: number
+  deferred_count: number
+  created_count: number
+  updated_count: number
+  items: ProxySourceSyncAllItem[]
+}

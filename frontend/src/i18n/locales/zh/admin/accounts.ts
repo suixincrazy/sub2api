@@ -98,7 +98,6 @@ export default {
       columns: {
         name: '名称',
         id: '账号ID',
-        owner: '资源归属',
         platformType: '平台/类型',
         platform: '平台',
         type: '类型',
@@ -120,11 +119,6 @@ export default {
         expiresAt: '过期时间',
         actions: '操作'
       },
-      allResourceOwners: '全部资源归属',
-      systemResources: '系统资源',
-      userResources: '用户资源',
-      systemResource: '系统',
-      userResourceOwner: '用户 #{id}',
       schedulerScore: {
         baseShort: '普通',
         stickyShort: '粘性',
@@ -320,8 +314,6 @@ export default {
         opencode_go: 'OpenCode',
       },
       cnProviders: {
-        baseUrlHint: '留空使用当前供应商所选账号类型和 API 协议的官方地址。',
-        apiKeyHint: '当前供应商控制台签发的 API Key。',
         accountMode: {
           title: '账号类型',
           payg: '按量付费',
@@ -410,7 +402,6 @@ export default {
       status: {
         active: '正常',
         inactive: '停用',
-        disabled: '禁用',
         expired: '已过期',
         error: '错误',
         cooldown: '冷却中',
@@ -1553,10 +1544,9 @@ export default {
       readyToTest: '准备测试。点击"开始测试"按钮开始...',
       connectingToApi: '连接 API 中...',
       testCompleted: '测试完成！',
-      testCancelled: '测试已取消或超时',
       connectedToApi: '已连接到 API',
       usingModel: '使用模型：{model}',
-      sendingTestMessage: '发送测试消息："{prompt}"',
+      sendingTestMessage: '发送测试消息："hi"',
       sendingImageRequest: '发送生图测试请求...',
       response: '响应：',
       startTest: '开始测试',
@@ -1567,9 +1557,7 @@ export default {
       testAccountTypeLabel: '账号类型：{type}',
       selectTestModel: '选择测试模型',
       testModel: '测试模型',
-      testPrompt: '提示词："{prompt}"',
-      testPromptLabel: '测试提示词',
-      testPromptPlaceholder: '输入用于连接测试的提示词',
+      testPrompt: '提示词："hi"',
       imagePromptLabel: '生图提示词',
       imagePromptPlaceholder: '例如：生成一只戴宇航员头盔的橘猫，像素插画风格，纯色背景。',
       imagePromptDefault: 'Generate a cute orange cat astronaut sticker on a clean pastel background.',

@@ -38,15 +38,6 @@
               @change="loadProxies"
             />
           </div>
-          <div class="w-full sm:w-40">
-            <Select
-              v-model="filters.owner_scope"
-              :options="ownerScopeOptions"
-              :placeholder="t('admin.proxies.allResourceOwners')"
-              data-test="admin-proxy-owner-scope-filter"
-              @change="loadProxies"
-            />
-          </div>
           <div v-if="proxySourceFilterOptions.length > 1" class="w-full sm:w-44">
             <Select
               v-model="filters.source_id"
@@ -156,21 +147,6 @@
 
           <template #cell-name="{ value }">
             <span class="font-medium text-gray-900 dark:text-white">{{ value }}</span>
-          </template>
-
-          <template #cell-owner_user_id="{ row }">
-            <span v-if="row.owner_user_id" class="font-mono text-xs text-primary-600 dark:text-primary-400">
-              {{ t('admin.proxies.userResourceOwner', { id: row.owner_user_id }) }}
-            </span>
-            <span v-else class="text-xs text-gray-500 dark:text-gray-400">
-              {{ t('admin.proxies.systemResource') }}
-            </span>
-          </template>
-
-          <template #cell-visibility="{ row }">
-            <span :class="['badge', row.is_public ? 'badge-success' : 'badge-gray']">
-              {{ row.is_public ? t('admin.proxies.publicResource') : t('admin.proxies.privateResource') }}
-            </span>
           </template>
 
           <template #cell-kind="{ value }">
@@ -741,16 +717,6 @@
             </div>
           </div>
         </template>
-
-        <label class="flex cursor-pointer items-center gap-2">
-          <input
-            v-model="createForm.is_public"
-            type="checkbox"
-            class="h-4 w-4 rounded border-gray-300 text-primary-600 focus:ring-primary-500"
-            data-test="admin-proxy-is-public"
-          />
-          <span class="text-sm text-gray-700 dark:text-gray-200">{{ t('admin.proxies.publicToUsers') }}</span>
-        </label>
       </form>
 
       <template #footer>
@@ -898,11 +864,6 @@
                       >
                         {{ maskSubscriptionUrl(source.subscription_url) }}
                       </div>
-                    </td>
-                    <td class="px-4 py-3 text-center align-top">
-                      <span :class="['badge', source.is_public ? 'badge-success' : 'badge-gray']">
-                        {{ source.is_public ? t('admin.proxies.publicResource') : t('admin.proxies.privateResource') }}
-                      </span>
                     </td>
                     <td class="px-4 py-3 text-center align-top">
                       <button
@@ -1060,14 +1021,6 @@
                 />
                 <span class="text-sm text-gray-700 dark:text-gray-200">{{ t('admin.proxies.sourceAutoSyncEnabled') }}</span>
               </label>
-              <label class="flex cursor-pointer items-center gap-2">
-                <input
-                  v-model="proxySourceForm.is_public"
-                  type="checkbox"
-                  class="h-4 w-4 rounded border-gray-300 text-primary-600 focus:ring-primary-500"
-                />
-                <span class="text-sm text-gray-700 dark:text-gray-200">{{ t('admin.proxies.publicToUsers') }}</span>
-              </label>
               <div class="flex flex-wrap justify-end gap-2">
                 <button
                   v-if="editingProxySourceId"
@@ -1188,15 +1141,6 @@
           <label class="input-label">{{ t('admin.proxies.status') }}</label>
           <Select v-model="editForm.status" :options="editStatusOptions" />
         </div>
-        <label class="flex items-center gap-2">
-          <input
-            v-model="editForm.is_public"
-            type="checkbox"
-            :disabled="editingProxy.owner_user_id != null"
-            class="h-4 w-4 rounded border-gray-300 text-primary-600 focus:ring-primary-500 disabled:cursor-not-allowed disabled:opacity-50"
-          />
-          <span class="text-sm text-gray-700 dark:text-gray-200">{{ t('admin.proxies.publicToUsers') }}</span>
-        </label>
         <div>
           <label class="input-label">{{ t('admin.proxies.expiresAt') }}</label>
           <div class="mb-2 flex flex-wrap gap-2">
@@ -1470,8 +1414,6 @@ const { copyToClipboard } = useClipboard()
 const columns = computed<Column[]>(() => [
   { key: 'select', label: '', sortable: false },
   { key: 'name', label: t('admin.proxies.columns.name'), sortable: true },
-  { key: 'owner_user_id', label: t('admin.proxies.columns.owner'), sortable: false },
-  { key: 'visibility', label: t('admin.proxies.columns.visibility'), sortable: false },
   { key: 'kind', label: t('admin.proxies.columns.kind'), sortable: false },
   { key: 'protocol', label: t('admin.proxies.columns.protocol'), sortable: true },
   { key: 'address', label: t('admin.proxies.columns.address'), sortable: false },
@@ -1511,11 +1453,6 @@ const statusOptions = computed(() => [
   { value: 'expired', label: t('admin.proxies.expired') }
 ])
 
-const ownerScopeOptions = computed(() => [
-  { value: '', label: t('admin.proxies.allResourceOwners') },
-  { value: 'system', label: t('admin.proxies.systemResources') },
-  { value: 'user', label: t('admin.proxies.userResources') }
-])
 
 // Source names for the list filter. Loaded independently of the manager modal so
 // the filter keeps working before the modal has ever been opened.
@@ -1565,7 +1502,6 @@ const searchQuery = ref('')
 const filters = reactive({
   protocol: '',
   status: '',
-  owner_scope: '',
   source_id: ''
 })
 const pagination = reactive({
@@ -1672,10 +1608,10 @@ type CreateMode = 'standard' | 'batch'
 type InputMode = 'direct' | 'xray' | 'source' | 'config'
 
 const inputModeOptions = computed<Array<{ value: InputMode; label: string }>>(() => [
-  { value: 'direct', label: t('myResources.proxyEditor.standardProxy') },
-  { value: 'xray', label: t('myResources.proxyEditor.xrayShare') },
-  { value: 'source', label: t('myResources.proxyEditor.providerSubscription') },
-  { value: 'config', label: t('myResources.proxyEditor.nodeConfig') },
+  { value: 'direct', label: t('admin.proxies.standardProxy') },
+  { value: 'xray', label: t('admin.proxies.nodeShareLink') },
+  { value: 'source', label: t('admin.proxies.subscriptionSource') },
+  { value: 'config', label: t('admin.proxies.clientNodeConfig') },
 ])
 
 // Creation/import state
@@ -1824,7 +1760,6 @@ const toggleSelectAllVisible = (event: Event) => {
 const buildProxyQueryFilters = () => ({
   protocol: filters.protocol || undefined,
   status: (filters.status || undefined) as 'active' | 'inactive' | 'expired' | undefined,
-  owner_scope: (filters.owner_scope || undefined) as 'system' | 'user' | undefined,
   source_id: filters.source_id ? Number(filters.source_id) : undefined,
   search: searchQuery.value || undefined,
   sort_by: sortState.sort_by,

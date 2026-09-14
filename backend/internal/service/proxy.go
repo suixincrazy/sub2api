@@ -57,6 +57,9 @@ func (p *Proxy) URL() string {
 		}
 		return "xray://unavailable/" + strconv.FormatInt(p.ID, 10)
 	}
+	if p != nil {
+		return "proxy://unavailable/" + strconv.FormatInt(p.ID, 10)
+	}
 	return ""
 }
 
@@ -66,6 +69,12 @@ func (p *Proxy) URL() string {
 func (p *Proxy) ResolveURL(ctx context.Context) (string, error) {
 	if p == nil {
 		return "", errors.New("proxy is nil")
+	}
+	if p.Status != "" && p.Status != StatusActive {
+		return "", errors.New("proxy is not active")
+	}
+	if p.IsExpired(time.Now()) {
+		return "", errors.New("proxy is expired")
 	}
 	if !strings.EqualFold(p.Kind, "xray") {
 		return p.StandardURL(), nil

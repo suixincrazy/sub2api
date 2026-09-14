@@ -237,7 +237,7 @@ const proxyEndpointLabel = (proxy: Proxy): string => {
   const port = normalizedText(proxy.port)
 
   if (proxy.details_hidden || (proxy.is_public === true && (!host || !port))) {
-    return t('myResources.states.publicDetailsHidden')
+    return t('admin.proxies.detailsHidden')
   }
   if (!protocol || !host || !port || port === '0') {
     return t('common.notAvailable')

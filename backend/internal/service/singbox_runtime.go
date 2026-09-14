@@ -100,6 +100,9 @@ func requiresSingBoxRuntime(p *Proxy) bool {
 	if p == nil || !strings.EqualFold(p.Kind, "xray") {
 		return false
 	}
+	if isNativeSingBoxNode(xrayRawNode(p)) {
+		return true
+	}
 	protocol := canonicalSingBoxProtocol(p.Protocol)
 	if raw := xrayRawNode(p); raw != "" {
 		if u, err := url.Parse(raw); err == nil {
@@ -394,6 +397,9 @@ func buildSingBoxRuntimeConfig(port int, spec singBoxRuntimeSpec, blockPrivateDe
 }
 
 func buildSingBoxRuntimeSpec(raw string, p *Proxy) (singBoxRuntimeSpec, error) {
+	if isNativeSingBoxNode(raw) {
+		return nativeSingBoxRuntimeSpec(raw)
+	}
 	raw = strings.TrimSpace(raw)
 	if raw == "" {
 		return singBoxRuntimeSpec{}, errors.New("missing sing-box node uri")
@@ -517,6 +523,17 @@ func buildSingBoxRuntimeSpec(raw string, p *Proxy) (singBoxRuntimeSpec, error) {
 		privateKey := decodedURLUserInfo(u)
 		publicKey := firstQuery(q, "publickey", "public_key", "peer_public_key")
 		addresses := splitCSV(firstQuery(q, "address", "local_address", "ip"))
+		for i, address := range addresses {
+			if ip := net.ParseIP(address); ip != nil {
+				bits := 128
+				if ip.To4() != nil {
+					bits = 32
+				}
+				addresses[i] = ip.String() + "/" + strconv.Itoa(bits)
+			} else if _, _, err := net.ParseCIDR(address); err != nil {
+				return singBoxRuntimeSpec{}, errors.New("wireguard interface address must be an IP or CIDR")
+			}
+		}
 		if privateKey == "" || publicKey == "" || len(addresses) == 0 {
 			return singBoxRuntimeSpec{}, errors.New("wireguard node missing private key, public key or interface address")
 		}
@@ -625,7 +642,12 @@ func normalizeSingBoxShadowsocksPlugin(name, options string) (string, string, er
 }
 
 func applySingBoxPortHopping(out map[string]any, q url.Values) {
-	copyStringQuery(out, q, "hop_interval", "hop_interval", "hop-interval")
+	if interval := firstQuery(q, "hop_interval", "hop-interval"); interval != "" {
+		if seconds, err := strconv.ParseFloat(interval, 64); err == nil && seconds > 0 {
+			interval = strconv.FormatFloat(seconds, 'f', -1, 64) + "s"
+		}
+		out["hop_interval"] = interval
+	}
 	if ports := firstQuery(q, "mport", "server_ports", "ports"); ports != "" {
 		out["server_ports"] = splitCSV(strings.ReplaceAll(ports, "-", ":"))
 		delete(out, "server_port")

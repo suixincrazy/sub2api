@@ -65,9 +65,6 @@ func (s *claudeUsageService) FetchUsageWithOptions(ctx context.Context, opts *se
 		userAgent = opts.Fingerprint.UserAgent
 	}
 	req.Header.Set("User-Agent", userAgent)
-	if opts.NetworkPolicy.PublicOnly {
-		req = req.WithContext(service.WithHTTPUpstreamNetworkPolicy(req.Context(), opts.NetworkPolicy))
-	}
 
 	var resp *http.Response
 
@@ -76,11 +73,6 @@ func (s *claudeUsageService) FetchUsageWithOptions(ctx context.Context, opts *se
 		resp, err = s.httpUpstream.DoWithTLS(req, opts.ProxyURL, opts.AccountID, 0, opts.TLSProfile)
 		if err != nil {
 			return nil, fmt.Errorf("request with TLS fingerprint failed: %w", err)
-		}
-	} else if s.httpUpstream != nil {
-		resp, err = s.httpUpstream.Do(req, opts.ProxyURL, opts.AccountID, 0)
-		if err != nil {
-			return nil, fmt.Errorf("request failed: %w", err)
 		}
 	} else {
 		// 不启用 TLS 指纹，使用普通 HTTP 客户端

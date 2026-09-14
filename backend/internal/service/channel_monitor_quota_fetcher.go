@@ -120,17 +120,7 @@ func (f *ChannelMonitorQuotaFetcher) LoadAccount(ctx context.Context, id int64) 
 	if f == nil || f.accounts == nil {
 		return nil, fmt.Errorf("quota fetcher is not configured")
 	}
-	account, err := f.accounts.GetByID(ctx, id)
-	if err != nil {
-		return nil, err
-	}
-	if account == nil {
-		return nil, fmt.Errorf("linked account not found")
-	}
-	if account.OwnerUserID != nil {
-		return nil, fmt.Errorf("linked account must be a system account")
-	}
-	return account, nil
+	return f.accounts.GetByID(ctx, id)
 }
 
 // Fetch 抓取账号的最新配额快照。永不返回 error：失败降级为
