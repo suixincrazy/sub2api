@@ -841,7 +841,8 @@ const (
 // 都在 message_delta 里，所以持流必须一直撑到那一帧。
 //
 // 撑到 message_delta 的代价是首字延迟，所以给三条提前放行的出口，任何一条成立就立刻放行：
-//  1. 出现 tool_use 块——工具回合永远不是截断形态，没有再等的理由；
+//  1. 工具回合**已经收尾**（见到 tool_use 块且 stop_reason 已到）——这一回合不是截断形态，
+//     没有再等的理由；
 //  2. 正文已超过短回合上限——已经不可能被判可疑，再等只是白等；
 //  3. 放行截止线到点——静默窗口耗尽、持流总时长撞上限、或首帧后的累计持流预算耗尽，三条都拿
 //     真实数据标定过，见 GatewayConfig.AnthropicHoldbackWindowMs /
@@ -875,6 +876,25 @@ const (
 // 它必须排在 sawToolUseBlock 与正文上限这两个提前放行出口之前：违规回合完全可以带工具块，
 // 也完全可以带超过 1300 rune 的长正文（21:25:40 那一发 872 rune，同类更长的也见得到），
 // 排在后面就会被提前放行短路掉，等于没加。
+//
+// 2026-09-15 修正 sawToolUseBlock 那道出口：原先它只要**见到** tool_use 块就立刻放行，
+// 把两件不同的事混成了一件——
+//   - 「以 tool_use 收尾的回合」确实不是截断形态，这是原注释想说的；
+//   - 「开过 tool_use 块的回合」完全可以在 input_json_delta 中途断掉，那正是截断。
+//
+// 后者一放行就提交，提交之后 failover 窗口关死，只剩罚号，客户端拿到一个 input JSON 残缺
+// 的工具调用。Claude Code 这类客户端会拿残缺参数去执行或直接丢弃该调用，表现就是「宣布要
+// 做某事，然后什么都没做」——这一形态在被审查的那份 transcript 里出现十余次。
+//
+// 收紧成「见到工具块 **且** stop_reason 已到」：stop_reason 一到，判据就齐了，工具回合会在
+// 下面 stopReason != "" 那个分支里被 anthropicTurnLooksSuspiciouslyShort 的 sawToolUseBlock
+// 短路判成不可疑，从而照旧放行——终态行为逐位不变，改变的只有**放行时机**：从「工具块起始帧」
+// 推到「message_delta」。中途断流的工具回合因此落在 events 通道关闭那条路径上，仍持有完好的
+// 提交窗口，走 newAnthropicEmptyStreamFailoverError 换号重来，客户端零暴露。
+//
+// 为什么不怕把工具回合攥死：三条截止线照旧管着这一档（工具回合无思考时 effectiveHoldCap 不
+// 放宽），最坏是等到 AnthropicHoldbackMaxHoldMs 原样放行，与改动前相比只多了这段延迟；而
+// 工具回合的 message_delta 紧跟 input_json_delta 到达，实测远早于截止线。
 func anthropicHoldbackVerdict(
 	releaseDeadlineElapsed bool,
 	deadAirExhausted bool,
@@ -891,7 +911,7 @@ func anthropicHoldbackVerdict(
 	if blockOrderViolation && blockOrderDiscardsUsed < anthropicBlockOrderDiscardBudget {
 		return anthropicHoldbackDiscard
 	}
-	if sawToolUseBlock {
+	if sawToolUseBlock && strings.TrimSpace(stopReason) != "" {
 		return anthropicHoldbackRelease
 	}
 	if proseRunes > anthropicShortTurnProseRuneLimit {

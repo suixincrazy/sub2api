@@ -95,8 +95,23 @@ func TestAnthropicHoldbackVerdict(t *testing.T) {
 			name: "正文刚起头也要继续攥着", proseRunes: 12, outputTokens: 4,
 			want: anthropicHoldbackKeep,
 		},
+		// 2026-09-15：这一条原先断言「见到 tool_use 块就立刻放行」，锚的是被修掉的旧语义。
+		// 开了工具块但 stop_reason 还没到，说明这一回合还在吐 input_json_delta，此刻放行就
+		// 提交，之后若断在工具参数中途只剩罚号、无法换号，客户端拿到 input JSON 残缺的调用。
+		// 见 anthropicHoldbackVerdict 上 2026-09-15 那段。
 		{
-			name: "tool_use 块立刻放行", toolUse: true, proseRunes: 3,
+			name: "见到 tool_use 块但 stop_reason 未到：继续攥着", toolUse: true, proseRunes: 3,
+			want: anthropicHoldbackKeep,
+		},
+		{
+			name:       "工具回合收尾后放行",
+			stopReason: "tool_use", toolUse: true, proseRunes: 3,
+			want: anthropicHoldbackRelease,
+		},
+		// 工具回合被攥住不等于被攥死：截止线照旧管这一档，到点原样放行，最坏只是多等这段延迟。
+		{
+			name:       "工具块 + 截止线到点：放行，不把工具回合攥死",
+			windowGone: true, toolUse: true, proseRunes: 3,
 			want: anthropicHoldbackRelease,
 		},
 		{
