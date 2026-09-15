@@ -43,6 +43,12 @@ sing-box TLS settings are preserved without conversion through a share link.
 
 ## Validation and Deployment
 
+The application version follows `Wei-Shaw/sub2api` through
+`backend/cmd/server/VERSION`. Keep fork-specific build identity in the Git
+commit and image revision label. Local builds should use the embedded version
+instead of adding a proxy or date suffix through `main.Version`. Update
+artifacts remain builds of this fork so the proxy features are retained.
+
 Relevant backend regression tests:
 
 ```sh

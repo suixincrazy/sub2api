@@ -139,13 +139,14 @@ func fillGlobalPricingFallback(pricingService *PricingService, models []Supporte
 
 // derivedTokenDisplayPrices 是按派生倍率算出的展示价，字段为 nil 表示该档不派生。
 type derivedTokenDisplayPrices struct {
-	output     *float64
-	cacheWrite *float64
-	cacheRead  *float64
+	output       *float64
+	cacheWrite   *float64
+	cacheWrite1h *float64
+	cacheRead    *float64
 }
 
 func (d derivedTokenDisplayPrices) empty() bool {
-	return d.output == nil && d.cacheWrite == nil && d.cacheRead == nil
+	return d.output == nil && d.cacheWrite == nil && d.cacheWrite1h == nil && d.cacheRead == nil
 }
 
 // applyTo 把派生价盖到展示定价上（返回克隆，不改入参——渠道定价指针指向缓存共享数据）。
@@ -162,6 +163,9 @@ func (d derivedTokenDisplayPrices) applyTo(p *ChannelModelPricing) *ChannelModel
 	}
 	if d.cacheWrite != nil {
 		clone.CacheWritePrice = d.cacheWrite
+	}
+	if d.cacheWrite1h != nil {
+		clone.CacheWrite1hPrice = d.cacheWrite1h
 	}
 	if d.cacheRead != nil {
 		clone.CacheReadPrice = d.cacheRead
@@ -198,6 +202,9 @@ func computeDerivedDisplayPrices(pricingService *PricingService, model string, p
 	}
 	out.output = derive(p.OutputPrice, p.CompletionMultiplier)
 	out.cacheWrite = derive(p.CacheWritePrice, p.CacheCreationMultiplier)
+	if p.CacheWrite1hPrice == nil {
+		out.cacheWrite1h = out.cacheWrite
+	}
 	out.cacheRead = derive(p.CacheReadPrice, p.CacheReadMultiplier)
 	return out
 }

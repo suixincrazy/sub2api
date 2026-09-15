@@ -272,6 +272,35 @@ describe('admin ProxiesView behavior', () => {
     vi.useRealTimers()
   })
 
+  it.each([
+    { filter: 'protocol', value: 'vless', expected: { protocol: 'vless' } },
+    { filter: 'status', value: 'active', expected: { status: 'active' } },
+    { filter: 'source', value: '7', expected: { source_id: 7 } },
+  ])('resets proxy pagination when the $filter filter changes', async ({ filter, value, expected }) => {
+    listProxies.mockImplementation(async (page: number) => paginated([createProxy(page)], page, 60, 3))
+    listSources.mockResolvedValue({ ...paginated([createProxySource(7)]), page_size: 100 })
+    const wrapper = mountView()
+    await flushPromises()
+
+    await wrapper.get('[data-test="pagination-next"]').trigger('click')
+    await flushPromises()
+    await wrapper.get('[data-test="pagination-next"]').trigger('click')
+    await flushPromises()
+    expect(wrapper.get('[data-test="pagination-page"]').text()).toBe('3')
+
+    await wrapper.get(`[data-test="admin-proxy-${filter}-filter"]`).setValue(value)
+    await flushPromises()
+
+    expect(listProxies).toHaveBeenLastCalledWith(
+      1,
+      20,
+      expect.objectContaining(expected),
+      expect.objectContaining({ signal: expect.any(AbortSignal) }),
+    )
+    expect(wrapper.get('[data-test="pagination-page"]').text()).toBe('1')
+    wrapper.unmount()
+  })
+
   it('loads a selected configuration file into the editable import field', async () => {
     const wrapper = mountView()
     await flushPromises()

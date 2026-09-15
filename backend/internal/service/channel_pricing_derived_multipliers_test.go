@@ -214,11 +214,12 @@ func TestDisplayPricingMaterializesDerivedPrices(t *testing.T) {
 	// 否则派生值与 LiteLLM 值撞在一起，断言就分不出展示的是哪一个。
 	svc := &ChannelService{pricingService: &PricingService{pricingData: map[string]*LiteLLMModelPricing{
 		"claude-opus-5": {
-			Mode:                        "chat",
-			InputCostPerToken:           5e-6,
-			OutputCostPerToken:          30e-6,
-			CacheCreationInputTokenCost: 8e-6,
-			CacheReadInputTokenCost:     0.5e-6,
+			Mode:                                "chat",
+			InputCostPerToken:                   5e-6,
+			OutputCostPerToken:                  30e-6,
+			CacheCreationInputTokenCost:         8e-6,
+			CacheCreationInputTokenCostAbove1hr: 12.5e-6,
+			CacheReadInputTokenCost:             0.5e-6,
 		},
 	}}}
 
@@ -230,6 +231,8 @@ func TestDisplayPricingMaterializesDerivedPrices(t *testing.T) {
 		require.NotNil(t, got.OutputPrice)
 		require.InDelta(t, derivedCompletionPerToken, *got.OutputPrice, 1e-18)
 		require.InDelta(t, derivedCacheWritePerToken, *got.CacheWritePrice, 1e-18)
+		require.NotNil(t, got.CacheWrite1hPrice)
+		require.InDelta(t, derivedCacheWritePerToken, *got.CacheWrite1hPrice, 1e-18)
 		require.InDelta(t, derivedCacheReadPerToken, *got.CacheReadPrice, 1e-18)
 	})
 
@@ -245,7 +248,21 @@ func TestDisplayPricingMaterializesDerivedPrices(t *testing.T) {
 		require.InDelta(t, 5e-6, *got.InputPrice, 1e-18, "提示价由全局回落补上")
 		require.InDelta(t, 25e-6, *got.OutputPrice, 1e-18, "5 × 5e-6，不是 LiteLLM 的 30e-6")
 		require.InDelta(t, 6.25e-6, *got.CacheWritePrice, 1e-18, "1.25 × 5e-6，不是 LiteLLM 的 8e-6")
+		require.NotNil(t, got.CacheWrite1hPrice)
+		require.InDelta(t, 6.25e-6, *got.CacheWrite1hPrice, 1e-18)
 		require.InDelta(t, 1e-6, *got.CacheReadPrice, 1e-18, "0.2 × 5e-6，不是 LiteLLM 的 0.5e-6")
+	})
+
+	t.Run("explicit_1h_price_overrides_multiplier", func(t *testing.T) {
+		for _, price := range []float64{0, 9e-6} {
+			config := derivedRatioPricing()
+			config.CacheWrite1hPrice = pricingMultiplier(price)
+			models := []SupportedModel{{Name: "claude-opus-5", Platform: "anthropic", Pricing: config}}
+			fillGlobalPricingFallback(svc.pricingService, models)
+			require.NotNil(t, models[0].Pricing.CacheWrite1hPrice)
+			require.Equal(t, price, *models[0].Pricing.CacheWrite1hPrice)
+			require.Nil(t, config.CacheWritePrice, "display prices must not mutate cached configuration")
+		}
 	})
 }
 

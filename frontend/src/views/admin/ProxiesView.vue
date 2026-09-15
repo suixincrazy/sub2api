@@ -26,7 +26,7 @@
               :options="protocolOptions"
               :placeholder="t('admin.proxies.allProtocols')"
               data-test="admin-proxy-protocol-filter"
-              @change="loadProxies"
+              @change="handleFilterChange"
             />
           </div>
           <div class="w-full sm:w-36">
@@ -35,7 +35,7 @@
               :options="statusOptions"
               :placeholder="t('admin.proxies.allStatus')"
               data-test="admin-proxy-status-filter"
-              @change="loadProxies"
+              @change="handleFilterChange"
             />
           </div>
           <div v-if="proxySourceFilterOptions.length > 1" class="w-full sm:w-44">
@@ -44,7 +44,7 @@
               :options="proxySourceFilterOptions"
               :placeholder="t('admin.proxies.allSources')"
               data-test="admin-proxy-source-filter"
-              @change="loadProxies"
+              @change="handleFilterChange"
             />
           </div>
 
@@ -1798,6 +1798,11 @@ const loadProxies = async () => {
       abortController = null
     }
   }
+}
+
+const handleFilterChange = () => {
+  pagination.page = 1
+  loadProxies()
 }
 
 const resetProxySourceForm = () => {
