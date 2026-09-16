@@ -858,8 +858,150 @@ func (s *GatewayService) handleStreamingResponse(ctx context.Context, resp *http
 	sawContentBlockStart := false
 	sawToolUseBlock := false
 	// blockOrder 判块序违规，与透传链路同口径（见 anthropicContentBlockOrderTracker）。
-	// 这条链路没有持流窗口，所以只有 delivered 一种结局：响应已经交付，只能事后解绑 + 罚号。
 	var blockOrder anthropicContentBlockOrderTracker
+
+	// 零暴露持流。以下这一大段是从 gateway_anthropic_passthrough.go 移植过来的，判定函数、
+	// 观察器、四条截止线全部复用，不另立一套口径。
+	//
+	// 为什么必须移植：持流机制此前**整套只存在于透传链路**，而透传链路要求账号
+	// extra.anthropic_passthrough == true（见 Account.IsAnthropicAPIKeyPassthroughEnabled）。
+	// 线上四个 anthropic apikey 账号（1/3/4/5）的 extra 里压根没有这个键，于是
+	// forwardOnce 一次都没进过透传分支，100% 的流量走的是这里 —— 一条当时完全没有持流机制的
+	// 链路。此前所有持流修复（零暴露、三条/四条截止线、丢弃预算、长思考放宽、tool_use 出口
+	// 收紧）落在了生产从不执行的文件里。
+	//
+	// 实证：anthropic_short_turn_streak_unbind 有 103 行 disposition="delivered"、
+	// discarded 零行；全部持流事件计数器为零；usage_logs 里 71 行 duration_ms ≈
+	// first_token_ms 且 output_tokens 只有 9~16 —— 第一个字节就已经是终态。
+	//
+	// 结构差异：这条链路按 SSE **事件块**（processSSEEvent -> outputBlocks）写出，不是按行，
+	// 所以缓冲区是 pendingPreludeBlocks []string 而不是透传那边的 pendingPreludeLines。
+	holdbackWindow := time.Duration(0)
+	if account != nil && account.Platform == PlatformAnthropic &&
+		s.cfg != nil && s.cfg.Gateway.AnthropicHoldbackWindowMs > 0 {
+		holdbackWindow = time.Duration(s.cfg.Gateway.AnthropicHoldbackWindowMs) * time.Millisecond
+	}
+	holdbackActive := holdbackWindow > 0
+	// 持流总时长上限，与静默窗口取先到者。窗口配 0（整个机制关掉）时这一条也不参与，
+	// 免得上限把已经显式关掉的机制又拉起来。见 GatewayConfig.AnthropicHoldbackMaxHoldMs。
+	holdbackMaxHold := time.Duration(0)
+	if holdbackActive && s.cfg != nil && s.cfg.Gateway.AnthropicHoldbackMaxHoldMs > 0 {
+		holdbackMaxHold = time.Duration(s.cfg.Gateway.AnthropicHoldbackMaxHoldMs) * time.Millisecond
+	}
+	// 累计持流预算：三条截止线里唯一跨 failover 不归零的一条，见 deadAirElapsed。
+	holdbackDeadAir := time.Duration(0)
+	if holdbackActive && s.cfg != nil && s.cfg.Gateway.AnthropicHoldbackDeadAirBudgetMs > 0 {
+		holdbackDeadAir = time.Duration(s.cfg.Gateway.AnthropicHoldbackDeadAirBudgetMs) * time.Millisecond
+	}
+	// 长思考回合的持流下限，只放宽两条总时长类截止线、不动静默窗口。
+	// 见 effectiveHoldCap 与 GatewayConfig.AnthropicHoldbackLongThinkingHoldMs。
+	holdbackLongThinkingFloor := time.Duration(0)
+	if holdbackActive && s.cfg != nil && s.cfg.Gateway.AnthropicHoldbackLongThinkingHoldMs > 0 {
+		holdbackLongThinkingFloor = time.Duration(s.cfg.Gateway.AnthropicHoldbackLongThinkingHoldMs) * time.Millisecond
+	}
+	// 丢弃代价预算：跨尝试累计的墙钟上限，到点后不再丢弃、直接放行手上这一发。它与上面三条
+	// 性质不同 —— 那三条到点的结果是**放行**，这一条到点的结果是**不再丢弃**，所以它刻意
+	// 不进 effectiveHoldCap 的放宽。见 GatewayConfig.AnthropicHoldbackDiscardBudgetMs。
+	holdbackDiscardBudget := time.Duration(0)
+	if holdbackActive && s.cfg != nil && s.cfg.Gateway.AnthropicHoldbackDiscardBudgetMs > 0 {
+		holdbackDiscardBudget = time.Duration(s.cfg.Gateway.AnthropicHoldbackDiscardBudgetMs) * time.Millisecond
+	}
+	holdbackDiscardsUsed := anthropicHoldbackDiscardsUsed(c)
+	blockOrderDiscardsUsed := anthropicBlockOrderDiscardsUsed(c)
+	holdback := &anthropicHoldbackObserver{
+		holdbackElapsedBefore: anthropicHoldbackElapsedBefore(c),
+		longThinkingHoldFloor: holdbackLongThinkingFloor,
+	}
+	// streamCommitted 与 c.Writer.Written() 对齐取初值：上游重试、协议适配器嵌套都可能
+	// 在进入这里之前就已经写过字节，那种情况下持流没有意义，必须退化成旧行为。
+	streamCommitted := c.Writer.Written()
+	pendingPreludeBlocks := make([]string, 0, 12)
+	flushPendingPrelude := func() {
+		if len(pendingPreludeBlocks) == 0 {
+			streamCommitted = true
+			return
+		}
+		if !clientDisconnected {
+			for _, block := range pendingPreludeBlocks {
+				restored := reverseToolNamesIfPresent(c, []byte(block))
+				if _, werr := fmt.Fprint(w, string(restored)); werr != nil {
+					clientDisconnected = true
+					logger.LegacyPrintf("service.gateway", "Client disconnected while flushing holdback buffer, continuing to drain upstream for billing")
+					break
+				}
+			}
+			if !clientDisconnected {
+				flusher.Flush()
+				lastDataAt = time.Now()
+				resetKeepaliveTimer()
+			}
+		}
+		pendingPreludeBlocks = pendingPreludeBlocks[:0]
+		streamCommitted = true
+	}
+	// 第四条放行线：丢弃代价预算的剩余额度。只在已经丢弃过内容之后才参与，与
+	// anthropicHoldbackVerdict 里「首次内容丢弃豁免时间预算」同口径 —— 一次都还没丢的时候
+	// 这段墙钟不是丢弃代价，长思考首发不该被它打断。
+	releaseBudgetDeadline := func(now time.Time) time.Time {
+		if !holdbackActive || holdbackDiscardBudget <= 0 {
+			return time.Time{}
+		}
+		if holdbackDiscardsUsed+blockOrderDiscardsUsed == 0 {
+			return time.Time{}
+		}
+		return anthropicDiscardBudgetDeadline(c, now, holdbackDiscardBudget)
+	}
+	// holdbackDeadline 把四条放行线合成一个时刻，取先到者。定时器与判定都只认这一个口径。
+	holdbackDeadline := func(now time.Time) time.Time {
+		deadline := holdback.holdbackReleaseDeadline(holdbackWindow, holdbackMaxHold, holdbackDeadAir)
+		budget := releaseBudgetDeadline(now)
+		if budget.IsZero() {
+			return deadline
+		}
+		if deadline.IsZero() || budget.Before(deadline) {
+			return budget
+		}
+		return deadline
+	}
+	budgetReleaseElapsed := func(now time.Time) bool {
+		deadline := releaseBudgetDeadline(now)
+		return !deadline.IsZero() && !now.Before(deadline)
+	}
+	// 独立定时器，不复用 keepalive：窗口是毫秒级而 keepalive 默认 10 秒。定时器只是唤醒器，
+	// 判据在 holdbackDeadline 手里，开火后必须复核、没到就按剩余时间续期。见 case <-holdbackCh。
+	var holdbackTimer *time.Timer
+	var holdbackCh <-chan time.Time
+	armHoldbackTimer := func() {
+		if !holdbackActive {
+			return
+		}
+		deadline := holdbackDeadline(time.Now())
+		if deadline.IsZero() {
+			return
+		}
+		wake := time.Until(deadline)
+		if wake <= 0 {
+			wake = time.Millisecond
+		}
+		if holdbackTimer == nil {
+			holdbackTimer = time.NewTimer(wake)
+		} else {
+			if !holdbackTimer.Stop() {
+				select {
+				case <-holdbackTimer.C:
+				default:
+				}
+			}
+			holdbackTimer.Reset(wake)
+		}
+		holdbackCh = holdbackTimer.C
+	}
+	defer func() {
+		if holdbackTimer != nil {
+			holdbackTimer.Stop()
+		}
+	}()
+
 	useNoopDeltaKeepalive := c != nil && c.Request != nil && shouldUseClaudeCodeNoopDeltaKeepalive(c.GetHeader("User-Agent"))
 	noopDeltaKeepaliveBlockIndex := -1
 	noopDeltaKeepaliveDeltaType := ""
@@ -1105,11 +1247,30 @@ func (s *GatewayService) handleStreamingResponse(ctx context.Context, resp *http
 			if !ok {
 				// 上游完成，返回结果
 				if !sawTerminalEvent {
+					// 持流期上游直接 EOF 而没给终止事件：提交窗口还完好，换号重来。缓冲区
+					// 里可能已经攥着半截正文，丢弃前必须清空，否则 flush 会把它写给客户端。
+					if !streamCommitted && holdbackActive && !clientDisconnected &&
+						c.Request.Context().Err() == nil {
+						reason := "upstream closed stream without terminal event"
+						if !holdback.firstCommitPointAt.IsZero() {
+							reason = fmt.Sprintf("stream ended mid-content during holdback (prose_runes=%d output_tokens=%d)",
+								holdback.proseRunes, holdback.outputTokens)
+						}
+						logger.LegacyPrintf("service.gateway",
+							"Upstream closed stream during holdback (account=%d prose_runes=%d output_tokens=%d), failing over",
+							account.ID, holdback.proseRunes, holdback.outputTokens)
+						pendingPreludeBlocks = pendingPreludeBlocks[:0]
+						return nil, s.newAnthropicEmptyStreamFailoverError(c, resp, account, reason)
+					}
+					// 换不了号就别把已经产出的内容带进坟墓。
+					flushPendingPrelude()
 					if !clientDisconnected && c.Request.Context().Err() == nil {
 						s.reportStreamTruncatedAfterCommit(ctx, c, resp, account, originalModel, "upstream closed stream without terminal event")
 					}
 					return &streamingResult{usage: usage, firstTokenMs: firstTokenMs, clientDisconnect: clientDisconnected}, fmt.Errorf("stream usage incomplete: missing terminal event")
 				}
+				// 带终止事件的正常收尾：缓冲原样放行，再走事后归因。
+				flushPendingPrelude()
 				reportIfTerminalButIncomplete()
 				return &streamingResult{usage: usage, firstTokenMs: firstTokenMs, clientDisconnect: clientDisconnected}, nil
 			}
@@ -1140,6 +1301,18 @@ func (s *GatewayService) handleStreamingResponse(ctx context.Context, resp *http
 				// 仅在下方 LegacyPrintf 内部日志中保留供运维诊断。
 				disconnectMsg := "upstream stream disconnected: " + sanitizeStreamError(ev.err)
 				if !c.Writer.Written() {
+					// 持流期上游中途死掉：提交窗口仍然完好，所以照样换号。但归因不能说成
+					// 「客户端零输出」——正文其实已经吐了一部分，只是还攥在 pendingPreludeBlocks
+					// 里没写出去。与透传链路的 stream ended mid-content 同口径。
+					if holdbackActive && !holdback.firstCommitPointAt.IsZero() {
+						logger.LegacyPrintf("service.gateway",
+							"Upstream stream read error mid-content during holdback (account=%d prose_runes=%d output_tokens=%d), failing over: %v",
+							account.ID, holdback.proseRunes, holdback.outputTokens, ev.err)
+						pendingPreludeBlocks = pendingPreludeBlocks[:0]
+						return nil, s.newAnthropicEmptyStreamFailoverError(c, resp, account,
+							fmt.Sprintf("stream ended mid-content during holdback (prose_runes=%d output_tokens=%d)",
+								holdback.proseRunes, holdback.outputTokens))
+					}
 					logger.LegacyPrintf("service.gateway", "Upstream stream read error before any client output (account=%d), failing over: %v", account.ID, ev.err)
 					body, _ := json.Marshal(map[string]any{
 						"type": "error",
@@ -1175,41 +1348,148 @@ func (s *GatewayService) handleStreamingResponse(ctx context.Context, resp *http
 					return nil, err
 				}
 
+				// 计量先于写出，且不受持流影响：持流只改变字节**什么时候**写给客户端，
+				// usage 与 first_token_ms 的口径必须与旧行为逐位一致。原实现把这一段放在
+				// 逐 block 循环里，而同一个事件的 data/usagePatch 对每个 block 都相同，
+				// 提到循环外等价（mergeSSEUsagePatch 是覆盖式赋值，重复调用无额外效果）。
+				// 提出来之后写出循环才可以 break —— 否则 break 会连带漏计 usage。
+				if data != "" {
+					if firstTokenMs == nil && data != "[DONE]" {
+						ms := int(time.Since(startTime).Milliseconds())
+						firstTokenMs = &ms
+					}
+					if usagePatch != nil {
+						mergeSSEUsagePatch(usage, usagePatch)
+					}
+				}
+
+				if !streamCommitted && holdbackActive {
+					pendingPreludeBlocks = append(pendingPreludeBlocks, outputBlocks...)
+					commitPrelude := data != "" && anthropicSSEPayloadCommitsResponse([]byte(data))
+					// holdEligible 排除终止帧与错误帧，口径与透传链路一致：message_stop /
+					// error / [DONE] 到了就说明没什么可等的，继续攥着只是白拖延迟。
+					holdEligible := false
+					var holdFrame gjson.Result
+					if data != "" && data != "[DONE]" && json.Valid([]byte(data)) {
+						holdFrame = gjson.Parse(data)
+						switch strings.TrimSpace(holdFrame.Get("type").String()) {
+						case "message_stop", "error":
+						default:
+							holdEligible = true
+						}
+					}
+					// 每一帧都要过判定，不能只看会提交的帧：stop_reason 落在 message_delta 上，
+					// 而 anthropicSSEPayloadCommitsResponse 对它返回 false，只在提交帧上判就
+					// 永远拿不到判据。
+					if holdEligible {
+						now := time.Now()
+						holdback.observe(holdFrame, commitPrelude, now)
+						armHoldbackTimer()
+						switch anthropicHoldbackVerdict(
+							holdback.releaseDeadlineElapsed(now, holdbackWindow, holdbackMaxHold, holdbackDeadAir) ||
+								budgetReleaseElapsed(now),
+							holdback.deadAirElapsed(now, holdbackDeadAir),
+							holdback.stopReason, holdback.proseRunes, holdback.outputTokens,
+							holdback.sawToolUseBlock, holdbackDiscardsUsed, blockOrderDiscardsUsed,
+							holdback.thinkingRunes, holdback.blockOrder.violation(),
+							holdbackDiscardBudget > 0 && anthropicDiscardBudgetElapsed(c, now) >= holdbackDiscardBudget,
+						) {
+						case anthropicHoldbackKeep:
+							commitPrelude = false
+						case anthropicHoldbackRelease:
+							commitPrelude = true
+						case anthropicHoldbackDiscard:
+							noteAnthropicHoldbackElapsed(c, holdback.holdbackElapsed(now))
+							pendingPreludeBlocks = pendingPreludeBlocks[:0]
+							// 块序违规单独一条出口，理由与透传链路一致：判据是确定性的，解绑
+							// 不走短回合的连击阈值，归因也不能混进短回合/空回合那两档。
+							if holdback.blockOrder.violation() && blockOrderDiscardsUsed < anthropicBlockOrderDiscardBudget {
+								s.unbindStickySessionNow(ctx, account, originalModel, "content block order violation")
+								s.reportAnthropicBlockOrderViolation(ctx, c, resp, account, originalModel,
+									holdback.proseRunes, holdback.outputTokens,
+									holdback.stopReason, "discarded")
+								return nil, s.newAnthropicBlockOrderFailoverError(
+									c, resp, account, originalModel,
+									holdback.proseRunes, holdback.outputTokens, holdback.stopReason)
+							}
+							// 丢弃只治这一发。粘性绑定还指着这个坏号，重试那一发不会改写它
+							// （非破坏性绑定），所以这里主动解绑，重试随即绑到新号上。
+							unbound := s.noteAnthropicShortTurnStreak(ctx, account, originalModel,
+								holdback.proseRunes, holdback.outputTokens)
+							switch {
+							case anthropicTurnIsEmptyAnswer(holdback.stopReason, holdback.proseRunes,
+								holdback.outputTokens, holdback.sawToolUseBlock):
+								s.reportAnthropicEmptyAnswerTurn(ctx, c, resp, account, originalModel,
+									holdback.outputTokens, holdback.stopReason, "discarded")
+							case unbound:
+								s.reportAnthropicShortTurnUnbind(ctx, c, resp, account, originalModel,
+									holdback.proseRunes, holdback.outputTokens,
+									holdback.stopReason, "discarded")
+							}
+							return nil, s.newAnthropicShortTurnFailoverError(
+								c, resp, account, originalModel,
+								holdback.proseRunes, holdback.outputTokens, holdback.stopReason)
+						}
+					}
+					if commitPrelude {
+						flushPendingPrelude()
+					}
+					continue
+				}
+
 				for _, block := range outputBlocks {
-					if !clientDisconnected {
-						restored := reverseToolNamesIfPresent(c, []byte(block))
-						if _, werr := fmt.Fprint(w, string(restored)); werr != nil {
-							clientDisconnected = true
-							logger.LegacyPrintf("service.gateway", "Client disconnected during streaming, continuing to drain upstream for billing")
-							// 不 break：客户端断开后仍需继续合并本事件及后续事件的 usage，
-							// 否则会漏计当前事件携带的 usage 导致少计费。后续写入由
-							// clientDisconnected 守卫跳过。
-						} else {
-							flusher.Flush()
-							lastDataAt = time.Now()
-							resetKeepaliveTimer()
-						}
+					if clientDisconnected {
+						break
 					}
-					if data != "" {
-						if firstTokenMs == nil && data != "[DONE]" {
-							ms := int(time.Since(startTime).Milliseconds())
-							firstTokenMs = &ms
-						}
-						if usagePatch != nil {
-							mergeSSEUsagePatch(usage, usagePatch)
-						}
+					restored := reverseToolNamesIfPresent(c, []byte(block))
+					if _, werr := fmt.Fprint(w, string(restored)); werr != nil {
+						clientDisconnected = true
+						logger.LegacyPrintf("service.gateway", "Client disconnected during streaming, continuing to drain upstream for billing")
+						break
 					}
+					flusher.Flush()
+					lastDataAt = time.Now()
+					resetKeepaliveTimer()
 				}
 				continue
 			}
 
 			pendingEventLines = append(pendingEventLines, line)
 
+		case <-holdbackCh:
+			// 定时器只是唤醒器，判据在 holdbackDeadline 手里：静默窗口量的是**静默**时长、
+			// 会随新帧续期，而定时器 arm 之后按固定时长走，帧还在源源到达时它照样开火。
+			// 所以开火先复核，四条截止线都没到就按剩余时间续期、继续持流；只有静默真的满了
+			// 一个窗口（判定要的 stop_reason 始终没来）、持流总时长撞到上限（上游一直在吐
+			// 但客户端一个字节都还没拿到）、首帧后的累计持流预算吃满（跨 failover 累加），
+			// 或者丢弃代价预算的剩余额度用尽，才认定等不起，原样放行。
+			holdbackCh = nil
+			now := time.Now()
+			deadline := holdbackDeadline(now)
+			switch {
+			case streamCommitted:
+				// 已经提交过，窗口没有可做的事。
+			case !deadline.IsZero() && now.Before(deadline):
+				if holdbackTimer != nil {
+					// 定时器已经开火、通道已被取空，Reset 前不需要再 Stop+drain。
+					holdbackTimer.Reset(deadline.Sub(now))
+					holdbackCh = holdbackTimer.C
+				}
+			default:
+				flushPendingPrelude()
+				if !clientDisconnected {
+					flusher.Flush()
+				}
+			}
+
 		case <-intervalCh:
 			lastRead := time.Unix(0, atomic.LoadInt64(&lastReadAt))
 			if time.Since(lastRead) < streamInterval {
 				continue
 			}
+			// 上游静默到超时：持流缓冲不能带进坟墓，先原样放行再报错，客户端至少拿到
+			// 已经产出的那部分内容。与透传链路同口径。
+			flushPendingPrelude()
 			if clientDisconnected {
 				return &streamingResult{usage: usage, firstTokenMs: firstTokenMs, clientDisconnect: true}, fmt.Errorf("stream usage incomplete after timeout")
 			}
@@ -1222,6 +1502,13 @@ func (s *GatewayService) handleStreamingResponse(ctx context.Context, resp *http
 			return &streamingResult{usage: usage, firstTokenMs: firstTokenMs}, fmt.Errorf("stream data interval timeout")
 
 		case <-keepaliveCh:
+			// 持流期一个字节都不能写：ping 也会让 c.Writer.Written() 变真，把 HTTP 200
+			// 钉死在客户端上，换号窗口随之关闭。这段零字节等待的上界由死气预算
+			// （AnthropicHoldbackDeadAirBudgetMs）与另外三条截止线一起兜着。
+			if !streamCommitted && holdbackActive {
+				resetKeepaliveTimer()
+				continue
+			}
 			if clientDisconnected {
 				continue
 			}
