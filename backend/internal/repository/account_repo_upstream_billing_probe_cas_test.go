@@ -39,8 +39,8 @@ func TestUpdateUpstreamBillingProbeSnapshotRequiresSameIdentityAndSnapshot(t *te
 			require.NoError(t, err)
 			mock.ExpectQuery(`(?s)` + regexp.QuoteMeta("SELECT protocol, host, port") + `.*` + regexp.QuoteMeta("FOR SHARE")).
 				WithArgs(int64(9)).
-				WillReturnRows(sqlmock.NewRows([]string{"protocol", "host", "port", "username", "password", "status"}).
-					AddRow("http", "127.0.0.1", 3128, "user", "pass", service.StatusActive))
+				WillReturnRows(sqlmock.NewRows([]string{"protocol", "host", "port", "username", "password", "status", "kind", "extra", "owner_user_id"}).
+					AddRow("http", "127.0.0.1", 3128, "user", "pass", service.StatusActive, "standard", []byte("{}"), nil))
 			mock.ExpectExec(`(?s)`+regexp.QuoteMeta("UPDATE accounts")+`.*`+regexp.QuoteMeta("WHERE id = $2")+`.*`+regexp.QuoteMeta("AND platform = $3")+`.*`+regexp.QuoteMeta("AND type = $4")+`.*`+regexp.QuoteMeta("AND credentials = $5::jsonb")+`.*`+regexp.QuoteMeta("AND proxy_id IS NOT DISTINCT FROM $6")+`.*`+regexp.QuoteMeta("COALESCE(extra -> 'upstream_billing_probe', 'null'::jsonb) = $7::jsonb")+`.*`+regexp.QuoteMeta("COALESCE(extra -> 'upstream_billing_probe_enabled', 'null'::jsonb) = $8::jsonb")+`.*`+regexp.QuoteMeta("COALESCE(extra -> 'upstream_billing_rate_sync_enabled', 'null'::jsonb) = $9::jsonb")).
 				WithArgs(sqlmock.AnyArg(), int64(17), service.PlatformOpenAI, service.AccountTypeAPIKey, `{"api_key":"sk-test","base_url":"http://127.0.0.1:8080"}`, int64(9), `{"status":"stale"}`, "null", "null", nil).
 				WillReturnResult(sqlmock.NewResult(0, tt.affected))
@@ -142,8 +142,8 @@ func TestUpdateUpstreamBillingProbeSnapshotRejectsChangedProxyIdentity(t *testin
 	require.NoError(t, err)
 	mock.ExpectQuery(`(?s)` + regexp.QuoteMeta("SELECT protocol, host, port") + `.*` + regexp.QuoteMeta("FOR SHARE")).
 		WithArgs(int64(9)).
-		WillReturnRows(sqlmock.NewRows([]string{"protocol", "host", "port", "username", "password", "status"}).
-			AddRow("http", "new.example", 3128, "user", "pass", service.StatusActive))
+		WillReturnRows(sqlmock.NewRows([]string{"protocol", "host", "port", "username", "password", "status", "kind", "extra", "owner_user_id"}).
+			AddRow("http", "new.example", 3128, "user", "pass", service.StatusActive, "standard", []byte("{}"), nil))
 
 	proxyID := int64(9)
 	account := &service.Account{

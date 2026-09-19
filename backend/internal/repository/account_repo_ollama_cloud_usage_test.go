@@ -82,8 +82,8 @@ func TestOllamaCloudUsageManagedWriteRejectsChangedProxyIdentity(t *testing.T) {
 	mock.ExpectBegin()
 	mock.ExpectQuery(`(?s)` + regexp.QuoteMeta("SELECT protocol, host, port") + `.*` + regexp.QuoteMeta("FOR SHARE")).
 		WithArgs(int64(9)).
-		WillReturnRows(sqlmock.NewRows([]string{"protocol", "host", "port", "username", "password", "status"}).
-			AddRow("http", "new.example", 3128, "user", "pass", service.StatusActive))
+		WillReturnRows(sqlmock.NewRows([]string{"protocol", "host", "port", "username", "password", "status", "kind", "extra", "owner_user_id"}).
+			AddRow("http", "new.example", 3128, "user", "pass", service.StatusActive, "standard", []byte("{}"), nil))
 	mock.ExpectRollback()
 
 	account := ollamaCloudUsageRepositoryAccount()
