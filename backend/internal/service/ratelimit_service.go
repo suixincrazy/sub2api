@@ -2745,23 +2745,9 @@ func truncateTempUnschedMessage(body []byte, maxBytes int) string {
 	return strings.TrimSpace(string(body))
 }
 
-// HandleStreamTruncated 处理「上游把已提交的流截断且没送终止事件」。
-//
-// 与 HandleStreamTimeout 并列：都表示这个账号交付了一条客户端无法使用的流，
-// 因此共用 stream_timeout_settings 的开关/阈值/计数窗口（运维只需一个旋钮），
-// 只在落库的 keyword 与错误文案上区分，避免把截断误报成空闲超时。
-//
-// 这条路径此前完全没有账号健康度信号：流已提交后本次请求不能再 failover（改写
-// 已 flush 的字节会腐化响应），但如果连账号都不罚，客户端紧接着发来的重试会被
-// 粘性直接送回同一个坏账号，表现为「报错但从不主副切换」。
-func (s *RateLimitService) HandleStreamTruncated(ctx context.Context, account *Account, model string) bool {
-	return s.handleStreamDeliveryFailure(ctx, account, model, "stream_truncated",
-		"Stream truncated without terminal event for model: "+model)
-}
-
 // HandleStreamRefused 处理「安全拒答到达时已经切不了号」。
 //
-// 与 HandleStreamTruncated / HandleStreamTimeout 并列：三者都表示这个账号交付了一条
+// 与 HandleStreamTimeout 并列：两者都表示这个账号交付了一条
 // 客户端无法使用的响应，因此共用 stream_timeout_settings 的开关/阈值/计数窗口，只在
 // 落库 keyword 与错误文案上区分。拒答的特殊之处在于它**账号特有**（同一请求换个账号
 // 常常就过了），所以罚号冷却正是让下一发重试落到别的账号的手段——否则粘性会把重试原样
@@ -2827,7 +2813,7 @@ func (s *RateLimitService) handleStreamDeliveryFailure(ctx context.Context, acco
 	// 达到阈值，执行相应操作
 	switch settings.Action {
 	case StreamTimeoutActionTempUnsched:
-		return s.triggerStreamTimeoutTempUnsched(ctx, account, settings, model, keyword, errorMessage)
+		return s.triggerStreamTimeoutTempUnsched(ctx, account, settings, keyword, errorMessage)
 	case StreamTimeoutActionError:
 		return s.triggerStreamTimeoutError(ctx, account, model, errorMessage)
 	default:
@@ -2836,9 +2822,7 @@ func (s *RateLimitService) handleStreamDeliveryFailure(ctx context.Context, acco
 }
 
 // triggerStreamTimeoutTempUnsched 触发流超时临时不可调度
-//
-// model 会随停调状态一起落库，后台探针据此复现同一条链路（见 TempUnschedState.Model）。
-func (s *RateLimitService) triggerStreamTimeoutTempUnsched(ctx context.Context, account *Account, settings *StreamTimeoutSettings, model, keyword, errorMessage string) bool {
+func (s *RateLimitService) triggerStreamTimeoutTempUnsched(ctx context.Context, account *Account, settings *StreamTimeoutSettings, keyword, errorMessage string) bool {
 	now := time.Now()
 	until := now.Add(time.Duration(settings.TempUnschedMinutes) * time.Minute)
 
@@ -2849,7 +2833,6 @@ func (s *RateLimitService) triggerStreamTimeoutTempUnsched(ctx context.Context, 
 		MatchedKeyword:  keyword,
 		RuleIndex:       -1, // 表示系统级规则
 		ErrorMessage:    errorMessage,
-		Model:           model,
 	}
 
 	reason := ""
