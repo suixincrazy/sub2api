@@ -110,6 +110,40 @@ func TestForward429AllProtocols(t *testing.T) {
 	}
 }
 
+func TestOpenAIStreaming429BeforeOutputRetries(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	for _, passthrough := range []bool{false, true} {
+		t.Run(strconv.FormatBool(passthrough), func(t *testing.T) {
+			synctest.Test(t, func(t *testing.T) {
+				repo := &anthropicWindowLimitRepo{}
+				account := &Account{ID: 907, Platform: PlatformOpenAI, Type: AccountTypeAPIKey,
+					Credentials: map[string]any{"api_key": "test", "base_url": "https://api.example.invalid"},
+					Extra:       map[string]any{"openai_passthrough": passthrough},
+				}
+				cfg := &config.Config{Gateway: config.GatewayConfig{MaxLineSize: defaultMaxLineSize}}
+				rl := NewRateLimitService(repo, nil, cfg, nil, nil)
+				upstream := &retry429Upstream{t: t, repo: repo, accountID: account.ID,
+					respond: func(_ int, _ *http.Request) *http.Response {
+						body := "data: {\"type\":\"response.created\",\"response\":{\"id\":\"pending\"}}\n\ndata: {\"type\":\"response.failed\",\"response\":{\"status\":\"failed\",\"error\":{\"code\":\"rate_limit_exceeded\",\"message\":\"rate limit reached\"}}}\n\n"
+						return &http.Response{StatusCode: 200, Header: http.Header{"Content-Type": []string{"text/event-stream"}}, Body: io.NopCloser(strings.NewReader(body))}
+					},
+				}
+				svc := &OpenAIGatewayService{cfg: cfg, httpUpstream: upstream, rateLimitService: rl}
+				rl.SetAccountRuntimeBlocker(svc)
+				c, rec := newTransportFailoverTestContext(t)
+				c.Request = httptest.NewRequest(http.MethodPost, "/v1/responses", nil)
+				_, err := svc.Forward(context.Background(), c, account, []byte(`{"model":"gpt-5.4","input":"hello","stream":true}`))
+				var failure *UpstreamFailoverError
+				require.ErrorAs(t, err, &failure)
+				require.Equal(t, http.StatusTooManyRequests, failure.StatusCode)
+				require.Equal(t, 7, upstream.calls)
+				require.Equal(t, 1, repo.rateLimitCalls)
+				require.Empty(t, rec.Body.String())
+			})
+		})
+	}
+}
+
 func TestForward429SuccessAndCancellationDoNotFreeze(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	for _, platform := range []string{PlatformOpenAI, PlatformAnthropic} {
