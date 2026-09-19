@@ -2912,8 +2912,10 @@ func lockAndMatchProbeProxyIdentity(ctx context.Context, client *dbent.Client, a
 	if account.ProxyID == nil {
 		return true, nil
 	}
+	// 取列必须与 lockProxyProbeIdentity 保持一致：proxyProbeIdentity 是逐字段比较的
+	// 值类型，少读一列就等于把该字段留成零值，与 service 侧算出来的身份永不相等。
 	rows, err := client.QueryContext(ctx, `
-		SELECT protocol, host, port, COALESCE(username, ''), COALESCE(password, ''), status
+		SELECT protocol, host, port, COALESCE(username, ''), COALESCE(password, ''), status, kind, COALESCE(extra, '{}'::jsonb), owner_user_id
 		FROM proxies
 		WHERE id = $1 AND deleted_at IS NULL
 		FOR SHARE
@@ -2932,9 +2934,17 @@ func lockAndMatchProbeProxyIdentity(ctx context.Context, client *dbent.Client, a
 		return false, nil
 	}
 	var current proxyProbeIdentity
-	if err := rows.Scan(&current.protocol, &current.host, &current.port, &current.username, &current.password, &current.status); err != nil {
+	var kind string
+	var extra []byte
+	var ownerID *int64
+	if err := rows.Scan(&current.protocol, &current.host, &current.port, &current.username, &current.password, &current.status, &kind, &extra, &ownerID); err != nil {
 		return false, err
 	}
+	var config map[string]any
+	if err := json.Unmarshal(extra, &config); err != nil {
+		return false, err
+	}
+	current.connectionKey = service.ProxyConnectionKey(&service.Proxy{Kind: kind, Protocol: current.protocol, Host: current.host, Port: current.port, Username: current.username, Password: current.password, Status: current.status, Extra: config, OwnerUserID: ownerID})
 	return current == proxyProbeIdentityFromService(account.Proxy), rows.Err()
 }
 

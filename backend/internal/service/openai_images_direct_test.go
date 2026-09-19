@@ -86,8 +86,9 @@ func TestCodexDirectImagesHTTPErrorFallbacksOnlyWhenEndpointUnavailable(t *testi
 			calls := 0
 			upstream := &codexModelsHTTPUpstreamStub{do: func(req *http.Request, _ string, _ int64, _ int) (*http.Response, error) {
 				calls++
-				if calls == 1 {
-					require.Equal(t, "/backend-api/codex/images/generations", req.URL.Path)
+				// 按路径分派而不是按调用序号:429 会被 retryUpstream429 在同号上重发,
+				// 重发仍打 images 端点,按序号判断会把重发误当成 fallback 请求。
+				if req.URL.Path == "/backend-api/codex/images/generations" {
 					return &http.Response{StatusCode: status, Header: http.Header{}, Body: io.NopCloser(strings.NewReader(`{"error":{"type":"server_error","message":"image request rejected"}}`))}, nil
 				}
 				require.Contains(t, req.URL.Path, "/backend-api/codex/responses")
@@ -105,7 +106,13 @@ func TestCodexDirectImagesHTTPErrorFallbacksOnlyWhenEndpointUnavailable(t *testi
 				require.Equal(t, 2, calls)
 			} else {
 				require.Error(t, err)
-				require.Equal(t, 1, calls)
+				// 429 由 retryUpstream429 在同号上重发 6 次后才交还 failover,
+				// 其余状态码不重试,一次即终态。两者都不应触发 responses fallback。
+				if status == http.StatusTooManyRequests {
+					require.Equal(t, 1+upstream429MaxRetries, calls)
+				} else {
+					require.Equal(t, 1, calls)
+				}
 			}
 		})
 	}

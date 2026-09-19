@@ -98,8 +98,9 @@ func TestOpenAISetupTokenImagesUsesOAuthDirectPath(t *testing.T) {
 	var failoverErr *UpstreamFailoverError
 	require.ErrorAs(t, err, &failoverErr)
 	require.Equal(t, http.StatusTooManyRequests, failoverErr.StatusCode)
-	require.True(t, failoverErr.RetryableOnSameAccount)
-	require.False(t, failoverErr.SameAccountRetryDeadline.IsZero())
+	// retryUpstream429 在 service 层耗尽同号重试后才交还 failover,不再让 handler 重试同号。
+	require.False(t, failoverErr.RetryableOnSameAccount)
+	require.True(t, failoverErr.SameAccountRetryDeadline.IsZero())
 	require.Contains(t, upstream.lastReq.URL.String(), "/backend-api/codex/images/generations")
 }
 
