@@ -26,9 +26,14 @@ func NewCodexHistoryFilter(settings *service.SettingService) *CodexHistoryFilter
 // Prepare bounds and decodes the original body before model allowlist checks.
 // Apply runs after those checks so JSON normalization cannot hide duplicate models.
 func (f *CodexHistoryFilter) Prepare(c *gin.Context) {
-	path := strings.TrimRight(c.Request.URL.Path, "/")
-	responses := strings.HasSuffix(path, "/responses")
-	compact := strings.HasSuffix(path, "/responses/compact")
+	route := c.FullPath()
+	if !strings.HasSuffix(route, "/responses") && !strings.Contains(route, "/responses/") {
+		c.Next()
+		return
+	}
+	suffix, valid := service.OpenAIResponsesRequestPathSuffix(c)
+	responses := valid && suffix == ""
+	compact := valid && suffix == "/compact"
 	if (!responses && !compact) || (c.Request.Method != http.MethodPost && c.Request.Method != http.MethodGet) {
 		c.Next()
 		return

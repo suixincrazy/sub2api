@@ -250,3 +250,30 @@ func TestCodexHistoryFilterLogsOnlyCountsAndCodes(t *testing.T) {
 	require.NoError(t, err)
 	require.EqualValues(t, 1, status.Stats.UpstreamErrors)
 }
+
+func TestCodexHistoryFilterRejectsOversizedSingleSegmentZstd(t *testing.T) {
+	router, _ := historyFilterRouter(t, true, func(c *gin.Context) { t.Error("oversized request was forwarded") })
+	encoder, err := zstd.NewWriter(nil, zstd.WithSingleSegment(true), zstd.WithEncoderConcurrency(1))
+	require.NoError(t, err)
+	compressed := encoder.EncodeAll(make([]byte, codexhistory.MaxBodySize+1), nil)
+	require.NoError(t, encoder.Close())
+	var header zstd.Header
+	require.NoError(t, header.Decode(compressed))
+	require.True(t, header.SingleSegment)
+	require.EqualValues(t, codexhistory.MaxBodySize+1, header.FrameContentSize)
+	response := historyFilterRequest(router, http.MethodPost, "/responses", compressed, map[string]string{"Content-Encoding": "zstd"})
+	require.Equal(t, http.StatusRequestEntityTooLarge, response.Code, response.Body.String())
+	require.Contains(t, response.Body.String(), `"code":"request_too_large"`)
+}
+
+func TestCodexHistoryFilterDoesNotInterceptModelNamedResponses(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	svc := service.NewSettingService(&panelRateLimitStubRepo{}, nil)
+	require.NoError(t, svc.SetCodexHistoryFilterEnabled(context.Background(), true))
+	filter := NewCodexHistoryFilter(svc)
+	router := gin.New()
+	router.Use(filter.Prepare, filter.Apply)
+	router.GET("/v1/models/:model", func(c *gin.Context) { c.Status(http.StatusOK) })
+	response := historyFilterRequest(router, http.MethodGet, "/v1/models/responses", nil, nil)
+	require.Equal(t, http.StatusOK, response.Code)
+}

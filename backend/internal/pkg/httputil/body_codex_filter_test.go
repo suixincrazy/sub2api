@@ -50,3 +50,26 @@ func TestCompressedBodiesPreserveContentAndEnforceDecodedLimit(t *testing.T) {
 		})
 	}
 }
+
+func TestZstdRequestPreservesLargeWindowCompatibility(t *testing.T) {
+	payload := []byte(samplePayload)
+	var compressed bytes.Buffer
+	encoder, err := zstd.NewWriter(&compressed, zstd.WithWindowSize(128<<20))
+	require.NoError(t, err)
+	_, err = encoder.Write(payload)
+	require.NoError(t, err)
+	require.NoError(t, encoder.Close())
+	frame := compressed.Bytes()
+	var header zstd.Header
+	require.NoError(t, header.Decode(frame))
+	header.SingleSegment = false
+	header.WindowSize = 128 << 20
+	wideHeader, err := header.AppendTo(nil)
+	require.NoError(t, err)
+	frame = append(wideHeader, frame[header.HeaderSize:]...)
+	require.NoError(t, header.Decode(frame))
+	require.EqualValues(t, 128<<20, header.WindowSize)
+	actual, err := ReadRequestBodyWithPrealloc(newRequestWithBody(t, frame, "zstd"))
+	require.NoError(t, err, "small requests remain valid with the existing zstd window limit")
+	require.Equal(t, payload, actual)
+}

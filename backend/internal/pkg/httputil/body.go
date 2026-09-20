@@ -174,7 +174,7 @@ func decompressRequestBodyLimit(encoding string, raw []byte, limit int64) ([]byt
 	var reader io.Reader
 	switch encoding {
 	case "zstd":
-		dec, err := zstd.NewReader(bytes.NewReader(raw), zstd.WithDecoderMaxMemory(maxDecompressedBodySize))
+		dec, err := zstd.NewReader(bytes.NewReader(raw))
 		if err != nil {
 			return nil, err
 		}
