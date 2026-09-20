@@ -47,6 +47,7 @@ func TestNativeCodexHistoryFilterMountedOnAllResponsesAliases(t *testing.T) {
 			{http.MethodGet, "/responses", ``, "websocket_filtering_unsupported", 426},
 			{http.MethodPost, "/responses/%20", `{"previous_response_id":"old"}`, "response_reference_not_portable", 400},
 			{http.MethodPost, "/responses/compact%20", `{}`, "encrypted_compaction_disabled", 409},
+			{http.MethodPost, "/responses/compact/detail", `{}`, "encrypted_compaction_disabled", 409},
 			{http.MethodPost, "/responses/responsesX", `{"previous_response_id":"old"}`, "response_reference_not_portable", 400},
 		} {
 			response := httptest.NewRecorder()
@@ -59,5 +60,5 @@ func TestNativeCodexHistoryFilterMountedOnAllResponsesAliases(t *testing.T) {
 	}
 	status, err := settings.GetCodexHistoryFilterStatus(context.Background())
 	require.NoError(t, err)
-	require.EqualValues(t, 21, status.Stats.BlockedRequests)
+	require.EqualValues(t, 24, status.Stats.BlockedRequests)
 }

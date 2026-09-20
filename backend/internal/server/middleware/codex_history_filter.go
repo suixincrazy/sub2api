@@ -33,7 +33,7 @@ func (f *CodexHistoryFilter) Prepare(c *gin.Context) {
 	}
 	suffix, valid := service.OpenAIResponsesRequestPathSuffix(c)
 	responses := valid && suffix == ""
-	compact := valid && suffix == "/compact"
+	compact := valid && (suffix == "/compact" || strings.HasPrefix(suffix, "/compact/"))
 	if (!responses && !compact) || (c.Request.Method != http.MethodPost && c.Request.Method != http.MethodGet) {
 		c.Next()
 		return
