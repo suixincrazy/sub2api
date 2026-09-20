@@ -1,5 +1,28 @@
 export default {
     settings: {
+      codexHistoryFilter: {
+        title: "Codex 历史过滤",
+        description: "在 Sub2API 内直接清理 Responses 历史，无需本地过滤层或 CC Switch。",
+        enabled: "启用 Codex 历史过滤",
+        saving: "正在保存…",
+        active: "已启用，立即对新请求生效。",
+        inactive: "已关闭，请求沿用网关原有处理。",
+        behavior: "移除历史 reasoning 和可重发消息、工具记录的顶层 ID；保留本轮推理强度、call_id 配对、消息内容及嵌套资源引用。固定 store=false，并移除 include 中的 reasoning.encrypted_content。",
+        boundaries: "仅支持 HTTP/SSE。压缩上下文、服务端会话或条目引用、其他加密上下文会被明确拒绝。历史内部推理会丢弃；遇到引用拒绝时，请用文本摘要开启新会话。此模式不支持浏览器直接发送 Responses 请求。",
+        filteredRequests: "过滤请求数",
+        removedReasoning: "移除推理项",
+        removedIds: "清理记录 ID",
+        blockedRequests: "拒绝请求数",
+        lastFiltered: "最近过滤时间",
+        lastStatus: "最近网关 HTTP 状态",
+        httpErrors: "HTTP 错误数",
+        transportErrors: "出现传输错误的请求",
+        none: "暂无",
+        statsHint: "统计仅覆盖当前服务进程，重启后清零。响应内容及网关原有重试规则保持不变。",
+        refresh: "刷新状态",
+        loadFailed: "无法读取过滤状态，请重试以确认当前设置。",
+        saveFailed: "保存请求未获确认，请刷新当前状态后重试。",
+      },
       title: '系统设置',
       description: '管理注册、邮箱验证、默认值和 SMTP 设置',
       tabs: {

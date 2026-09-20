@@ -259,6 +259,10 @@ vi.mock("vue-i18n", async () => {
   };
 });
 
+vi.mock("@/views/admin/settings/CodexHistoryFilterCard.vue", () => ({
+  default: { template: '<section data-testid="codex-history-filter-card" />' },
+}));
+
 const AppLayoutStub = { template: "<div><slot /></div>" };
 const ToggleStub = defineComponent({
   props: {

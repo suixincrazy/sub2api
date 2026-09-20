@@ -1566,7 +1566,40 @@ export async function resetWebSearchUsage(payload: {
   );
 }
 
+export interface CodexHistoryFilterStatus {
+  enabled: boolean;
+  filter_version: number;
+  stats: {
+    requests: number;
+    filtered_requests: number;
+    removed_reasoning_items: number;
+    removed_item_ids: number;
+    blocked_requests: number;
+    upstream_errors: number;
+    upstream_http_errors: number;
+    last_filtered_at: string | null;
+    last_upstream_status: number | null;
+  };
+}
+
+export async function getCodexHistoryFilter(): Promise<CodexHistoryFilterStatus> {
+  const { data } = await apiClient.get<CodexHistoryFilterStatus>(
+    "/admin/settings/codex-history-filter",
+  );
+  return data;
+}
+
+export async function updateCodexHistoryFilter(enabled: boolean): Promise<CodexHistoryFilterStatus> {
+  const { data } = await apiClient.put<CodexHistoryFilterStatus>(
+    "/admin/settings/codex-history-filter",
+    { enabled },
+  );
+  return data;
+}
+
 export const settingsAPI = {
+  getCodexHistoryFilter,
+  updateCodexHistoryFilter,
   getSettings,
   updateSettings,
   testSmtpConnection,

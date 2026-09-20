@@ -1,0 +1,832 @@
+[
+  {
+    "name": "full_history",
+    "input": {
+      "model": "mock-model",
+      "store": true,
+      "stream": true,
+      "reasoning": {
+        "effort": "xhigh",
+        "summary": "auto"
+      },
+      "include": [
+        "reasoning.encrypted_content",
+        "message.output_text.logprobs"
+      ],
+      "input": [
+        {
+          "role": "user",
+          "content": [
+            {
+              "type": "input_text",
+              "text": "你好"
+            },
+            {
+              "type": "input_image",
+              "image_url": "data:image/png;base64,AAAA"
+            }
+          ]
+        },
+        {
+          "type": "reasoning",
+          "id": "rs_old",
+          "encrypted_content": "foreign-account-ciphertext",
+          "summary": []
+        },
+        {
+          "type": "function_call",
+          "id": "fc_1",
+          "call_id": "call_1",
+          "name": "lookup",
+          "arguments": "{\"id\":\"business_1\"}"
+        },
+        {
+          "type": "function_call_output",
+          "id": "fco_1",
+          "call_id": "call_1",
+          "output": "result"
+        },
+        {
+          "type": "custom_tool_call",
+          "id": "ctc_1",
+          "call_id": "call_2",
+          "name": "exec",
+          "input": "a"
+        },
+        {
+          "type": "custom_tool_call_output",
+          "id": "ctco_1",
+          "call_id": "call_2",
+          "output": "ok"
+        },
+        {
+          "type": "message",
+          "id": "msg_old",
+          "role": "assistant",
+          "phase": "final_answer",
+          "content": [
+            {
+              "type": "output_text",
+              "text": "done",
+              "annotations": [
+                {
+                  "type": "file_citation",
+                  "file_id": "file_keep",
+                  "index": 0,
+                  "filename": "evidence.txt"
+                }
+              ]
+            }
+          ]
+        }
+      ]
+    },
+    "output": {
+      "model": "mock-model",
+      "store": false,
+      "stream": true,
+      "reasoning": {
+        "effort": "xhigh",
+        "summary": "auto"
+      },
+      "include": [
+        "message.output_text.logprobs"
+      ],
+      "input": [
+        {
+          "role": "user",
+          "content": [
+            {
+              "type": "input_text",
+              "text": "你好"
+            },
+            {
+              "type": "input_image",
+              "image_url": "data:image/png;base64,AAAA"
+            }
+          ]
+        },
+        {
+          "type": "function_call",
+          "call_id": "call_1",
+          "name": "lookup",
+          "arguments": "{\"id\":\"business_1\"}"
+        },
+        {
+          "type": "function_call_output",
+          "call_id": "call_1",
+          "output": "result"
+        },
+        {
+          "type": "custom_tool_call",
+          "call_id": "call_2",
+          "name": "exec",
+          "input": "a"
+        },
+        {
+          "type": "custom_tool_call_output",
+          "call_id": "call_2",
+          "output": "ok"
+        },
+        {
+          "type": "message",
+          "role": "assistant",
+          "phase": "final_answer",
+          "content": [
+            {
+              "type": "output_text",
+              "text": "done",
+              "annotations": [
+                {
+                  "type": "file_citation",
+                  "file_id": "file_keep",
+                  "index": 0,
+                  "filename": "evidence.txt"
+                }
+              ]
+            }
+          ]
+        }
+      ]
+    },
+    "removed_reasoning_items": 1,
+    "removed_item_ids": 5
+  },
+  {
+    "name": "string_input",
+    "input": {
+      "input": "hello"
+    },
+    "output": {
+      "input": "hello",
+      "store": false
+    },
+    "removed_reasoning_items": 0,
+    "removed_item_ids": 0
+  },
+  {
+    "name": "empty_object",
+    "input": {},
+    "output": {
+      "store": false
+    },
+    "removed_reasoning_items": 0,
+    "removed_item_ids": 0
+  },
+  {
+    "name": "preserve_current_effort",
+    "input": {
+      "input": [],
+      "reasoning": {
+        "effort": "ultra",
+        "summary": "detailed"
+      },
+      "metadata": {
+        "nested": {
+          "id": "keep"
+        }
+      }
+    },
+    "output": {
+      "input": [],
+      "reasoning": {
+        "effort": "ultra",
+        "summary": "detailed"
+      },
+      "metadata": {
+        "nested": {
+          "id": "keep"
+        }
+      },
+      "store": false
+    },
+    "removed_reasoning_items": 0,
+    "removed_item_ids": 0
+  },
+  {
+    "name": "include_types",
+    "input": {
+      "include": [
+        "reasoning.encrypted_content",
+        1,
+        null,
+        "reasoning.encrypted_content",
+        {
+          "key": "keep"
+        }
+      ]
+    },
+    "output": {
+      "include": [
+        1,
+        null,
+        {
+          "key": "keep"
+        }
+      ],
+      "store": false
+    },
+    "removed_reasoning_items": 0,
+    "removed_item_ids": 0
+  },
+  {
+    "name": "resource_ids",
+    "input": {
+      "input": [
+        {
+          "id": "msg_shorthand",
+          "role": "user",
+          "content": [
+            {
+              "type": "input_file",
+              "file_id": "file_keep",
+              "id": "nested_keep"
+            }
+          ]
+        },
+        {
+          "type": "file_search_call",
+          "id": "required",
+          "results": []
+        },
+        {
+          "type": null,
+          "id": "keep",
+          "role": "assistant",
+          "content": null
+        }
+      ]
+    },
+    "output": {
+      "input": [
+        {
+          "role": "user",
+          "content": [
+            {
+              "type": "input_file",
+              "file_id": "file_keep",
+              "id": "nested_keep"
+            }
+          ]
+        },
+        {
+          "type": "file_search_call",
+          "id": "required",
+          "results": []
+        },
+        {
+          "type": null,
+          "id": "keep",
+          "role": "assistant",
+          "content": null
+        }
+      ],
+      "store": false
+    },
+    "removed_reasoning_items": 0,
+    "removed_item_ids": 1
+  },
+  {
+    "name": "primitive_items",
+    "input": {
+      "input": [
+        null,
+        true,
+        12,
+        "keep",
+        [],
+        {}
+      ]
+    },
+    "output": {
+      "input": [
+        null,
+        true,
+        12,
+        "keep",
+        [],
+        {}
+      ],
+      "store": false
+    },
+    "removed_reasoning_items": 0,
+    "removed_item_ids": 0
+  },
+  {
+    "name": "null_content_shorthand",
+    "input": {
+      "input": [
+        {
+          "id": null,
+          "role": "assistant",
+          "content": null
+        }
+      ]
+    },
+    "output": {
+      "input": [
+        {
+          "role": "assistant",
+          "content": null
+        }
+      ],
+      "store": false
+    },
+    "removed_reasoning_items": 0,
+    "removed_item_ids": 1
+  },
+  {
+    "name": "previous_response_id_\"resp_old\"",
+    "input": {
+      "previous_response_id": "resp_old"
+    },
+    "error_code": "response_reference_not_portable",
+    "status": 400
+  },
+  {
+    "name": "previous_response_id_{}",
+    "input": {
+      "previous_response_id": {}
+    },
+    "error_code": "response_reference_not_portable",
+    "status": 400
+  },
+  {
+    "name": "previous_response_id_[]",
+    "input": {
+      "previous_response_id": []
+    },
+    "error_code": "response_reference_not_portable",
+    "status": 400
+  },
+  {
+    "name": "previous_response_id_null",
+    "input": {
+      "previous_response_id": null
+    },
+    "output": {
+      "previous_response_id": null,
+      "store": false
+    },
+    "removed_reasoning_items": 0,
+    "removed_item_ids": 0
+  },
+  {
+    "name": "previous_response_id_false",
+    "input": {
+      "previous_response_id": false
+    },
+    "output": {
+      "previous_response_id": false,
+      "store": false
+    },
+    "removed_reasoning_items": 0,
+    "removed_item_ids": 0
+  },
+  {
+    "name": "previous_response_id_0",
+    "input": {
+      "previous_response_id": 0
+    },
+    "output": {
+      "previous_response_id": 0,
+      "store": false
+    },
+    "removed_reasoning_items": 0,
+    "removed_item_ids": 0
+  },
+  {
+    "name": "previous_response_id_\"\"",
+    "input": {
+      "previous_response_id": ""
+    },
+    "output": {
+      "previous_response_id": "",
+      "store": false
+    },
+    "removed_reasoning_items": 0,
+    "removed_item_ids": 0
+  },
+  {
+    "name": "conversation_\"resp_old\"",
+    "input": {
+      "conversation": "resp_old"
+    },
+    "error_code": "response_reference_not_portable",
+    "status": 400
+  },
+  {
+    "name": "conversation_{}",
+    "input": {
+      "conversation": {}
+    },
+    "error_code": "response_reference_not_portable",
+    "status": 400
+  },
+  {
+    "name": "conversation_[]",
+    "input": {
+      "conversation": []
+    },
+    "error_code": "response_reference_not_portable",
+    "status": 400
+  },
+  {
+    "name": "conversation_null",
+    "input": {
+      "conversation": null
+    },
+    "output": {
+      "conversation": null,
+      "store": false
+    },
+    "removed_reasoning_items": 0,
+    "removed_item_ids": 0
+  },
+  {
+    "name": "conversation_false",
+    "input": {
+      "conversation": false
+    },
+    "output": {
+      "conversation": false,
+      "store": false
+    },
+    "removed_reasoning_items": 0,
+    "removed_item_ids": 0
+  },
+  {
+    "name": "conversation_0",
+    "input": {
+      "conversation": 0
+    },
+    "output": {
+      "conversation": 0,
+      "store": false
+    },
+    "removed_reasoning_items": 0,
+    "removed_item_ids": 0
+  },
+  {
+    "name": "conversation_\"\"",
+    "input": {
+      "conversation": ""
+    },
+    "output": {
+      "conversation": "",
+      "store": false
+    },
+    "removed_reasoning_items": 0,
+    "removed_item_ids": 0
+  },
+  {
+    "name": "validation_22",
+    "input": null,
+    "error_code": "invalid_request_json",
+    "status": 400
+  },
+  {
+    "name": "validation_23",
+    "input": [],
+    "error_code": "invalid_request_json",
+    "status": 400
+  },
+  {
+    "name": "validation_24",
+    "input": true,
+    "error_code": "invalid_request_json",
+    "status": 400
+  },
+  {
+    "name": "validation_25",
+    "input": 12,
+    "error_code": "invalid_request_json",
+    "status": 400
+  },
+  {
+    "name": "validation_26",
+    "input": {
+      "include": null
+    },
+    "error_code": "invalid_include",
+    "status": 400
+  },
+  {
+    "name": "validation_27",
+    "input": {
+      "include": "x"
+    },
+    "error_code": "invalid_include",
+    "status": 400
+  },
+  {
+    "name": "validation_28",
+    "input": {
+      "input": null
+    },
+    "error_code": "invalid_input",
+    "status": 400
+  },
+  {
+    "name": "validation_29",
+    "input": {
+      "input": false
+    },
+    "error_code": "invalid_input",
+    "status": 400
+  },
+  {
+    "name": "validation_30",
+    "input": {
+      "input": {}
+    },
+    "error_code": "invalid_input",
+    "status": 400
+  },
+  {
+    "name": "validation_31",
+    "input": {
+      "context_management": [
+        null,
+        12,
+        {
+          "type": "compaction"
+        }
+      ]
+    },
+    "error_code": "encrypted_compaction_disabled",
+    "status": 400
+  },
+  {
+    "name": "validation_32",
+    "input": {
+      "context_management": [
+        null,
+        12,
+        {}
+      ]
+    },
+    "output": {
+      "context_management": [
+        null,
+        12,
+        {}
+      ],
+      "store": false
+    },
+    "removed_reasoning_items": 0,
+    "removed_item_ids": 0
+  },
+  {
+    "name": "validation_33",
+    "input": {
+      "input": [
+        {
+          "type": "compaction"
+        }
+      ]
+    },
+    "error_code": "encrypted_context_not_portable",
+    "status": 400
+  },
+  {
+    "name": "validation_34",
+    "input": {
+      "input": [
+        {
+          "type": "item_reference",
+          "id": "old"
+        }
+      ]
+    },
+    "error_code": "encrypted_context_not_portable",
+    "status": 400
+  },
+  {
+    "name": "encrypted_null",
+    "input": {
+      "input": [
+        {
+          "type": "opaque",
+          "encrypted_content": null
+        }
+      ]
+    },
+    "output": {
+      "input": [
+        {
+          "type": "opaque",
+          "encrypted_content": null
+        }
+      ],
+      "store": false
+    },
+    "removed_reasoning_items": 0,
+    "removed_item_ids": 0
+  },
+  {
+    "name": "encrypted_false",
+    "input": {
+      "input": [
+        {
+          "type": "opaque",
+          "encrypted_content": false
+        }
+      ]
+    },
+    "output": {
+      "input": [
+        {
+          "type": "opaque",
+          "encrypted_content": false
+        }
+      ],
+      "store": false
+    },
+    "removed_reasoning_items": 0,
+    "removed_item_ids": 0
+  },
+  {
+    "name": "encrypted_0",
+    "input": {
+      "input": [
+        {
+          "type": "opaque",
+          "encrypted_content": 0
+        }
+      ]
+    },
+    "output": {
+      "input": [
+        {
+          "type": "opaque",
+          "encrypted_content": 0
+        }
+      ],
+      "store": false
+    },
+    "removed_reasoning_items": 0,
+    "removed_item_ids": 0
+  },
+  {
+    "name": "encrypted_\"\"",
+    "input": {
+      "input": [
+        {
+          "type": "opaque",
+          "encrypted_content": ""
+        }
+      ]
+    },
+    "output": {
+      "input": [
+        {
+          "type": "opaque",
+          "encrypted_content": ""
+        }
+      ],
+      "store": false
+    },
+    "removed_reasoning_items": 0,
+    "removed_item_ids": 0
+  },
+  {
+    "name": "encrypted_[]",
+    "input": {
+      "input": [
+        {
+          "type": "opaque",
+          "encrypted_content": []
+        }
+      ]
+    },
+    "error_code": "encrypted_context_not_portable",
+    "status": 400
+  },
+  {
+    "name": "encrypted_{}",
+    "input": {
+      "input": [
+        {
+          "type": "opaque",
+          "encrypted_content": {}
+        }
+      ]
+    },
+    "error_code": "encrypted_context_not_portable",
+    "status": 400
+  },
+  {
+    "name": "encrypted_\"ciphertext\"",
+    "input": {
+      "input": [
+        {
+          "type": "opaque",
+          "encrypted_content": "ciphertext"
+        }
+      ]
+    },
+    "error_code": "encrypted_context_not_portable",
+    "status": 400
+  },
+  {
+    "name": "item_id_null",
+    "input": {
+      "input": [
+        {
+          "type": "function_call",
+          "id": null,
+          "call_id": "keep",
+          "arguments": "{}"
+        }
+      ]
+    },
+    "output": {
+      "input": [
+        {
+          "type": "function_call",
+          "call_id": "keep",
+          "arguments": "{}"
+        }
+      ],
+      "store": false
+    },
+    "removed_reasoning_items": 0,
+    "removed_item_ids": 1
+  },
+  {
+    "name": "item_id_false",
+    "input": {
+      "input": [
+        {
+          "type": "function_call",
+          "id": false,
+          "call_id": "keep",
+          "arguments": "{}"
+        }
+      ]
+    },
+    "output": {
+      "input": [
+        {
+          "type": "function_call",
+          "call_id": "keep",
+          "arguments": "{}"
+        }
+      ],
+      "store": false
+    },
+    "removed_reasoning_items": 0,
+    "removed_item_ids": 1
+  },
+  {
+    "name": "item_id_0",
+    "input": {
+      "input": [
+        {
+          "type": "function_call",
+          "id": 0,
+          "call_id": "keep",
+          "arguments": "{}"
+        }
+      ]
+    },
+    "output": {
+      "input": [
+        {
+          "type": "function_call",
+          "call_id": "keep",
+          "arguments": "{}"
+        }
+      ],
+      "store": false
+    },
+    "removed_reasoning_items": 0,
+    "removed_item_ids": 1
+  },
+  {
+    "name": "item_id_\"\"",
+    "input": {
+      "input": [
+        {
+          "type": "function_call",
+          "id": "",
+          "call_id": "keep",
+          "arguments": "{}"
+        }
+      ]
+    },
+    "output": {
+      "input": [
+        {
+          "type": "function_call",
+          "call_id": "keep",
+          "arguments": "{}"
+        }
+      ],
+      "store": false
+    },
+    "removed_reasoning_items": 0,
+    "removed_item_ids": 1
+  }
+]

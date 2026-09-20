@@ -99,12 +99,12 @@ func TestReadRequestBodyWithPrealloc_DecodesDeflate(t *testing.T) {
 }
 
 func TestReadRequestBodyWithPrealloc_RejectsUnsupportedEncoding(t *testing.T) {
-	req := newRequestWithBody(t, []byte(samplePayload), "br")
+	req := newRequestWithBody(t, []byte(samplePayload), "compress")
 	_, err := ReadRequestBodyWithPrealloc(req)
 	if err == nil {
 		t.Fatal("expected error for unsupported encoding, got nil")
 	}
-	if !strings.Contains(err.Error(), "br") {
+	if !strings.Contains(err.Error(), "compress") {
 		t.Fatalf("error should mention encoding, got %v", err)
 	}
 }

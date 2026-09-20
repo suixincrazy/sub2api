@@ -1,5 +1,28 @@
 export default {
     settings: {
+      codexHistoryFilter: {
+        title: "Codex history filter",
+        description: "Clean Responses history inside Sub2API without a local filter or CC Switch.",
+        enabled: "Enable Codex history filtering",
+        saving: "Saving…",
+        active: "Enabled; changes apply to new requests immediately.",
+        inactive: "Disabled; requests follow the existing gateway behavior.",
+        behavior: "Remove historical reasoning and optional message/tool item IDs; retain current reasoning effort, call_id pairs, message contents and nested resource references. Force store=false and remove reasoning.encrypted_content from include.",
+        boundaries: "Uses HTTP/SSE only. Compaction, server-side conversation/item references and other encrypted context are rejected explicitly. Historical reasoning is discarded; use a text summary in a new session when a context reference is rejected. Browser Responses requests are not supported in this mode.",
+        filteredRequests: "Filtered requests",
+        removedReasoning: "Reasoning items removed",
+        removedIds: "Item IDs removed",
+        blockedRequests: "Blocked requests",
+        lastFiltered: "Last filtered request",
+        lastStatus: "Last gateway HTTP status",
+        httpErrors: "HTTP errors",
+        transportErrors: "Requests with transport errors",
+        none: "None yet",
+        statsHint: "Counts cover this server process and reset on restart. Responses and existing gateway retry rules are unchanged.",
+        refresh: "Refresh status",
+        loadFailed: "Could not load filter status. Retry to view the current setting.",
+        saveFailed: "The save request was not confirmed. Refresh the current status before retrying.",
+      },
       title: 'System Settings',
       description: 'Manage registration, email verification, default values, and SMTP settings',
       tabs: {
