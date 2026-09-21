@@ -25,10 +25,10 @@
         </p>
         <p class="text-sm text-gray-600 dark:text-gray-400">{{ t('admin.settings.codexHistoryFilter.behavior') }}</p>
         <p class="text-sm text-gray-600 dark:text-gray-400">{{ t('admin.settings.codexHistoryFilter.boundaries') }}</p>
-        <dl class="grid grid-cols-2 gap-4 md:grid-cols-4">
+        <dl class="grid grid-cols-2 gap-4 md:grid-cols-5">
           <div v-for="metric in metrics" :key="metric.key" class="rounded-lg bg-gray-50 p-3 dark:bg-dark-800">
             <dt class="text-xs text-gray-500 dark:text-gray-400">{{ t(`admin.settings.codexHistoryFilter.${metric.label}`) }}</dt>
-            <dd class="mt-1 text-xl font-semibold text-gray-900 dark:text-white">{{ status.stats[metric.key].toLocaleString() }}</dd>
+            <dd class="mt-1 text-xl font-semibold text-gray-900 dark:text-white">{{ (status.stats[metric.key] ?? 0).toLocaleString() }}</dd>
           </div>
         </dl>
         <dl class="grid gap-2 text-sm sm:grid-cols-2">
@@ -61,6 +61,7 @@ const metrics = [
   { key: 'filtered_requests', label: 'filteredRequests' },
   { key: 'removed_reasoning_items', label: 'removedReasoning' },
   { key: 'removed_item_ids', label: 'removedIds' },
+  { key: 'normalized_agent_text_parts', label: 'normalizedAgentText' },
   { key: 'blocked_requests', label: 'blockedRequests' },
 ] as const
 const lastFiltered = computed(() => status.value?.stats.last_filtered_at

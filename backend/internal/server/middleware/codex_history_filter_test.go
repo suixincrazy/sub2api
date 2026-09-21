@@ -277,3 +277,40 @@ func TestCodexHistoryFilterDoesNotInterceptModelNamedResponses(t *testing.T) {
 	response := historyFilterRequest(router, http.MethodGet, "/v1/models/responses", nil, nil)
 	require.Equal(t, http.StatusOK, response.Code)
 }
+
+func TestCodexHistoryFilterPortableHistoryAndMetrics(t *testing.T) {
+	body := []byte(`{"model":"mock-model","input":[{"type":"web_search_call","id":"ws_foreign","status":"completed","action":{"type":"search","query":"notes"}},{"type":"agent_message","id":"amsg_foreign","author":"/root/a","recipient":"/root","content":[{"type":"encrypted_content","encrypted_content":"Agent checks passed."}]}]}`)
+	router, svc := historyFilterRouter(t, true, func(c *gin.Context) {
+		filtered, err := httputil.ReadRequestBodyWithPrealloc(c.Request)
+		require.NoError(t, err)
+		require.NotContains(t, string(filtered), "ws_foreign")
+		require.NotContains(t, string(filtered), "amsg_foreign")
+		require.NotContains(t, string(filtered), "encrypted_content")
+		require.Contains(t, string(filtered), `"type":"input_text"`)
+		require.Contains(t, string(filtered), "Agent checks passed.")
+		require.Contains(t, string(filtered), `"query":"notes"`)
+		require.EqualValues(t, len(filtered), c.Request.ContentLength)
+		c.Data(200, "application/json", []byte(`{"status":"completed"}`))
+	})
+	for _, path := range []string{"/responses", "/v1/responses", "/backend-api/codex/responses"} {
+		response := historyFilterRequest(router, http.MethodPost, path, body, nil)
+		require.Equal(t, 200, response.Code)
+	}
+	status, err := svc.GetCodexHistoryFilterStatus(context.Background())
+	require.NoError(t, err)
+	require.Equal(t, 3, status.FilterVersion)
+	require.EqualValues(t, 6, status.Stats.RemovedItemIDs)
+	require.EqualValues(t, 3, status.Stats.NormalizedAgentTextParts)
+	require.Zero(t, status.Stats.RemovedReasoningItems)
+	require.NoError(t, svc.SetCodexHistoryFilterEnabled(context.Background(), false))
+	disabled := NewCodexHistoryFilter(svc)
+	plain := gin.New()
+	plain.POST("/responses", disabled.Prepare, disabled.Apply, func(c *gin.Context) {
+		unfiltered, err := httputil.ReadRequestBodyWithPrealloc(c.Request)
+		require.NoError(t, err)
+		require.Equal(t, body, unfiltered)
+		c.Status(200)
+	})
+	response := historyFilterRequest(plain, http.MethodPost, "/responses", body, nil)
+	require.Equal(t, 200, response.Code)
+}

@@ -34,7 +34,7 @@ func TestCodexHistorySettingsPersistAndToggleImmediately(t *testing.T) {
 		require.NoError(t, err)
 		require.Equal(t, enabled, status.Enabled, "a new process must recover the saved setting")
 	}
-	svc.RecordCodexHistoryFiltered(2, 3)
+	svc.RecordCodexHistoryFiltered(2, 3, 4)
 	status, err = NewSettingService(repo, nil).GetCodexHistoryFilterStatus(ctx)
 	require.NoError(t, err)
 	require.True(t, status.Enabled)
@@ -69,7 +69,7 @@ func TestCodexHistoryStatsConcurrentAndSnapshotsImmutable(t *testing.T) {
 		workers.Add(1)
 		go func() {
 			defer workers.Done()
-			svc.RecordCodexHistoryFiltered(2, 3)
+			svc.RecordCodexHistoryFiltered(2, 3, 4)
 			svc.RecordCodexHistoryBlocked()
 			svc.RecordCodexHistoryResponse(429, true)
 		}()
@@ -81,6 +81,7 @@ func TestCodexHistoryStatsConcurrentAndSnapshotsImmutable(t *testing.T) {
 	require.EqualValues(t, 100, status.Stats.FilteredRequests)
 	require.EqualValues(t, 200, status.Stats.RemovedReasoningItems)
 	require.EqualValues(t, 300, status.Stats.RemovedItemIDs)
+	require.EqualValues(t, 400, status.Stats.NormalizedAgentTextParts)
 	require.EqualValues(t, 100, status.Stats.BlockedRequests)
 	require.EqualValues(t, 100, status.Stats.UpstreamErrors)
 	require.EqualValues(t, 100, status.Stats.UpstreamHTTPErrors)

@@ -1574,6 +1574,7 @@ export interface CodexHistoryFilterStatus {
     filtered_requests: number;
     removed_reasoning_items: number;
     removed_item_ids: number;
+    normalized_agent_text_parts: number;
     blocked_requests: number;
     upstream_errors: number;
     upstream_http_errors: number;

@@ -35,7 +35,7 @@ func TestCodexHistoryFilterAdminSettings(t *testing.T) {
 		read := httptest.NewRecorder()
 		router.ServeHTTP(read, httptest.NewRequest(http.MethodGet, "/filter", nil))
 		require.Equal(t, response.Body.String(), read.Body.String())
-		require.Contains(t, read.Body.String(), `"filter_version":2`)
+		require.Contains(t, read.Body.String(), `"filter_version":3`)
 	}
 	require.Equal(t, "false", repo.values[service.SettingKeyCodexHistoryFilterEnabled])
 }

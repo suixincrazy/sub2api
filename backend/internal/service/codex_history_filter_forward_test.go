@@ -42,10 +42,25 @@ func TestCodexHistoryFilterSurvivesAccountTransformsAndRetries(t *testing.T) {
 						require.Equal(t, "xhigh", gjson.GetBytes(body, "reasoning.effort").String())
 						require.NotContains(t, string(body), "reasoning.encrypted_content")
 						require.NotContains(t, string(body), "foreign-ciphertext")
+						var sawWebSearch, sawAgent bool
 						for _, item := range gjson.GetBytes(body, "input").Array() {
 							require.NotEqual(t, "reasoning", item.Get("type").String())
 							require.False(t, item.Get("id").Exists())
+							switch item.Get("type").String() {
+							case "web_search_call":
+								sawWebSearch = true
+								require.Equal(t, "release notes", item.Get("action.query").String())
+								require.Equal(t, "completed", item.Get("status").String())
+							case "agent_message":
+								sawAgent = true
+								require.Equal(t, "/root/review", item.Get("author").String())
+								require.Equal(t, "input_text", item.Get("content.1.type").String())
+								require.Equal(t, "Portable agent result.", item.Get("content.1.text").String())
+								require.False(t, item.Get("content.1.encrypted_content").Exists())
+							}
 						}
+						require.True(t, sawWebSearch, "search history must survive account transforms")
+						require.True(t, sawAgent, "agent task/result history must survive account transforms")
 						require.EqualValues(t, len(body), request.ContentLength)
 						if attempt == 1 {
 							return &http.Response{StatusCode: 429, Header: http.Header{}, Body: io.NopCloser(strings.NewReader(`{"error":{"type":"rate_limit_error","message":"slow down"}}`))}
@@ -63,7 +78,7 @@ func TestCodexHistoryFilterSurvivesAccountTransformsAndRetries(t *testing.T) {
 					c, _ := newTransportFailoverTestContext(t)
 					ctx := codexhistory.WithEnabled(context.Background())
 					c.Request = c.Request.WithContext(ctx)
-					body := []byte(`{"model":"gpt-5.4","instructions":"test","store":true,"stream":false,"reasoning":{"effort":"xhigh"},"include":["reasoning.encrypted_content"],"input":[{"type":"message","id":"old-message","role":"user","content":[{"type":"input_text","text":"hello"}]},{"type":"reasoning","encrypted_content":"foreign-ciphertext"}]}`)
+					body := []byte(`{"model":"gpt-5.4","instructions":"test","store":true,"stream":false,"reasoning":{"effort":"xhigh"},"include":["reasoning.encrypted_content"],"input":[{"type":"message","id":"old-message","role":"user","content":[{"type":"input_text","text":"hello"}]},{"type":"reasoning","encrypted_content":"foreign-ciphertext"},{"type":"web_search_call","id":"ws_foreign","status":"completed","action":{"type":"search","query":"release notes"}},{"type":"agent_message","id":"amsg_foreign","author":"/root/review","recipient":"/root","content":[{"type":"input_text","text":"Result: "},{"type":"encrypted_content","encrypted_content":"Portable agent result."}]}]}`)
 					_, err := svc.Forward(ctx, c, account, body)
 					require.NoError(t, err)
 					require.Equal(t, 2, upstream.calls, "retain the gateway's existing 429 retry policy")

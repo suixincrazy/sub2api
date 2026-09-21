@@ -6,7 +6,7 @@ import { getCodexHistoryFilter, updateCodexHistoryFilter } from '@/api/admin/set
 describe('Codex history filter API', () => {
   beforeEach(() => { vi.clearAllMocks() })
   it('reads status from the authenticated settings endpoint', async () => {
-    const value = { enabled: true, filter_version: 2, stats: { filtered_requests: 4 } }
+    const value = { enabled: true, filter_version: 3, stats: { filtered_requests: 4 } }
     client.get.mockResolvedValue({ data: value })
     expect(await getCodexHistoryFilter()).toBe(value)
     expect(client.get).toHaveBeenCalledWith('/admin/settings/codex-history-filter')

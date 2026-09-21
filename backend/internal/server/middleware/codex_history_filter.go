@@ -130,9 +130,9 @@ func (f *CodexHistoryFilter) Apply(c *gin.Context) {
 	c.Request.Header.Del("Expect")
 	c.Request.Header.Set("Content-Type", "application/json")
 	c.Request.TransferEncoding = nil
-	f.settings.RecordCodexHistoryFiltered(result.RemovedReasoningItems, result.RemovedItemIDs)
+	f.settings.RecordCodexHistoryFiltered(result.RemovedReasoningItems, result.RemovedItemIDs, result.NormalizedAgentTextParts)
 	c.Set(codexHistoryFilteredKey, true)
-	slog.InfoContext(c.Request.Context(), "codex_history_filtered", "removed_reasoning_items", result.RemovedReasoningItems, "removed_item_ids", result.RemovedItemIDs)
+	slog.InfoContext(c.Request.Context(), "codex_history_filtered", "removed_reasoning_items", result.RemovedReasoningItems, "removed_item_ids", result.RemovedItemIDs, "normalized_agent_text_parts", result.NormalizedAgentTextParts)
 	c.Next()
 }
 

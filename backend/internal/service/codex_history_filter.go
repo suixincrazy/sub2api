@@ -15,15 +15,16 @@ const SettingKeyCodexHistoryFilterEnabled = "codex_history_filter_enabled"
 const codexHistoryFilterSettingsTTL = 30 * time.Second
 
 type CodexHistoryFilterStats struct {
-	Requests              int64      `json:"requests"`
-	FilteredRequests      int64      `json:"filtered_requests"`
-	RemovedReasoningItems int64      `json:"removed_reasoning_items"`
-	RemovedItemIDs        int64      `json:"removed_item_ids"`
-	BlockedRequests       int64      `json:"blocked_requests"`
-	UpstreamErrors        int64      `json:"upstream_errors"`
-	UpstreamHTTPErrors    int64      `json:"upstream_http_errors"`
-	LastFilteredAt        *time.Time `json:"last_filtered_at"`
-	LastUpstreamStatus    *int       `json:"last_upstream_status"`
+	Requests                 int64      `json:"requests"`
+	FilteredRequests         int64      `json:"filtered_requests"`
+	RemovedReasoningItems    int64      `json:"removed_reasoning_items"`
+	RemovedItemIDs           int64      `json:"removed_item_ids"`
+	NormalizedAgentTextParts int64      `json:"normalized_agent_text_parts"`
+	BlockedRequests          int64      `json:"blocked_requests"`
+	UpstreamErrors           int64      `json:"upstream_errors"`
+	UpstreamHTTPErrors       int64      `json:"upstream_http_errors"`
+	LastFilteredAt           *time.Time `json:"last_filtered_at"`
+	LastUpstreamStatus       *int       `json:"last_upstream_status"`
 }
 
 type CodexHistoryFilterStatus struct {
@@ -95,7 +96,7 @@ func (s *SettingService) GetCodexHistoryFilterStatus(ctx context.Context) (*Code
 	return status, nil
 }
 
-func (s *SettingService) RecordCodexHistoryFiltered(reasoningItems, itemIDs int) {
+func (s *SettingService) RecordCodexHistoryFiltered(reasoningItems, itemIDs, agentTextParts int) {
 	runtime := &s.codexHistoryFilter
 	runtime.statsMu.Lock()
 	defer runtime.statsMu.Unlock()
@@ -104,6 +105,7 @@ func (s *SettingService) RecordCodexHistoryFiltered(reasoningItems, itemIDs int)
 	runtime.stats.FilteredRequests++
 	runtime.stats.RemovedReasoningItems += int64(reasoningItems)
 	runtime.stats.RemovedItemIDs += int64(itemIDs)
+	runtime.stats.NormalizedAgentTextParts += int64(agentTextParts)
 	runtime.stats.LastFilteredAt = &now
 }
 

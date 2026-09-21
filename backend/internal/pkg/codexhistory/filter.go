@@ -6,9 +6,10 @@ import (
 	"context"
 	"encoding/json"
 	"net/http"
+	"strings"
 )
 
-const Version = 2
+const Version = 3
 const MaxBodySize int64 = 64 << 20
 
 type enabledKey struct{}
@@ -34,9 +35,10 @@ func Invalid(code, message string) *Error {
 }
 
 type Result struct {
-	Body                  []byte
-	RemovedReasoningItems int
-	RemovedItemIDs        int
+	Body                     []byte
+	RemovedReasoningItems    int
+	RemovedItemIDs           int
+	NormalizedAgentTextParts int
 }
 
 // Filter only removes replayable item IDs, never call_id or nested resource IDs.
@@ -102,13 +104,24 @@ func Filter(body []byte) (Result, error) {
 			_, hasContent := item["content"]
 			portable := !hasType && isString(item["role"]) && hasContent
 			switch kind {
-			case "message", "function_call", "function_call_output", "custom_tool_call", "custom_tool_call_output":
+			case "message", "function_call", "function_call_output", "custom_tool_call", "custom_tool_call_output",
+				"web_search_call", "agent_message", "tool_search_call", "tool_search_output":
 				portable = true
 			}
+			changed := false
 			if _, hasID := item["id"]; hasID && portable {
 				delete(item, "id")
-				raw, _ = json.Marshal(item)
 				result.RemovedItemIDs++
+				changed = true
+			}
+			if kind == "agent_message" {
+				if count := normalizeAgentTextContent(item); count > 0 {
+					result.NormalizedAgentTextParts += count
+					changed = true
+				}
+			}
+			if changed {
+				raw, _ = json.Marshal(item)
 			}
 			kept = append(kept, raw)
 		}
@@ -117,6 +130,47 @@ func Filter(body []byte) (Result, error) {
 	var err error
 	result.Body, err = json.Marshal(fields)
 	return result, err
+}
+
+// Some custom providers store visible agent text in encrypted_content parts.
+// Opaque agent payloads carry task/result content, so retain them losslessly.
+func normalizeAgentTextContent(item map[string]json.RawMessage) int {
+	if !isArray(item["content"]) {
+		return 0
+	}
+	var parts []json.RawMessage
+	_ = json.Unmarshal(item["content"], &parts)
+	count := 0
+	for i, raw := range parts {
+		var part map[string]json.RawMessage
+		if json.Unmarshal(raw, &part) != nil || stringValue(part["type"]) != "encrypted_content" || !isString(part["encrypted_content"]) {
+			continue
+		}
+		text := stringValue(part["encrypted_content"])
+		if opaqueAgentContent(text) {
+			continue
+		}
+		part["type"] = json.RawMessage(`"input_text"`)
+		part["text"] = part["encrypted_content"]
+		delete(part, "encrypted_content")
+		parts[i], _ = json.Marshal(part)
+		count++
+	}
+	if count > 0 {
+		item["content"], _ = json.Marshal(parts)
+	}
+	return count
+}
+
+func opaqueAgentContent(text string) bool {
+	text = strings.TrimSpace(text)
+	if strings.HasPrefix(text, "gAAAA") {
+		return true
+	}
+	// Preserve unknown encoded tokens instead of guessing they are visible text.
+	return len(text) >= 64 && strings.IndexFunc(text, func(r rune) bool {
+		return !(r >= 'a' && r <= 'z' || r >= 'A' && r <= 'Z' || r >= '0' && r <= '9' || strings.ContainsRune("_-/+=.:", r))
+	}) == -1
 }
 
 // Apply enforces the same policy after account-specific request normalization.

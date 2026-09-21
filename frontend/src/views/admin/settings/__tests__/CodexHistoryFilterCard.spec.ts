@@ -9,9 +9,9 @@ vi.mock('vue-i18n', () => ({ useI18n: () => ({ t: (key: string) => key }) }))
 
 const state = (enabled = false, filteredRequests = 12): CodexHistoryFilterStatus => ({
   enabled,
-  filter_version: 2,
+  filter_version: 3,
   stats: { requests: filteredRequests, filtered_requests: filteredRequests,
-    removed_reasoning_items: 3, removed_item_ids: 9, blocked_requests: 2,
+    removed_reasoning_items: 3, removed_item_ids: 9, normalized_agent_text_parts: 7, blocked_requests: 2,
     upstream_errors: 1, upstream_http_errors: 4,
     last_filtered_at: '2026-09-20T12:00:00Z', last_upstream_status: 200 },
 })
@@ -29,6 +29,8 @@ describe('CodexHistoryFilterCard', () => {
     expect(wrapper.get('[role="switch"]').attributes('aria-checked')).toBe('false')
     expect(wrapper.get('[role="switch"]').attributes('aria-label')).toBe('admin.settings.codexHistoryFilter.enabled')
     expect(wrapper.text()).toContain('12')
+    expect(wrapper.text()).toContain('admin.settings.codexHistoryFilter.normalizedAgentText')
+    expect(wrapper.text()).toContain('7')
     expect(wrapper.text()).toContain('admin.settings.codexHistoryFilter.boundaries')
     expect(wrapper.text()).toContain('admin.settings.codexHistoryFilter.statsHint')
   })
