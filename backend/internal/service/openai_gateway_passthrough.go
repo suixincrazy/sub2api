@@ -934,8 +934,22 @@ func (s *OpenAIGatewayService) handleErrorResponsePassthrough(
 	requestBody []byte,
 	responseBody []byte,
 ) error {
-	MarkResponseCommitted(c)
 	body := s.redactAgentIdentitySensitiveBody(ctx, account, responseBody)
+
+	// 「通用拒绝」在 passthrough 路径同样是链路抖动，不是请求非法。必须在
+	// MarkResponseCommitted 之前返回 429 failover 错误：retryUpstream429 的准入要求
+	// 错误是 UpstreamFailoverError(429) 且响应尚未提交，本函数原本两条都不满足
+	// （首行就提交、末尾返回裸 error），于是这类 400 从来用不上既有重试预算。
+	// 构造函数返回 nil（无重试作用域）时落回下方既有的 passthrough 错误处理。
+	if rejectionMsg := sanitizeUpstreamErrorMessage(strings.TrimSpace(extractUpstreamErrorMessage(body))); isOpenAIGenericUpstreamRejection(resp.StatusCode, rejectionMsg, body) {
+		reqModel, _, _ := extractOpenAIRequestMetaFromBody(requestBody)
+		if retryErr := s.newOpenAIGenericRejectionRetryError(ctx, account, resp.Header, body,
+			canonicalOpenAIAccountSchedulingModel(account, reqModel)); retryErr != nil {
+			return retryErr
+		}
+	}
+
+	MarkResponseCommitted(c)
 
 	// cyber_policy 仍按原始 body 打内部标记，供 handler 事后写风控/邮件；面向客户端的
 	// 错误体在下方统一重建。cyber 是上游网络安全策略拦截，不冷却账号，
@@ -1536,6 +1550,12 @@ func openAIStreamFailedEventShouldFailover(payload []byte, message string) bool 
 	if isOpenAIContextWindowError(message, payload) {
 		return false
 	}
+	// 「通用拒绝」是链路抖动：不带 param/code 的 invalid_request_error。必须在下方
+	// nonRetryableMarkers（含 "invalid_request"）之前放行，否则它会被当成确定性
+	// 请求错误直接回客户端，用不上 429 重试预算。
+	if isOpenAIGenericStreamRejection(payload, message) {
+		return true
+	}
 	if isOpenAIUpstreamAccessStateError(message, payload) {
 		return true
 	}
@@ -1587,6 +1607,10 @@ func openAIStreamErrorEventShouldFailover(payload []byte, message string) bool {
 	}
 	if isOpenAIContextWindowError(message, payload) {
 		return false
+	}
+	// 「通用拒绝」是链路抖动，先于下方 invalid_request 归类放行，进入 429 重试预算。
+	if isOpenAIGenericStreamRejection(payload, message) {
+		return true
 	}
 	if isOpenAIUpstreamAccessStateError(message, payload) {
 		return true
@@ -1738,6 +1762,19 @@ func (s *OpenAIGatewayService) newOpenAIStreamFailoverErrorWithModel(
 	if len(responseHeaders) > 0 && responseHeaders[0] != nil {
 		headers = responseHeaders[0].Clone()
 	}
+	// 「通用拒绝」在流内的形态：HTTP 200 之后立刻推一个不带 param/code 的
+	// invalid_request_error 就收尾。语义与 HTTP 400 通用拒绝一致，同样复用 429
+	// 重试预算。必须在 handleOpenAIStreamTerminalAccountSideEffects 之前返回：
+	// 那里会按语义状态（400）更新账号健康，而 upstream429RetryState.retry 只认
+	// StatusCode==429，走过去就再也进不了重试闸门。
+	// 构造函数返回 nil 表示没有重试作用域可用，此时继续走下方既有的流内终态处理。
+	if isOpenAIGenericStreamRejection(payload, message) {
+		if retryErr := s.newOpenAIGenericRejectionRetryError(c.Request.Context(), account, headers, payload, canonicalModel); retryErr != nil {
+			s.recordOpenAIStreamUpstreamError(c, account, passthrough, upstreamRequestID, "failover", payload, message)
+			return retryErr
+		}
+	}
+
 	statusCode, shouldDisable := s.handleOpenAIStreamTerminalAccountSideEffects(c, account, payload, message, headers, canonicalModel)
 	// 流内 failed 事件承载于 HTTP 200；使用事件的语义状态更新账号健康，
 	// 再由 failover 引擎按 StatusCode/RetryableOnSameAccount 决定恢复策略。
