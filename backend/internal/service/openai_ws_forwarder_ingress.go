@@ -1048,7 +1048,7 @@ func (s *OpenAIGatewayService) ProxyResponsesWebSocketFromClient(
 			}
 			if eventType == "error" || eventType == "response.failed" {
 				markOpenAICyberPolicyEvent(c, upstreamMessage, http.StatusOK, &usage)
-				if !wroteDownstream && openAIStreamFailedEventSemanticStatus(upstreamMessage, "") == http.StatusTooManyRequests {
+				if !wroteDownstream && openAIAccountStreamRateLimit(account, upstreamMessage, "") {
 					message := extractOpenAISSEErrorMessage(upstreamMessage)
 					s.persistOpenAIWSRateLimitSignal(ctx, account, lease.HandshakeHeaders(), upstreamMessage, "rate_limit_exceeded", "rate_limit_error", message, mappedModel)
 					return nil, s.newOpenAIWSRateLimitFailoverError(account, lease.HandshakeHeaders(), upstreamMessage, message)

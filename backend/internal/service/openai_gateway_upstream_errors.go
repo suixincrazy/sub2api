@@ -690,20 +690,6 @@ func (s *OpenAIGatewayService) handleErrorResponse(
 		}
 	}
 
-	// 「通用拒绝」是链路抖动，不是请求非法：上游/前置 ALB 打回一个不带 param/code
-	// 的 400（HTML 错误页、只有一句 Upstream rejected the request 的 JSON、空体），
-	// 重放同一份请求体立刻就能成功。必须在 MarkResponseCommitted 之前返回 429
-	// failover 错误，否则 retryUpstream429 会因响应已提交而拒绝重试。
-	//
-	// 构造函数返回 nil 表示当前调用栈没有 429 重试作用域（不经 Forward 的内部调用、
-	// 以及直接调本函数的单元测试）。那种情况下必须落回下方的确定性 400 分支：合成一个
-	// 无人重试、又不带 code/param 的 429 给客户端，正是 #5479 要避免的形状。
-	if isOpenAIGenericUpstreamRejection(resp.StatusCode, upstreamMsg, body) {
-		if retryErr := s.newOpenAIGenericRejectionRetryError(ctx, account, resp.Header, body, reqModel); retryErr != nil {
-			return nil, retryErr
-		}
-	}
-
 	MarkResponseCommitted(c)
 
 	// 上游 400 是确定性的请求错误：同一份请求体换账号、重试多少次都会失败。归一成

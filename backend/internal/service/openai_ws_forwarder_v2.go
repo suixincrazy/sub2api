@@ -668,7 +668,7 @@ readLoop:
 
 		if eventType == "error" || eventType == "response.failed" {
 			markOpenAICyberPolicyEvent(c, message, http.StatusOK, usage)
-			if !wroteDownstream && openAIStreamFailedEventSemanticStatus(message, "") == http.StatusTooManyRequests {
+			if !wroteDownstream && openAIAccountStreamRateLimit(account, message, "") {
 				errMsg := extractOpenAISSEErrorMessage(message)
 				s.persistOpenAIWSRateLimitSignal(ctx, account, lease.HandshakeHeaders(), message, "rate_limit_exceeded", "rate_limit_error", errMsg, mappedModel)
 				return nil, s.newOpenAIWSRateLimitFailoverError(account, lease.HandshakeHeaders(), message, errMsg)

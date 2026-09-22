@@ -829,10 +829,12 @@ func (s *OpenAIGatewayService) proxyOpenAIWSHTTPBridgeTurnOnce(
 				errMessage = "upstream error event"
 			}
 			statusCode := openAIStreamFailureStatus(upstreamMessage, errMessage)
-			shouldFailover := openAIStreamFailedEventShouldFailover(upstreamMessage, errMessage)
+			shouldFailover := openAIAccountStreamShouldFailover(account, upstreamMessage, errMessage, eventType)
+			if openAIAccountStreamRateLimit(account, upstreamMessage, errMessage) {
+				statusCode = http.StatusTooManyRequests
+			}
 			if eventType == "error" {
 				errCodeRaw, errTypeRaw, _ := parseOpenAIWSErrorEventFields(upstreamMessage)
-				shouldFailover = openAIStreamErrorEventShouldFailover(upstreamMessage, errMessage)
 				if account.Platform == PlatformGrok {
 					statusCode = openAIWSErrorHTTPStatusFromRaw(errCodeRaw, errTypeRaw)
 				}

@@ -90,7 +90,7 @@ func (c *openAIWS429RetryFrameConn) ReadFrame(ctx context.Context) (coderws.Mess
 		c.mu.Lock()
 		wrote, request, turn, requestType := c.wrote, c.request, c.turn, c.requestType
 		c.mu.Unlock()
-		if kind == coderws.MessageText && !wrote && len(request) > 0 && (event == "error" || event == "response.failed") && openAIStreamFailedEventSemanticStatus(payload, "") == http.StatusTooManyRequests {
+		if kind == coderws.MessageText && !wrote && len(request) > 0 && (event == "error" || event == "response.failed") && openAIAccountStreamRateLimit(c.account, payload, "") {
 			message := extractOpenAISSEErrorMessage(payload)
 			model := gjson.GetBytes(request, "model").String()
 			c.service.persistOpenAIWSRateLimitSignal(ctx, c.account, c.headers, payload, "rate_limit_exceeded", "rate_limit_error", message, model)

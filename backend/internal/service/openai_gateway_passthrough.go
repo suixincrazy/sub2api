@@ -424,6 +424,9 @@ func (s *OpenAIGatewayService) forwardOpenAIPassthrough(
 			// 透传模式默认保持原样代理；容量错误以及 API-key 上游的瞬时
 			// 5xx 应先触发多账号 failover，且此时尚未写入下游响应。
 			// probeBody 已在上方任务探测时读取过一次，直接复用避免重复读取。
+			if retryErr := s.retryOpenAIRejectedHTTPResponse(ctx, c, account, resp, probeBody, extractUpstreamErrorMessage(probeBody), upstreamPassthroughModel); retryErr != nil {
+				return nil, retryErr
+			}
 			if shouldFailoverOpenAIPassthroughResponse(account, resp.StatusCode, probeBody) {
 				return nil, s.handleFailoverErrorResponsePassthrough(ctx, resp, c, account, body, probeBody)
 			}
@@ -935,19 +938,6 @@ func (s *OpenAIGatewayService) handleErrorResponsePassthrough(
 	responseBody []byte,
 ) error {
 	body := s.redactAgentIdentitySensitiveBody(ctx, account, responseBody)
-
-	// 「通用拒绝」在 passthrough 路径同样是链路抖动，不是请求非法。必须在
-	// MarkResponseCommitted 之前返回 429 failover 错误：retryUpstream429 的准入要求
-	// 错误是 UpstreamFailoverError(429) 且响应尚未提交，本函数原本两条都不满足
-	// （首行就提交、末尾返回裸 error），于是这类 400 从来用不上既有重试预算。
-	// 构造函数返回 nil（无重试作用域）时落回下方既有的 passthrough 错误处理。
-	if rejectionMsg := sanitizeUpstreamErrorMessage(strings.TrimSpace(extractUpstreamErrorMessage(body))); isOpenAIGenericUpstreamRejection(resp.StatusCode, rejectionMsg, body) {
-		reqModel, _, _ := extractOpenAIRequestMetaFromBody(requestBody)
-		if retryErr := s.newOpenAIGenericRejectionRetryError(ctx, account, resp.Header, body,
-			canonicalOpenAIAccountSchedulingModel(account, reqModel)); retryErr != nil {
-			return retryErr
-		}
-	}
 
 	MarkResponseCommitted(c)
 
@@ -1550,12 +1540,7 @@ func openAIStreamFailedEventShouldFailover(payload []byte, message string) bool 
 	if isOpenAIContextWindowError(message, payload) {
 		return false
 	}
-	// 「通用拒绝」是链路抖动：不带 param/code 的 invalid_request_error。必须在下方
-	// nonRetryableMarkers（含 "invalid_request"）之前放行，否则它会被当成确定性
-	// 请求错误直接回客户端，用不上 429 重试预算。
-	if isOpenAIGenericStreamRejection(payload, message) {
-		return true
-	}
+
 	if isOpenAIUpstreamAccessStateError(message, payload) {
 		return true
 	}
@@ -1608,10 +1593,7 @@ func openAIStreamErrorEventShouldFailover(payload []byte, message string) bool {
 	if isOpenAIContextWindowError(message, payload) {
 		return false
 	}
-	// 「通用拒绝」是链路抖动，先于下方 invalid_request 归类放行，进入 429 重试预算。
-	if isOpenAIGenericStreamRejection(payload, message) {
-		return true
-	}
+
 	if isOpenAIUpstreamAccessStateError(message, payload) {
 		return true
 	}
@@ -1762,14 +1744,14 @@ func (s *OpenAIGatewayService) newOpenAIStreamFailoverErrorWithModel(
 	if len(responseHeaders) > 0 && responseHeaders[0] != nil {
 		headers = responseHeaders[0].Clone()
 	}
-	// 「通用拒绝」在流内的形态：HTTP 200 之后立刻推一个不带 param/code 的
-	// invalid_request_error 就收尾。语义与 HTTP 400 通用拒绝一致，同样复用 429
-	// 重试预算。必须在 handleOpenAIStreamTerminalAccountSideEffects 之前返回：
-	// 那里会按语义状态（400）更新账号健康，而 upstream429RetryState.retry 只认
-	// StatusCode==429，走过去就再也进不了重试闸门。
-	// 构造函数返回 nil 表示没有重试作用域可用，此时继续走下方既有的流内终态处理。
-	if isOpenAIGenericStreamRejection(payload, message) {
-		if retryErr := s.newOpenAIGenericRejectionRetryError(c.Request.Context(), account, headers, payload, canonicalModel); retryErr != nil {
+	if account != nil && account.Platform == PlatformOpenAI && c != nil && c.Request != nil && isOpenAIGenericStreamRejection(payload, message) {
+		// HTTP 200 quota snapshots are not evidence of this semantic refusal.
+		retryHeaders := http.Header{}
+		if delay := headers.Get("Retry-After"); delay != "" {
+			retryHeaders.Set("Retry-After", delay)
+		}
+		if retryErr := s.newOpenAIGenericRejectionRetryError(c.Request.Context(), account, retryHeaders, payload, canonicalModel); retryErr != nil {
+			retryErr.ResponseHeaders = headers
 			s.recordOpenAIStreamUpstreamError(c, account, passthrough, upstreamRequestID, "failover", payload, message)
 			return retryErr
 		}
@@ -1851,10 +1833,7 @@ func (s *OpenAIGatewayService) nonStreamingTerminalFailureFailover(
 	if account == nil || IsResponseCommitted(c) {
 		return nil
 	}
-	shouldFailover := openAIStreamFailedEventShouldFailover(payload, message)
-	if terminalType == "error" {
-		shouldFailover = openAIStreamErrorEventShouldFailover(payload, message)
-	}
+	shouldFailover := openAIAccountStreamShouldFailover(account, payload, message, terminalType)
 	if !shouldFailover {
 		return nil
 	}
@@ -2131,11 +2110,7 @@ func (s *OpenAIGatewayService) handleStreamingResponsePassthrough(
 				if !outputStarted {
 					shouldFailover := false
 					if !cyberHit {
-						if eventType == "error" {
-							shouldFailover = openAIStreamErrorEventShouldFailover(dataBytes, failedMessage)
-						} else {
-							shouldFailover = openAIStreamFailedEventShouldFailover(dataBytes, failedMessage)
-						}
+						shouldFailover = openAIAccountStreamShouldFailover(account, dataBytes, failedMessage, eventType)
 					}
 					if shouldFailover {
 						return resultWithUsage(),

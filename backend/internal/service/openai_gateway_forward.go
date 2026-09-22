@@ -1181,6 +1181,9 @@ func (s *OpenAIGatewayService) forwardOnce(ctx context.Context, c *gin.Context, 
 				)
 				continue
 			}
+			if retryErr := s.retryOpenAIRejectedHTTPResponse(ctx, c, account, resp, respBody, upstreamMsg, upstreamModel); retryErr != nil {
+				return nil, retryErr
+			}
 			if s.shouldFailoverOpenAIUpstreamResponse(account, resp.StatusCode, upstreamMsg, respBody) {
 				upstreamDetail := ""
 				if s.cfg != nil && s.cfg.Gateway.LogUpstreamErrorBody {
