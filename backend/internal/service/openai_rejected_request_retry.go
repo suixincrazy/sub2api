@@ -52,7 +52,7 @@ func isOpenAIGenericUpstreamRejection(statusCode int, upstreamMsg string, body [
 			return false
 		}
 	}
-	for _, path := range []string{"error.status_code", "response.error.status_code", "status_code"} {
+	for _, path := range openAIStreamErrorStatusPaths {
 		if status := gjson.GetBytes(body, path).Int(); status != 0 && status != http.StatusBadRequest {
 			return false
 		}

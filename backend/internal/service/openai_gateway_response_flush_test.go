@@ -644,3 +644,105 @@ func waitOpenAIResponseFlushSignal(t *testing.T, signal <-chan struct{}) {
 		t.Fatal("timed out waiting for stream signal")
 	}
 }
+
+// hangingOpenAISSEAfterTerminal 模拟上游在发完 terminal 事件后拖延关闭连接
+// （keep-alive/HTTP2 复用连接上观测到 8~46s 不 EOF）。
+type hangingOpenAISSEAfterTerminal struct {
+	payload   []byte
+	sent      bool
+	release   chan struct{}
+	closeOnce sync.Once
+}
+
+func (r *hangingOpenAISSEAfterTerminal) Read(data []byte) (int, error) {
+	if !r.sent {
+		r.sent = true
+		return copy(data, r.payload), nil
+	}
+	<-r.release
+	return 0, io.EOF
+}
+
+func (r *hangingOpenAISSEAfterTerminal) Close() error {
+	r.closeOnce.Do(func() { close(r.release) })
+	return nil
+}
+
+func TestOpenAIResponseFlush_TerminalEventEndsStreamWithoutEOF(t *testing.T) {
+	body := "data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\",\"output\":[],\"usage\":{\"input_tokens\":7,\"output_tokens\":5}}}\n\n"
+	reader := &hangingOpenAISSEAfterTerminal{payload: []byte(body), release: make(chan struct{})}
+	recorder := newOpenAIResponseFlushRecorder()
+	resultCh, errCh := runOpenAIResponseFlushTestAsync(recorder, reader, config.GatewayConfig{StreamKeepaliveInterval: 1, StreamDataIntervalTimeout: 30})
+	t.Cleanup(func() { _ = reader.Close() })
+
+	select {
+	case err := <-errCh:
+		require.NoError(t, err)
+		result := <-resultCh
+		require.NotNil(t, result)
+		require.Equal(t, 7, result.usage.InputTokens)
+		require.Equal(t, 5, result.usage.OutputTokens)
+	case <-time.After(3 * time.Second):
+		t.Fatal("stream did not end after terminal event; still waiting for upstream EOF")
+	}
+	gotBody, _ := recorder.snapshot()
+	require.Equal(t, body, gotBody)
+}
+
+func TestOpenAIResponseFlush_BareErrorThenFailedEndsWithoutEOF(t *testing.T) {
+	for _, passthrough := range []bool{false, true} {
+		name := "native"
+		if passthrough {
+			name = "passthrough"
+		}
+		t.Run(name, func(t *testing.T) {
+			body := "data: {\"type\":\"response.output_text.delta\",\"delta\":\"partial\"}\n\n" +
+				"data: {\"type\":\"error\",\"error\":{\"code\":\"invalid_request\",\"message\":\"bad request\"}}\n\n" +
+				"data: {\"type\":\"response.failed\",\"response\":{\"status\":\"failed\",\"error\":{\"code\":\"invalid_request\",\"message\":\"bad request\"},\"usage\":{\"input_tokens\":7,\"output_tokens\":5}}}\n\n"
+			reader := &hangingOpenAISSEAfterTerminal{payload: []byte(body), release: make(chan struct{})}
+			t.Cleanup(func() { _ = reader.Close() })
+			recorder := newOpenAIResponseFlushRecorder()
+			done := make(chan error, 1)
+			usage := make(chan *OpenAIUsage, 1)
+			go func() {
+				c, _ := gin.CreateTestContext(recorder)
+				c.Request = httptest.NewRequest(http.MethodPost, "/v1/responses", nil)
+				svc := &OpenAIGatewayService{cfg: &config.Config{}, toolCorrector: NewCodexToolCorrector()}
+				account := &Account{ID: 1, Platform: PlatformOpenAI, Type: AccountTypeOAuth}
+				resp := &http.Response{StatusCode: 200, Header: http.Header{"Content-Type": []string{"text/event-stream"}}, Body: reader}
+				if passthrough {
+					result, err := svc.handleStreamingResponsePassthrough(context.Background(), resp, c, account, time.Now(), "gpt-5", "gpt-5")
+					if result != nil {
+						usage <- result.usage
+					} else {
+						usage <- nil
+					}
+					done <- err
+				} else {
+					result, err := svc.handleStreamingResponse(context.Background(), resp, c, account, time.Now(), "gpt-5", "gpt-5")
+					if result != nil {
+						usage <- result.usage
+					} else {
+						usage <- nil
+					}
+					done <- err
+				}
+			}()
+			select {
+			case err := <-done:
+				require.Error(t, err)
+				gotUsage := <-usage
+				require.NotNil(t, gotUsage)
+				require.Equal(t, 7, gotUsage.InputTokens)
+				require.Equal(t, 5, gotUsage.OutputTokens)
+			case <-time.After(time.Second):
+				_ = reader.Close()
+				<-done
+				t.Fatal("authoritative response.failed must end without waiting for EOF")
+			}
+			got, _ := recorder.snapshot()
+			require.Equal(t, 1, strings.Count(got, `"type":"response.failed"`))
+			require.NotContains(t, got, `"type":"error"`)
+		})
+	}
+}

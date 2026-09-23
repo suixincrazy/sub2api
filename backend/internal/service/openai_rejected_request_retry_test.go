@@ -289,3 +289,19 @@ func TestOpenAIRejectedRequestStreamingCompatProtocols(t *testing.T) {
 		}
 	}
 }
+
+func TestOpenAIRejectedRequestHonorsExplicitStreamStatus(t *testing.T) {
+	for _, status := range []int{401, 403, 429, 529} {
+		for _, nested := range []bool{false, true} {
+			t.Run(strconv.Itoa(status)+"/nested="+strconv.FormatBool(nested), func(t *testing.T) {
+				errorJSON := `{"status":` + strconv.Itoa(status) + `,"type":"invalid_request_error","message":"Upstream rejected the request"}`
+				payload := []byte(`{"type":"error","error":` + errorJSON + `}`)
+				if nested {
+					payload = []byte(`{"type":"response.failed","response":{"error":` + errorJSON + `}}`)
+				}
+				require.False(t, isOpenAIGenericStreamRejection(payload, "Upstream rejected the request"), "explicit status must retain its auth/rate-limit policy")
+				require.Equal(t, status, openAIStreamFailedEventSemanticStatus(payload, "Upstream rejected the request"))
+			})
+		}
+	}
+}
