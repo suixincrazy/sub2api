@@ -634,7 +634,7 @@ import { extractApiErrorMessage } from '@/utils/apiError'
 import { adminAPI } from '@/api/admin'
 import type { Channel, ChannelModelPricing, CreateChannelRequest, UpdateChannelRequest, AccountStatsPricingRule } from '@/api/admin/channels'
 import type { PricingFormEntry } from '@/components/admin/channel/types'
-import { apiIntervalsToForm, apiTimePricingToForm, createDefaultTimePricingForm, findModelConflict, formIntervalsToAPI, formReasoningEffortMultipliersToAPI, formTimePricingToAPI, isValidNonNegativeMultiplier, isValidPositiveMultiplier, mTokToPerToken, perTokenToMTok, toNullableNumber, validateIntervals, validateReasoningEffortMultipliers, validateTimePricing } from '@/components/admin/channel/types'
+import { apiIntervalsToForm, apiTimePricingToForm, createDefaultTimePricingForm, findModelConflict, formIntervalsToAPI, formReasoningEffortMultipliersToAPI, formTimePricingToAPI, isValidPositiveMultiplier, mTokToPerToken, perTokenToMTok, validateIntervals, validateReasoningEffortMultipliers, validateTimePricing } from '@/components/admin/channel/types'
 import type { AdminGroup, GroupPlatform } from '@/types'
 import type { Column } from '@/components/common/types'
 import { platformTextClass, platformBadgeLightClass } from '@/utils/platformColors'
@@ -863,9 +863,6 @@ function addPricingEntry(sectionIdx: number) {
     cache_write_price: null,
     cache_write_1h_price: null,
     cache_read_price: null,
-    completion_multiplier: null,
-    cache_creation_multiplier: null,
-    cache_read_multiplier: null,
     fast_multiplier: null,
     flex_multiplier: null,
     reasoning_effort_multipliers: null,
@@ -904,9 +901,6 @@ async function syncLatestModels(sectionIdx: number) {
       cache_write_price: null,
       cache_write_1h_price: null,
       cache_read_price: null,
-      completion_multiplier: null,
-      cache_creation_multiplier: null,
-      cache_read_multiplier: null,
       fast_multiplier: null,
       flex_multiplier: null,
       reasoning_effort_multipliers: null,
@@ -1139,9 +1133,6 @@ function formToAPI(): { group_ids: number[], model_pricing: ChannelModelPricing[
         cache_write_price: mTokToPerToken(entry.cache_write_price),
         cache_write_1h_price: mTokToPerToken(entry.cache_write_1h_price),
         cache_read_price: mTokToPerToken(entry.cache_read_price),
-        completion_multiplier: toNullableNumber(entry.completion_multiplier),
-        cache_creation_multiplier: toNullableNumber(entry.cache_creation_multiplier),
-        cache_read_multiplier: toNullableNumber(entry.cache_read_multiplier),
         fast_multiplier: entry.fast_multiplier != null && entry.fast_multiplier !== '' ? Number(entry.fast_multiplier) : null,
         flex_multiplier: entry.flex_multiplier != null && entry.flex_multiplier !== '' ? Number(entry.flex_multiplier) : null,
         reasoning_effort_multipliers: formReasoningEffortMultipliersToAPI(entry.reasoning_effort_multipliers),
@@ -1245,9 +1236,6 @@ function apiToForm(channel: Channel): PlatformSection[] {
         cache_write_price: perTokenToMTok(p.cache_write_price),
         cache_write_1h_price: perTokenToMTok(p.cache_write_1h_price),
         cache_read_price: perTokenToMTok(p.cache_read_price),
-        completion_multiplier: p.completion_multiplier ?? null,
-        cache_creation_multiplier: p.cache_creation_multiplier ?? null,
-        cache_read_multiplier: p.cache_read_multiplier ?? null,
         fast_multiplier: p.fast_multiplier,
         flex_multiplier: p.flex_multiplier,
         reasoning_effort_multipliers: p.reasoning_effort_multipliers ? { ...p.reasoning_effort_multipliers } : null,
@@ -1575,15 +1563,6 @@ async function handleSubmit() {
   // 校验区间合法性（范围、重叠等）
   for (const section of form.platforms.filter(s => s.enabled)) {
     for (const entry of section.model_pricing) {
-      if (!isValidNonNegativeMultiplier(entry.completion_multiplier) ||
-          !isValidNonNegativeMultiplier(entry.cache_creation_multiplier) ||
-          !isValidNonNegativeMultiplier(entry.cache_read_multiplier)) {
-        const platformLabel = t('admin.groups.platforms.' + section.platform, section.platform)
-        const modelLabel = entry.models.join(', ') || t('admin.channels.form.unnamed')
-        appStore.showError(`${platformLabel} - ${modelLabel}: ${t('admin.channels.form.multiplierNonNegative')}`)
-        activeTab.value = section.platform
-        return
-      }
       if (!isValidPositiveMultiplier(entry.fast_multiplier) ||
           !isValidPositiveMultiplier(entry.flex_multiplier)) {
         const platformLabel = t('admin.groups.platforms.' + section.platform, section.platform)

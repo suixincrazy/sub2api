@@ -57,15 +57,11 @@ type updateChannelRequest struct {
 }
 
 type channelModelPricingRequest struct {
-	Platform    string   `json:"platform" binding:"omitempty,max=50"`
-	Models      []string `json:"models" binding:"required,min=1,max=100"`
-	BillingMode string   `json:"billing_mode" binding:"omitempty,oneof=token per_request image"`
-	InputPrice  *float64 `json:"input_price" binding:"omitempty,min=0"`
-	OutputPrice *float64 `json:"output_price" binding:"omitempty,min=0"`
-	// 派生倍率：只填提示价时用来推出其余三档；对应绝对价一旦填了就以绝对价为准。
-	CompletionMultiplier       *float64                   `json:"completion_multiplier" binding:"omitempty,min=0"`
-	CacheCreationMultiplier    *float64                   `json:"cache_creation_multiplier" binding:"omitempty,min=0"`
-	CacheReadMultiplier        *float64                   `json:"cache_read_multiplier" binding:"omitempty,min=0"`
+	Platform                   string                     `json:"platform" binding:"omitempty,max=50"`
+	Models                     []string                   `json:"models" binding:"required,min=1,max=100"`
+	BillingMode                string                     `json:"billing_mode" binding:"omitempty,oneof=token per_request image"`
+	InputPrice                 *float64                   `json:"input_price" binding:"omitempty,min=0"`
+	OutputPrice                *float64                   `json:"output_price" binding:"omitempty,min=0"`
 	CacheWritePrice            *float64                   `json:"cache_write_price" binding:"omitempty,min=0"`
 	CacheWrite1hPrice          *float64                   `json:"cache_write_1h_price" binding:"omitempty,min=0"`
 	CacheReadPrice             *float64                   `json:"cache_read_price" binding:"omitempty,min=0"`
@@ -143,9 +139,6 @@ type channelModelPricingResponse struct {
 	CacheWritePrice            *float64                    `json:"cache_write_price"`
 	CacheWrite1hPrice          *float64                    `json:"cache_write_1h_price"`
 	CacheReadPrice             *float64                    `json:"cache_read_price"`
-	CompletionMultiplier       *float64                    `json:"completion_multiplier"`
-	CacheCreationMultiplier    *float64                    `json:"cache_creation_multiplier"`
-	CacheReadMultiplier        *float64                    `json:"cache_read_multiplier"`
 	FastMultiplier             *float64                    `json:"fast_multiplier"`
 	FlexMultiplier             *float64                    `json:"flex_multiplier"`
 	ReasoningEffortMultipliers map[string]float64          `json:"reasoning_effort_multipliers"`
@@ -276,9 +269,6 @@ func pricingToResponse(p *service.ChannelModelPricing) channelModelPricingRespon
 		CacheWritePrice:            p.CacheWritePrice,
 		CacheWrite1hPrice:          p.CacheWrite1hPrice,
 		CacheReadPrice:             p.CacheReadPrice,
-		CompletionMultiplier:       p.CompletionMultiplier,
-		CacheCreationMultiplier:    p.CacheCreationMultiplier,
-		CacheReadMultiplier:        p.CacheReadMultiplier,
 		FastMultiplier:             p.FastMultiplier,
 		FlexMultiplier:             p.FlexMultiplier,
 		ReasoningEffortMultipliers: p.ReasoningEffortMultipliers,
@@ -364,15 +354,9 @@ func pricingRequestToService(reqs []channelModelPricingRequest, allowChannelMult
 			})
 		}
 		var fastMultiplier, flexMultiplier *float64
-		// 派生倍率与 fast/flex/max 同一处境：账号成本统计那条路径直接用 *float64 价格算钱、
-		// 不查模型目录，倍率在那边没有生效点，所以在边界上一起丢掉，避免"存了却不生效"。
-		var completionMultiplier, cacheCreationMultiplier, cacheReadMultiplier *float64
 		if allowChannelMultipliers {
 			fastMultiplier = r.FastMultiplier
 			flexMultiplier = r.FlexMultiplier
-			completionMultiplier = r.CompletionMultiplier
-			cacheCreationMultiplier = r.CacheCreationMultiplier
-			cacheReadMultiplier = r.CacheReadMultiplier
 		}
 		result = append(result, service.ChannelModelPricing{
 			Platform:                   platform,
@@ -383,9 +367,6 @@ func pricingRequestToService(reqs []channelModelPricingRequest, allowChannelMult
 			CacheWritePrice:            r.CacheWritePrice,
 			CacheWrite1hPrice:          r.CacheWrite1hPrice,
 			CacheReadPrice:             r.CacheReadPrice,
-			CompletionMultiplier:       completionMultiplier,
-			CacheCreationMultiplier:    cacheCreationMultiplier,
-			CacheReadMultiplier:        cacheReadMultiplier,
 			FastMultiplier:             fastMultiplier,
 			FlexMultiplier:             flexMultiplier,
 			ReasoningEffortMultipliers: r.ReasoningEffortMultipliers,

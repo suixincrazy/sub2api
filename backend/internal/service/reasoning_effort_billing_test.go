@@ -243,20 +243,3 @@ func TestReasoningEffortBillingPreservesForwardedNoneAndMinimal(t *testing.T) {
 	require.NoError(t, err)
 	require.Nil(t, extractOpenAIReasoningEffortFromBody(filtered, "custom-model"))
 }
-
-func TestReasoningEffortBillingPreservesDerivedTokenPrices(t *testing.T) {
-	pricing := derivedRatioPricing()
-	pricing.Platform = PlatformOpenAI
-	pricing.Models = []string{"custom-model"}
-	pricing.ReasoningEffortMultipliers = map[string]float64{"high": 1.5}
-	bs, resolver := newTokenCostTestEnv(t, PlatformOpenAI, []ChannelModelPricing{*pricing}, nil)
-	group := &Group{ID: 100, Platform: PlatformOpenAI}
-	cost, err := bs.CalculateTokenCostForRequest(TokenCostRequest{
-		Ctx: context.Background(), Model: "custom-model", Group: group, Resolver: resolver,
-		Tokens:         UsageTokens{InputTokens: 26, OutputTokens: 3, CacheCreationTokens: 75837},
-		RateMultiplier: 0.5, ReasoningEffort: "high",
-	})
-	require.NoError(t, err)
-	require.InDelta(t, 0.379349*1.5, cost.TotalCost, 1e-12)
-	require.InDelta(t, 0.379349*1.5*0.5, cost.ActualCost, 1e-12)
-}

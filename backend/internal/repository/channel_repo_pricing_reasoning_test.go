@@ -30,7 +30,7 @@ func (c *capturedReasoningMultipliersJSON) Match(value driver.Value) bool {
 func reasoningPricingRow(multipliers any) *sqlmock.Rows {
 	return sqlmock.NewRows(channelModelPricingTimePricingColumns).AddRow(
 		int64(11), int64(7), "openai", `["custom-model"]`, service.BillingModeToken,
-		nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, multipliers, nil, nil, nil, nil,
+		nil, nil, nil, nil, nil, nil, nil, multipliers, nil, nil, nil, nil,
 		time.Time{}, time.Time{},
 	)
 }
@@ -56,9 +56,9 @@ func TestChannelReasoningEffortMultipliersRoundTrip(t *testing.T) {
 				}
 				stored := &capturedReasoningMultipliersJSON{}
 				if operation == "update" {
-					mock.ExpectExec(`(?s)UPDATE channel_model_pricing.*reasoning_effort_multipliers = \$10.*WHERE id = \$19`).
+					mock.ExpectExec(`(?s)UPDATE channel_model_pricing.*reasoning_effort_multipliers = \$10.*WHERE id = \$16`).
 						WithArgs([]byte(`["custom-model"]`), service.BillingModeToken,
-							nil, nil, nil, nil, nil, nil, nil, stored, nil, nil, nil, nil, "openai", nil, nil, nil, int64(11)).
+							nil, nil, nil, nil, nil, nil, nil, stored, nil, nil, nil, nil, "openai", int64(11)).
 						WillReturnResult(sqlmock.NewResult(0, 1))
 					require.NoError(t, repo.UpdateModelPricing(ctx, pricing))
 				} else {
@@ -69,7 +69,7 @@ func TestChannelReasoningEffortMultipliersRoundTrip(t *testing.T) {
 					}
 					mock.ExpectQuery(`INSERT INTO channel_model_pricing .*reasoning_effort_multipliers`).
 						WithArgs(int64(7), "openai", []byte(`["custom-model"]`), service.BillingModeToken,
-							nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, stored, nil, nil, nil, nil).
+							nil, nil, nil, nil, nil, nil, nil, stored, nil, nil, nil, nil).
 						WillReturnRows(sqlmock.NewRows([]string{"id", "created_at", "updated_at"}).AddRow(int64(11), time.Time{}, time.Time{}))
 					if operation == "replace" {
 						mock.ExpectCommit()
@@ -171,33 +171,5 @@ func TestAccountStatsReasoningEffortMultipliersRoundTrip(t *testing.T) {
 	require.NoError(t, err)
 	require.Len(t, loaded[9], 1)
 	require.Equal(t, pricing.ReasoningEffortMultipliers, loaded[9][0].ReasoningEffortMultipliers)
-	require.NoError(t, mock.ExpectationsWereMet())
-}
-
-func TestChannelDerivedAndReasoningMultipliersPersistTogether(t *testing.T) {
-	repo, mock := newChannelModelPricingTimePricingRepo(t)
-	completion, creation, read := 5.0, 1.25, 0.0
-	pricing := &service.ChannelModelPricing{ID: 11, ChannelID: 7, Platform: "openai", Models: []string{"custom-model"},
-		CompletionMultiplier: &completion, CacheCreationMultiplier: &creation, CacheReadMultiplier: &read,
-		ReasoningEffortMultipliers: map[string]float64{"high": 1.5}}
-	stored := &capturedReasoningMultipliersJSON{}
-	mock.ExpectExec(`(?s)UPDATE channel_model_pricing.*reasoning_effort_multipliers = \$10.*completion_multiplier = \$16.*WHERE id = \$19`).
-		WithArgs([]byte(`["custom-model"]`), service.BillingModeToken,
-			nil, nil, nil, nil, nil, nil, nil, stored, nil, nil, nil, nil, "openai", completion, creation, read, int64(11)).
-		WillReturnResult(sqlmock.NewResult(0, 1))
-	require.NoError(t, repo.UpdateModelPricing(context.Background(), pricing))
-	require.JSONEq(t, `{"high":1.5}`, stored.value)
-	rows := sqlmock.NewRows(channelModelPricingTimePricingColumns).AddRow(
-		int64(11), int64(7), "openai", `["custom-model"]`, service.BillingModeToken,
-		nil, nil, nil, nil, nil, completion, creation, read, nil, nil, stored.value, nil, nil, nil, nil, time.Time{}, time.Time{})
-	mock.ExpectQuery(`(?s)SELECT .*completion_multiplier.*reasoning_effort_multipliers.*FROM channel_model_pricing.*channel_id = \$1`).WithArgs(int64(7)).WillReturnRows(rows)
-	expectEmptyModelPricingIntervals(mock)
-	loaded, err := repo.ListModelPricing(context.Background(), 7)
-	require.NoError(t, err)
-	require.Len(t, loaded, 1)
-	require.Equal(t, pricing.CompletionMultiplier, loaded[0].CompletionMultiplier)
-	require.Equal(t, pricing.CacheCreationMultiplier, loaded[0].CacheCreationMultiplier)
-	require.Equal(t, pricing.CacheReadMultiplier, loaded[0].CacheReadMultiplier)
-	require.Equal(t, pricing.ReasoningEffortMultipliers, loaded[0].ReasoningEffortMultipliers)
 	require.NoError(t, mock.ExpectationsWereMet())
 }

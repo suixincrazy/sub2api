@@ -12,6 +12,8 @@ import (
 	"time"
 
 	"github.com/Wei-Shaw/sub2api/internal/config"
+	"github.com/Wei-Shaw/sub2api/internal/pkg/claude"
+	"github.com/Wei-Shaw/sub2api/internal/pkg/openai"
 	"github.com/Wei-Shaw/sub2api/internal/pkg/timezone"
 	"github.com/Wei-Shaw/sub2api/internal/pkg/xai"
 )
@@ -118,15 +120,6 @@ type ModelPricing struct {
 	ImageOutputPricePerToken           float64            // 图片输出 token 价格 (USD)
 	ImageOutputPriceExplicit           bool               // 是否由渠道定价显式设定（为 true 时即使 == 0 也不回退）
 }
-
-// Anthropic 1M-context 溢价：输入超过 200K 时整次会话 input ×2 / output ×1.5，
-// 缓存创建与缓存读取跟随输入倍率（computeTokenBreakdown 已按此口径处理）。
-// LiteLLM 目录没有给 Opus 5 系列长上下文字段，这里按官方价目补齐。
-const (
-	claudeOpusLongContextInputThreshold   = 200000
-	claudeOpusLongContextInputMultiplier  = 2.0
-	claudeOpusLongContextOutputMultiplier = 1.5
-)
 
 func normalizeBillingServiceTier(serviceTier string) string {
 	return strings.ToLower(strings.TrimSpace(serviceTier))
@@ -428,6 +421,16 @@ func (s *BillingService) initFallbackPricing() {
 	s.fallbackPrices["claude-opus-4.8"] = pricingWithPriorityMultiplier(s.fallbackPrices["claude-opus-4.7"], 2)
 	s.fallbackPrices["claude-opus-5"] = pricingWithPriorityMultiplier(s.fallbackPrices["claude-opus-4.8"], 2)
 
+	s.fallbackPrices["claude-opus-5-5"] = &ModelPricing{
+		InputPricePerToken:         4e-6,
+		OutputPricePerToken:        20e-6,
+		CacheCreationPricePerToken: 5e-6,
+		CacheReadPricePerToken:     0.2e-6,
+		CacheCreation5mPrice:       5e-6,
+		CacheCreation1hPrice:       8e-6,
+		SupportsCacheBreakdown:     true,
+	}
+
 	// Claude Fable 5.x uses the same input/output and cache-write prices, while
 	// Fable 5.1 reduces cache reads from $1 to $0.25 per MTok.
 	s.fallbackPrices["claude-fable-5"] = &ModelPricing{
@@ -538,6 +541,35 @@ func (s *BillingService) initFallbackPricing() {
 		LongContextOutputMultiplier:        1.5,
 	}
 
+	// GPT-6 Sol/Luna official rates, 2026-09-22.
+	s.fallbackPrices["gpt-6-sol"] = &ModelPricing{
+		InputPricePerToken:                 2e-6,
+		InputPricePerTokenPriority:         4e-6,
+		OutputPricePerToken:                10e-6,
+		OutputPricePerTokenPriority:        20e-6,
+		CacheCreationPricePerToken:         2.5e-6,
+		CacheCreationPricePerTokenPriority: 5e-6,
+		CacheReadPricePerToken:             0.2e-6,
+		CacheReadPricePerTokenPriority:     0.4e-6,
+		CacheCreationPriceExplicit:         true,
+		LongContextInputThreshold:          272_000,
+		LongContextInputMultiplier:         2,
+		LongContextOutputMultiplier:        1.5,
+	}
+	s.fallbackPrices["gpt-6-luna"] = &ModelPricing{
+		InputPricePerToken:                 0.1e-6,
+		InputPricePerTokenPriority:         0.2e-6,
+		OutputPricePerToken:                0.5e-6,
+		OutputPricePerTokenPriority:        1e-6,
+		CacheCreationPricePerToken:         0.125e-6,
+		CacheCreationPricePerTokenPriority: 0.25e-6,
+		CacheReadPricePerToken:             0.01e-6,
+		CacheReadPricePerTokenPriority:     0.02e-6,
+		CacheCreationPriceExplicit:         true,
+		LongContextInputThreshold:          272_000,
+		LongContextInputMultiplier:         2,
+		LongContextOutputMultiplier:        1.5,
+	}
 	// OpenAI GPT-5.6 官方价格（USD/token）。缓存写入为输入价的 1.25 倍。
 	s.fallbackPrices["gpt-5.6-sol"] = &ModelPricing{
 		InputPricePerToken:                 5e-6,
@@ -943,6 +975,9 @@ func (s *BillingService) getFallbackPricing(model string) *ModelPricing {
 	if strings.Contains(modelLower, "fable-5") || strings.Contains(modelLower, "fable5") {
 		return s.fallbackPrices["claude-fable-5"]
 	}
+	if claude.IsOpus55(modelLower) {
+		return s.fallbackPrices["claude-opus-5-5"]
+	}
 	if strings.Contains(modelLower, "opus") {
 		// "opus-5" 必须先判：不能用裸 "5" 匹配，否则 claude-opus-4-5 会被误判。
 		if strings.Contains(modelLower, "opus-5") || strings.Contains(modelLower, "opus5") {
@@ -1122,6 +1157,8 @@ func (s *BillingService) getFallbackPricing(model string) *ModelPricing {
 	// OpenAI（GPT-5 / Codex 族）：仅匹配已知型号，避免未知 OpenAI 型号误计价。
 	if normalized := normalizeKnownOpenAICodexModel(modelLower); normalized != "" {
 		switch normalized {
+		case "gpt-6-sol", "gpt-6-luna":
+			return s.fallbackPrices[normalized]
 		case "gpt-6-astra":
 			return s.fallbackPrices["gpt-6-astra"]
 		case "gpt-5.6-sol":
@@ -1279,6 +1316,7 @@ func (s *BillingService) getModelPricingAt(model string, pricingAt time.Time) (*
 				InputPricePerTokenPriority:         litellmPricing.InputCostPerTokenPriority,
 				OutputPricePerToken:                litellmPricing.OutputCostPerToken,
 				OutputPricePerTokenPriority:        litellmPricing.OutputCostPerTokenPriority,
+				CacheCreationPriceExplicit:         openai.IsGPT6SolOrLunaModelSpelling(model) && litellmPricing.CacheCreationInputTokenCostExplicit,
 				CacheCreationPricePerToken:         litellmPricing.CacheCreationInputTokenCost,
 				CacheCreationPricePerTokenPriority: litellmPricing.CacheCreationInputTokenCostPriority,
 				CacheReadPricePerToken:             litellmPricing.CacheReadInputTokenCost,
@@ -1382,54 +1420,6 @@ func applyChannelTokenPriceOverrides(pricing *ModelPricing, channelPricing *Chan
 	if channelPricing.CacheReadPrice != nil {
 		priority := channelTierOverridePrice(pricing.CacheReadPricePerToken, pricing.CacheReadPricePerTokenPriority, *channelPricing.CacheReadPrice)
 		pricing.CacheReadPricePerToken = *channelPricing.CacheReadPrice
-		pricing.CacheReadPricePerTokenPriority = priority
-	}
-	applyDerivedTokenPrices(pricing, channelPricing)
-}
-
-// applyDerivedTokenPrices 用「提示价 × 倍率」补齐没有显式配置绝对价的档位。
-//
-// 必须在 applyChannelTokenPriceOverrides 应用完绝对价之后调用：倍率乘的是**有效提示价**
-// （渠道覆盖优先，否则模型目录价），而不是各档自己的基础价。
-//
-// 三条不变式：
-//   - 绝对价优先。某档配了绝对价，该档的倍率一律忽略（前端也不该同时收两个值）。
-//   - 提示价为 0 时不派生。此时目录里没有可乘的基数，派生只会把该档静默打成 0 白送算力；
-//     宁可保留目录价。
-//   - Priority/Fast 档沿用 channelTierOverridePrice 的口径，与绝对价覆盖路径逐字一致。
-func applyDerivedTokenPrices(pricing *ModelPricing, channelPricing *ChannelModelPricing) {
-	if pricing == nil || channelPricing == nil || !channelPricing.HasDerivedTokenPrices() {
-		return
-	}
-	base := pricing.InputPricePerToken
-	if base <= 0 {
-		return
-	}
-	if channelPricing.OutputPrice == nil && channelPricing.CompletionMultiplier != nil {
-		derived := base * *channelPricing.CompletionMultiplier
-		priority := channelTierOverridePrice(pricing.OutputPricePerToken, pricing.OutputPricePerTokenPriority, derived)
-		pricing.OutputPricePerToken = derived
-		pricing.OutputPricePerTokenPriority = priority
-	}
-	if channelPricing.CacheWritePrice == nil && channelPricing.CacheCreationMultiplier != nil {
-		derived := base * *channelPricing.CacheCreationMultiplier
-		priority := channelTierOverridePrice(pricing.CacheCreationPricePerToken, pricing.CacheCreationPricePerTokenPriority, derived)
-		pricing.CacheCreationPricePerToken = derived
-		pricing.CacheCreationPricePerTokenPriority = priority
-		// 与绝对价覆盖路径同口径：显式设定后即使为 0 也不回退，5m/1h 两档一起跟上。
-		pricing.CacheCreationPriceExplicit = true
-		pricing.CacheCreation5mPrice = derived
-		// 上游 0.2.0 把缓存写入拆成 5m/1h 两档后，1h 有了自己的绝对价字段。派生只在
-		// 该档没配绝对价时才跟上 —— 本函数是覆盖链的最后一环，不加这道判断就会把
-		// applyChannelTokenPriceOverrides 刚写进去的绝对 1h 价冲掉（不变式一：绝对价优先）。
-		if channelPricing.CacheWrite1hPrice == nil {
-			pricing.CacheCreation1hPrice = derived
-		}
-	}
-	if channelPricing.CacheReadPrice == nil && channelPricing.CacheReadMultiplier != nil {
-		derived := base * *channelPricing.CacheReadMultiplier
-		priority := channelTierOverridePrice(pricing.CacheReadPricePerToken, pricing.CacheReadPricePerTokenPriority, derived)
-		pricing.CacheReadPricePerToken = derived
 		pricing.CacheReadPricePerTokenPriority = priority
 	}
 }
@@ -1823,12 +1813,6 @@ func (s *BillingService) applyModelSpecificPricingPolicyEx(model string, pricing
 	if pricing == nil {
 		return nil
 	}
-	// Claude Opus 长上下文阶梯必须排在 DeepSeek 之前：两个判据的模型名互斥
-	// （usesClaudeOpusLongContextPricing 只认 claude-opus-*），顺序不影响语义，
-	// 但把它放在最前面可以让「阶梯落点只有这一处」这个约束一眼看到。
-	if usesClaudeOpusLongContextPricing(model) {
-		return applyClaudeOpusLongContextPolicy(pricing)
-	}
 	// DeepSeek 模型：无论 JSON/远端价格表给什么价，一律强制官方低谷价
 	// （Flash 三档为 2026-09-10 官方降价后口径）。这是覆盖远端旧价的关键——远端
 	// 仓库不可改，生产会先拉到旧价，必须在此兜底修正；克隆后再覆盖，避免污染
@@ -1856,15 +1840,20 @@ func (s *BillingService) applyModelSpecificPricingPolicyEx(model string, pricing
 		return &cloned
 	}
 	normalized := normalizeKnownOpenAICodexModel(model)
-	isGPT56 := isOpenAIGPT56Model(normalized)
-	needsCacheCreationPolicy := isGPT56 && !pricing.CacheCreationPriceExplicit && (pricing.CacheCreationPricePerToken <= 0 ||
+	usesCacheWritePremium := isOpenAIGPT56Model(normalized) || openai.IsGPT6SolOrLunaModelSpelling(normalized)
+	needsCacheCreationPolicy := usesCacheWritePremium && !pricing.CacheCreationPriceExplicit && (pricing.CacheCreationPricePerToken <= 0 ||
 		(pricing.InputPricePerTokenPriority > 0 && pricing.CacheCreationPricePerTokenPriority <= 0))
 	fastRatio := openAIModelFastPricingRatio(normalized)
-	if !needsCacheCreationPolicy && fastRatio <= 0 {
+	needsOpus55FastMultiplier := claude.IsOpus55(model) && pricing.FastMultiplier == nil
+	if !needsCacheCreationPolicy && fastRatio <= 0 && !needsOpus55FastMultiplier {
 		return pricing
 	}
 	cloned := *pricing
-	if isGPT56 && !cloned.CacheCreationPriceExplicit {
+	if needsOpus55FastMultiplier {
+		multiplier := 2.0
+		cloned.FastMultiplier = &multiplier
+	}
+	if usesCacheWritePremium && !cloned.CacheCreationPriceExplicit {
 		if cloned.CacheCreationPricePerToken <= 0 {
 			cloned.CacheCreationPricePerToken = cloned.InputPricePerToken * 1.25
 		}
@@ -1874,41 +1863,9 @@ func (s *BillingService) applyModelSpecificPricingPolicyEx(model string, pricing
 	}
 	if fastRatio > 0 {
 		enforceOpenAIFastPricingRatio(&cloned, fastRatio)
-	}
-	return &cloned
-}
-
-// usesClaudeOpusLongContextPricing 匹配走 Anthropic 1M-context 溢价的 Opus 型号：
-// Opus 5 及映射到它的 Opus 4.8（两者共用同一张定价卡，阶梯口径必须一致）。
-// 匹配风格与 getFallbackPricing 一致：先判 opus-5，避免裸数字误命中 opus-4-5。
-func usesClaudeOpusLongContextPricing(model string) bool {
-	modelLower := strings.ToLower(strings.TrimSpace(model))
-	if !strings.Contains(modelLower, "opus") {
-		return false
-	}
-	if strings.Contains(modelLower, "opus-5") || strings.Contains(modelLower, "opus5") {
-		return true
-	}
-	return strings.Contains(modelLower, "4.8") || strings.Contains(modelLower, "4-8")
-}
-
-// applyClaudeOpusLongContextPolicy 按官方价目补齐缺失的长上下文阶梯字段。
-// 目录 / 渠道 / 分组已显式配置的字段不覆盖，逐字段判定。
-func applyClaudeOpusLongContextPolicy(pricing *ModelPricing) *ModelPricing {
-	if pricing.LongContextInputThreshold > 0 &&
-		pricing.LongContextInputMultiplier > 0 &&
-		pricing.LongContextOutputMultiplier > 0 {
-		return pricing
-	}
-	cloned := *pricing
-	if cloned.LongContextInputThreshold <= 0 {
-		cloned.LongContextInputThreshold = claudeOpusLongContextInputThreshold
-	}
-	if cloned.LongContextInputMultiplier <= 0 {
-		cloned.LongContextInputMultiplier = claudeOpusLongContextInputMultiplier
-	}
-	if cloned.LongContextOutputMultiplier <= 0 {
-		cloned.LongContextOutputMultiplier = claudeOpusLongContextOutputMultiplier
+		if openai.IsGPT6SolOrLunaModelSpelling(normalized) && cloned.CacheCreationPriceExplicit {
+			cloned.CacheCreationPricePerTokenPriority = cloned.CacheCreationPricePerToken * fastRatio
+		}
 	}
 	return &cloned
 }
@@ -1918,7 +1875,7 @@ func applyClaudeOpusLongContextPolicy(pricing *ModelPricing) *ModelPricing {
 // 档的模型（如 gpt-5.5-pro、gpt-5.4-mini/nano）返回 0。
 func openAIModelFastPricingRatio(normalized string) float64 {
 	switch normalized {
-	case "gpt-5.4", "gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna", "gpt-6-astra":
+	case "gpt-5.4", "gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna", "gpt-6-astra", "gpt-6-sol", "gpt-6-luna":
 		return 2.0
 	case "gpt-5.5":
 		return 2.5

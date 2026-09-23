@@ -4410,11 +4410,6 @@ const groupPricingFromAPI = (
     cache_write_price: perTokenToMTok(entry.cache_write_price),
     cache_write_1h_price: perTokenToMTok(entry.cache_write_1h_price),
     cache_read_price: perTokenToMTok(entry.cache_read_price),
-    // 分组表单不展示派生倍率（与 fast/flex 一致），但要原样带回去：
-    // 否则通过 API 配过倍率的分组，一进编辑框保存就被静默清空。
-    completion_multiplier: entry.completion_multiplier ?? null,
-    cache_creation_multiplier: entry.cache_creation_multiplier ?? null,
-    cache_read_multiplier: entry.cache_read_multiplier ?? null,
     reasoning_effort_multipliers: entry.reasoning_effort_multipliers
       ? { ...entry.reasoning_effort_multipliers }
       : null,
@@ -4440,9 +4435,6 @@ const groupPricingToAPI = (
       cache_write_price: mTokToPerToken(entry.cache_write_price),
       cache_write_1h_price: mTokToPerToken(entry.cache_write_1h_price),
       cache_read_price: mTokToPerToken(entry.cache_read_price),
-      completion_multiplier: toNullableNumber(entry.completion_multiplier),
-      cache_creation_multiplier: toNullableNumber(entry.cache_creation_multiplier),
-      cache_read_multiplier: toNullableNumber(entry.cache_read_multiplier),
       reasoning_effort_multipliers: formReasoningEffortMultipliersToAPI(
         entry.reasoning_effort_multipliers,
       ),

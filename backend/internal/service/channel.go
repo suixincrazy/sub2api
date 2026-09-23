@@ -88,35 +88,18 @@ type AccountStatsPricingRule struct {
 
 // ChannelModelPricing 渠道模型定价条目
 type ChannelModelPricing struct {
-	ID                int64       `json:"id,omitempty"`
-	ChannelID         int64       `json:"channel_id,omitempty"`
-	Platform          string      `json:"platform"` // 所属平台（anthropic/openai/gemini/...）
-	Models            []string    `json:"models"`
-	BillingMode       BillingMode `json:"billing_mode"`
-	InputPrice        *float64    `json:"input_price"`
-	OutputPrice       *float64    `json:"output_price"`
-	CacheWritePrice   *float64    `json:"cache_write_price"`
-	CacheWrite1hPrice *float64    `json:"cache_write_1h_price"`
-	CacheReadPrice    *float64    `json:"cache_read_price"`
-
-	// 派生倍率：只维护一个提示价，其余三档按倍率跟着走。
-	// 典型配置是 补全 5 / 缓存创建 1.25 / 缓存读取 0.2，于是提示价 $4/MTok
-	// 直接给出 补全 $20、缓存创建 $5、缓存读取 $0.80。
-	//
-	// 语义要点（两条都靠 applyDerivedTokenPrices 保证）：
-	//   - 只在对应的绝对价**没有**配置时生效，绝对价永远优先；三个都 nil 时行为与引入前逐位相同
-	//   - 乘的是「应用完覆盖后的有效提示价」，不是各档自己的基础价 ——
-	//     这一点与 PricingInterval 上的同名倍率**相反**，那边 OutputMultiplier 乘的是基础补全价
-	//
-	// 1h 缓存写入价（上游 0.2.0 新增）刻意**不**派生：它是 5m 缓存写入的另一档，
-	// 与提示价没有固定比例，留空即回落 CacheWritePrice 的历史行为。
-	CompletionMultiplier    *float64 `json:"completion_multiplier"`     // 补全价 = 提示价 × 该倍率
-	CacheCreationMultiplier *float64 `json:"cache_creation_multiplier"` // 缓存创建价 = 提示价 × 该倍率
-	CacheReadMultiplier     *float64 `json:"cache_read_multiplier"`     // 缓存读取价 = 提示价 × 该倍率
-
-	FastMultiplier *float64 `json:"fast_multiplier"`
-	FlexMultiplier *float64 `json:"flex_multiplier"`
-	// Reasoning multipliers apply separately to the final forwarded effort.
+	ID                         int64               `json:"id,omitempty"`
+	ChannelID                  int64               `json:"channel_id,omitempty"`
+	Platform                   string              `json:"platform"` // 所属平台（anthropic/openai/gemini/...）
+	Models                     []string            `json:"models"`
+	BillingMode                BillingMode         `json:"billing_mode"`
+	InputPrice                 *float64            `json:"input_price"`
+	OutputPrice                *float64            `json:"output_price"`
+	CacheWritePrice            *float64            `json:"cache_write_price"`
+	CacheWrite1hPrice          *float64            `json:"cache_write_1h_price"`
+	CacheReadPrice             *float64            `json:"cache_read_price"`
+	FastMultiplier             *float64            `json:"fast_multiplier"`
+	FlexMultiplier             *float64            `json:"flex_multiplier"`
 	ReasoningEffortMultipliers map[string]float64  `json:"reasoning_effort_multipliers,omitempty"`
 	ImageInputPrice            *float64            `json:"image_input_price"`
 	ImageOutputPrice           *float64            `json:"image_output_price"`
@@ -125,14 +108,6 @@ type ChannelModelPricing struct {
 	TimePricing                *ChannelTimePricing `json:"time_pricing,omitempty"`
 	CreatedAt                  time.Time           `json:"created_at,omitempty"`
 	UpdatedAt                  time.Time           `json:"updated_at,omitempty"`
-}
-
-// HasDerivedTokenPrices 报告该定价项是否配置了任一派生倍率。
-func (p *ChannelModelPricing) HasDerivedTokenPrices() bool {
-	if p == nil {
-		return false
-	}
-	return p.CompletionMultiplier != nil || p.CacheCreationMultiplier != nil || p.CacheReadMultiplier != nil
 }
 
 // ChannelTimePricing 渠道模型定价的分时倍率配置。
