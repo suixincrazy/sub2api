@@ -86,7 +86,18 @@ func TestAccountTestRequestShape(t *testing.T) {
 				require.NotEmpty(t, getHeaderRaw(req.Header, "Version"))
 				require.NotEmpty(t, getHeaderRaw(req.Header, "X-Codex-Window-ID"))
 				require.NotEmpty(t, gjson.GetBytes(body, "tools").Array(), "GPT tests need protocol-appropriate tool declarations")
-				require.Equal(t, "none", gjson.GetBytes(body, "tool_choice").String())
+				if tc.chat {
+					require.Equal(t, "none", gjson.GetBytes(body, "tool_choice").String())
+				} else {
+					require.Equal(t, "auto", gjson.GetBytes(body, "tool_choice").String())
+					require.Equal(t, "message", gjson.GetBytes(body, "input.0.type").String())
+					require.False(t, gjson.GetBytes(body, "store").Bool())
+					require.True(t, gjson.GetBytes(body, "store").Exists())
+					require.False(t, gjson.GetBytes(body, "parallel_tool_calls").Bool())
+					require.NotEmpty(t, gjson.GetBytes(body, "reasoning.effort").String())
+					require.Equal(t, "reasoning.encrypted_content", gjson.GetBytes(body, "include.0").String())
+					require.NotEmpty(t, gjson.GetBytes(body, "prompt_cache_key").String())
+				}
 				if tc.chat {
 					require.Equal(t, prompt, gjson.GetBytes(body, "messages.0.content").String())
 					require.Equal(t, "function", gjson.GetBytes(body, "tools.0.type").String())

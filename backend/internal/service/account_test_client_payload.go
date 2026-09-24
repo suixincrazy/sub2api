@@ -5,6 +5,8 @@ import (
 	"encoding/json"
 	"fmt"
 	"strings"
+
+	"github.com/google/uuid"
 )
 
 // Tool names and schemas follow the isolated Claude CLI 2.1.281 capture.
@@ -46,10 +48,22 @@ func accountTestOpenAITools(chatCompletions bool) []map[string]any {
 
 // Keep the lightweight quota probe's payload unchanged; only interactive and
 // scheduled account tests use the client tool declarations.
+//
+// Codex-gated relays (new-api "invalid codex request") reject Responses bodies
+// that lack reasoning + include; the full Codex CLI field set is required.
 func createOpenAIClientTestPayload(modelID string, isOAuth bool, prompt string) map[string]any {
 	payload := createOpenAITestPayload(modelID, isOAuth)
-	payload["input"] = []map[string]any{{"role": "user", "content": []map[string]any{{"type": "input_text", "text": accountTestTextPrompt(prompt)}}}}
-	payload["tools"] = accountTestOpenAITools(false)
-	payload["tool_choice"] = "none"
+	payload["input"] = []map[string]any{{"type": "message", "role": "user", "content": []map[string]any{{"type": "input_text", "text": accountTestTextPrompt(prompt)}}}}
+	tools := accountTestOpenAITools(false)
+	for _, tool := range tools {
+		tool["strict"] = false
+	}
+	payload["tools"] = tools
+	payload["tool_choice"] = "auto"
+	payload["parallel_tool_calls"] = false
+	payload["reasoning"] = map[string]any{"effort": "medium", "summary": "auto"}
+	payload["store"] = false
+	payload["include"] = []string{"reasoning.encrypted_content"}
+	payload["prompt_cache_key"] = uuid.NewString()
 	return payload
 }
