@@ -9,7 +9,7 @@
       <!-- Add Plan Button -->
       <div class="flex items-center justify-between">
         <p class="text-sm text-gray-500 dark:text-gray-400">
-          {{ t('admin.scheduledTests.title') }}
+          {{ t('admin.scheduledTests.description') }}
         </p>
         <button
           @click="showAddForm = !showAddForm"
@@ -41,30 +41,22 @@
             />
           </div>
           <div>
-            <label class="mb-1 flex items-center gap-1 text-xs font-medium text-gray-600 dark:text-gray-400">
-              {{ t('admin.scheduledTests.cronExpression') }}
-              <HelpTooltip>
-                <template #trigger>
-                  <span class="inline-flex h-4 w-4 cursor-help items-center justify-center rounded-full border border-gray-400/70 text-[10px] font-semibold text-gray-400 transition-colors hover:border-primary-500 hover:text-primary-600 dark:border-gray-500 dark:text-gray-500 dark:hover:border-primary-400 dark:hover:text-primary-400">
-                    ?
-                  </span>
-                </template>
-                <div class="space-y-1.5">
-                  <p class="font-medium">{{ t('admin.scheduledTests.cronTooltipTitle') }}</p>
-                  <p>{{ t('admin.scheduledTests.cronTooltipMeaning') }}</p>
-                  <p>{{ t('admin.scheduledTests.cronTooltipExampleEvery30Min') }}</p>
-                  <p>{{ t('admin.scheduledTests.cronTooltipExampleHourly') }}</p>
-                  <p>{{ t('admin.scheduledTests.cronTooltipExampleDaily') }}</p>
-                  <p>{{ t('admin.scheduledTests.cronTooltipExampleWeekly') }}</p>
-                  <p>{{ t('admin.scheduledTests.cronTooltipRange') }}</p>
-                </div>
-              </HelpTooltip>
+            <label class="mb-1 block text-xs font-medium text-gray-600 dark:text-gray-400">
+              {{ t('admin.scheduledTests.probeInterval') }}
             </label>
-            <Input
-              v-model="newPlan.cron_expression"
-              :placeholder="'*/30 * * * *'"
-              :hint="t('admin.scheduledTests.cronHelp')"
-            />
+            <Input v-model="newPlan.probe_interval_seconds" type="number" placeholder="2" />
+          </div>
+          <div>
+            <label class="mb-1 block text-xs font-medium text-gray-600 dark:text-gray-400">
+              {{ t('admin.scheduledTests.keepaliveInterval') }}
+            </label>
+            <Input v-model="newPlan.keepalive_interval_seconds" type="number" placeholder="60" />
+          </div>
+          <div>
+            <label class="mb-1 block text-xs font-medium text-gray-600 dark:text-gray-400">
+              {{ t('admin.scheduledTests.keepaliveMaxInterval') }}
+            </label>
+            <Input v-model="newPlan.keepalive_max_interval_seconds" type="number" placeholder="90" />
           </div>
           <div>
             <label class="mb-1 flex items-center gap-1 text-xs font-medium text-gray-600 dark:text-gray-400">
@@ -117,7 +109,7 @@
           </button>
           <button
             @click="handleCreate"
-            :disabled="!newPlan.model_id || !newPlan.cron_expression || creating"
+            :disabled="!newPlan.model_id || !validIntervals(newPlan) || creating"
             class="flex items-center gap-1.5 rounded-lg bg-primary-500 px-3 py-1.5 text-sm font-medium text-white transition-colors hover:bg-primary-600 disabled:cursor-not-allowed disabled:opacity-50"
           >
             <Icon v-if="creating" name="refresh" size="sm" class="animate-spin" :stroke-width="2" />
@@ -162,7 +154,7 @@
                   {{ plan.model_id }}
                 </div>
                 <div class="mt-0.5 font-mono text-xs text-gray-500 dark:text-gray-400">
-                  {{ plan.cron_expression }}
+                  {{ t('admin.scheduledTests.intervalSummary', { probe: plan.probe_interval_seconds, min: plan.keepalive_interval_seconds, max: plan.keepalive_max_interval_seconds }) }}
                 </div>
               </div>
 
@@ -173,7 +165,7 @@
                   @update:model-value="(val: boolean) => handleToggleEnabled(plan, val)"
                 />
                 <span class="text-xs text-gray-500 dark:text-gray-400">
-                  {{ plan.enabled ? t('admin.scheduledTests.enabled') : '' }}
+                  {{ t(!plan.enabled ? 'admin.scheduledTests.paused' : plan.last_status === 'success' ? 'admin.scheduledTests.keepingAlive' : 'admin.scheduledTests.probing') }}
                 </span>
               </div>
 
@@ -194,7 +186,7 @@
               </div>
 
               <!-- Next Run -->
-              <div v-if="plan.next_run_at" class="hidden text-right text-xs text-gray-500 dark:text-gray-400 sm:block">
+              <div v-if="plan.enabled && plan.next_run_at" class="hidden text-right text-xs text-gray-500 dark:text-gray-400 sm:block">
                 <div>{{ t('admin.scheduledTests.nextRun') }}</div>
                 <div>{{ formatDateTime(plan.next_run_at) }}</div>
               </div>
@@ -251,30 +243,22 @@
                 />
               </div>
               <div>
-                <label class="mb-1 flex items-center gap-1 text-xs font-medium text-gray-600 dark:text-gray-400">
-                  {{ t('admin.scheduledTests.cronExpression') }}
-                  <HelpTooltip>
-                    <template #trigger>
-                      <span class="inline-flex h-4 w-4 cursor-help items-center justify-center rounded-full border border-gray-400/70 text-[10px] font-semibold text-gray-400 transition-colors hover:border-primary-500 hover:text-primary-600 dark:border-gray-500 dark:text-gray-500 dark:hover:border-primary-400 dark:hover:text-primary-400">
-                        ?
-                      </span>
-                    </template>
-                    <div class="space-y-1.5">
-                      <p class="font-medium">{{ t('admin.scheduledTests.cronTooltipTitle') }}</p>
-                      <p>{{ t('admin.scheduledTests.cronTooltipMeaning') }}</p>
-                      <p>{{ t('admin.scheduledTests.cronTooltipExampleEvery30Min') }}</p>
-                      <p>{{ t('admin.scheduledTests.cronTooltipExampleHourly') }}</p>
-                      <p>{{ t('admin.scheduledTests.cronTooltipExampleDaily') }}</p>
-                      <p>{{ t('admin.scheduledTests.cronTooltipExampleWeekly') }}</p>
-                      <p>{{ t('admin.scheduledTests.cronTooltipRange') }}</p>
-                    </div>
-                  </HelpTooltip>
+                <label class="mb-1 block text-xs font-medium text-gray-600 dark:text-gray-400">
+                  {{ t('admin.scheduledTests.probeInterval') }}
                 </label>
-                <Input
-                  v-model="editForm.cron_expression"
-                  :placeholder="'*/30 * * * *'"
-                  :hint="t('admin.scheduledTests.cronHelp')"
-                />
+                <Input v-model="editForm.probe_interval_seconds" type="number" placeholder="2" />
+              </div>
+              <div>
+                <label class="mb-1 block text-xs font-medium text-gray-600 dark:text-gray-400">
+                  {{ t('admin.scheduledTests.keepaliveInterval') }}
+                </label>
+                <Input v-model="editForm.keepalive_interval_seconds" type="number" placeholder="60" />
+              </div>
+              <div>
+                <label class="mb-1 block text-xs font-medium text-gray-600 dark:text-gray-400">
+                  {{ t('admin.scheduledTests.keepaliveMaxInterval') }}
+                </label>
+                <Input v-model="editForm.keepalive_max_interval_seconds" type="number" placeholder="90" />
               </div>
               <div>
                 <label class="mb-1 flex items-center gap-1 text-xs font-medium text-gray-600 dark:text-gray-400">
@@ -327,7 +311,7 @@
               </button>
               <button
                 @click="handleEdit"
-                :disabled="!editForm.model_id || !editForm.cron_expression || updating"
+                :disabled="!editForm.model_id || !validIntervals(editForm) || updating"
                 class="flex items-center gap-1.5 rounded-lg bg-primary-500 px-3 py-1.5 text-sm font-medium text-white transition-colors hover:bg-primary-600 disabled:cursor-not-allowed disabled:opacity-50"
               >
                 <Icon v-if="updating" name="refresh" size="sm" class="animate-spin" :stroke-width="2" />
@@ -463,7 +447,7 @@
 </template>
 
 <script setup lang="ts">
-import { ref, reactive, watch } from 'vue'
+import { ref, reactive, watch, onUnmounted } from 'vue'
 import { useI18n } from 'vue-i18n'
 import BaseDialog from '@/components/common/BaseDialog.vue'
 import ConfirmDialog from '@/components/common/ConfirmDialog.vue'
@@ -505,7 +489,9 @@ const editingPlanId = ref<number | null>(null)
 const updating = ref(false)
 const editForm = reactive({
   model_id: '' as string,
-  cron_expression: '' as string,
+  probe_interval_seconds: '2',
+  keepalive_interval_seconds: '60',
+  keepalive_max_interval_seconds: '90',
   max_results: '100' as string,
   enabled: true,
   auto_recover: false
@@ -513,7 +499,9 @@ const editForm = reactive({
 
 const newPlan = reactive({
   model_id: '' as string,
-  cron_expression: '' as string,
+  probe_interval_seconds: '2',
+  keepalive_interval_seconds: '60',
+  keepalive_max_interval_seconds: '90',
   max_results: '100' as string,
   enabled: true,
   auto_recover: false
@@ -521,50 +509,89 @@ const newPlan = reactive({
 
 const resetNewPlan = () => {
   newPlan.model_id = ''
-  newPlan.cron_expression = ''
+  newPlan.probe_interval_seconds = '2'
+  newPlan.keepalive_interval_seconds = '60'
+  newPlan.keepalive_max_interval_seconds = '90'
   newPlan.max_results = '100'
   newPlan.enabled = true
   newPlan.auto_recover = false
 }
 
-// Load plans when dialog opens
-watch(
-  () => props.show,
-  async (visible) => {
-    if (visible && props.accountId) {
-      await loadPlans()
-    } else {
-      plans.value = []
-      results.value = []
-      expandedPlanId.value = null
-      expandedResultIds.clear()
-      showAddForm.value = false
-      showDeleteConfirm.value = false
-    }
-  }
-)
+const validIntervals = (form: typeof newPlan) => {
+  const values = [form.probe_interval_seconds, form.keepalive_interval_seconds, form.keepalive_max_interval_seconds].map(Number)
+  return values.every((value) => Number.isInteger(value) && value >= 1 && value <= 86400)
+    && values[2] >= values[1]
+    && Number.isInteger(Number(form.max_results)) && Number(form.max_results) >= 1 && Number(form.max_results) <= 1000
+}
 
-const loadPlans = async () => {
-  if (!props.accountId) return
-  loading.value = true
+let refreshTimer: ReturnType<typeof setTimeout> | undefined
+let viewVersion = 0
+const stopRefresh = () => {
+  if (refreshTimer) clearTimeout(refreshTimer)
+  refreshTimer = undefined
+}
+
+const loadPlans = async (silent = false) => {
+  const accountId = props.accountId
+  const version = viewVersion
+  if (!props.show || !accountId) return
+  if (!silent) loading.value = true
   try {
-    plans.value = await adminAPI.scheduledTests.listByAccount(props.accountId)
+    const loaded = await adminAPI.scheduledTests.listByAccount(accountId)
+    if (version !== viewVersion) return
+    plans.value = loaded || []
+    const planId = expandedPlanId.value
+    if (planId) {
+      const loadedResults = await adminAPI.scheduledTests.listResults(planId, 20)
+      if (version === viewVersion && expandedPlanId.value === planId) results.value = loadedResults || []
+    }
   } catch (error: any) {
-    appStore.showError(error?.message || 'Failed to load plans')
+    if (!silent && version === viewVersion) appStore.showError(error?.message || 'Failed to load plans')
   } finally {
-    loading.value = false
+    if (version === viewVersion) loading.value = false
   }
 }
 
+const refreshPlans = async () => {
+  const version = viewVersion
+  await loadPlans(true)
+  if (props.show && version === viewVersion) refreshTimer = setTimeout(refreshPlans, 3000)
+}
+
+watch(
+  () => [props.show, props.accountId] as const,
+  async ([visible, accountId]) => {
+    const version = ++viewVersion
+    stopRefresh()
+    plans.value = []
+    results.value = []
+    expandedPlanId.value = null
+    expandedResultIds.clear()
+    showAddForm.value = false
+    showDeleteConfirm.value = false
+    editingPlanId.value = null
+    resetNewPlan()
+    if (visible && accountId) {
+      await loadPlans()
+      if (version === viewVersion) refreshTimer = setTimeout(refreshPlans, 3000)
+    }
+  },
+  { immediate: true }
+)
+
+onUnmounted(() => { ++viewVersion; stopRefresh() })
+
 const handleCreate = async () => {
-  if (!props.accountId || !newPlan.model_id || !newPlan.cron_expression) return
+  if (!props.accountId || !newPlan.model_id || !validIntervals(newPlan)) return
   creating.value = true
   try {
     const maxResults = Number(newPlan.max_results) || 100
     await adminAPI.scheduledTests.create({
       account_id: props.accountId,
       model_id: newPlan.model_id,
-      cron_expression: newPlan.cron_expression,
+      probe_interval_seconds: Number(newPlan.probe_interval_seconds),
+      keepalive_interval_seconds: Number(newPlan.keepalive_interval_seconds),
+      keepalive_max_interval_seconds: Number(newPlan.keepalive_max_interval_seconds),
       enabled: newPlan.enabled,
       max_results: maxResults,
       auto_recover: newPlan.auto_recover
@@ -596,7 +623,9 @@ const handleToggleEnabled = async (plan: ScheduledTestPlan, enabled: boolean) =>
 const startEdit = (plan: ScheduledTestPlan) => {
   editingPlanId.value = plan.id
   editForm.model_id = plan.model_id
-  editForm.cron_expression = plan.cron_expression
+  editForm.probe_interval_seconds = String(plan.probe_interval_seconds)
+  editForm.keepalive_interval_seconds = String(plan.keepalive_interval_seconds)
+  editForm.keepalive_max_interval_seconds = String(plan.keepalive_max_interval_seconds)
   editForm.max_results = String(plan.max_results)
   editForm.enabled = plan.enabled
   editForm.auto_recover = plan.auto_recover
@@ -607,12 +636,14 @@ const cancelEdit = () => {
 }
 
 const handleEdit = async () => {
-  if (!editingPlanId.value || !editForm.model_id || !editForm.cron_expression) return
+  if (!editingPlanId.value || !editForm.model_id || !validIntervals(editForm)) return
   updating.value = true
   try {
     const updated = await adminAPI.scheduledTests.update(editingPlanId.value, {
       model_id: editForm.model_id,
-      cron_expression: editForm.cron_expression,
+      probe_interval_seconds: Number(editForm.probe_interval_seconds),
+      keepalive_interval_seconds: Number(editForm.keepalive_interval_seconds),
+      keepalive_max_interval_seconds: Number(editForm.keepalive_max_interval_seconds),
       max_results: Number(editForm.max_results) || 100,
       enabled: editForm.enabled,
       auto_recover: editForm.auto_recover
@@ -665,7 +696,9 @@ const toggleExpand = async (planId: number) => {
   expandedResultIds.clear()
   loadingResults.value = true
   try {
-    results.value = await adminAPI.scheduledTests.listResults(planId, 20)
+    const version = viewVersion
+    const loaded = await adminAPI.scheduledTests.listResults(planId, 20)
+    if (version === viewVersion && expandedPlanId.value === planId) results.value = loaded || []
   } catch (error: any) {
     appStore.showError(error?.message || 'Failed to load results')
     results.value = []

@@ -20,20 +20,26 @@ func NewScheduledTestHandler(scheduledTestSvc *service.ScheduledTestService) *Sc
 }
 
 type createScheduledTestPlanRequest struct {
-	AccountID      int64  `json:"account_id" binding:"required"`
-	ModelID        string `json:"model_id"`
-	CronExpression string `json:"cron_expression" binding:"required"`
-	Enabled        *bool  `json:"enabled"`
-	MaxResults     int    `json:"max_results"`
-	AutoRecover    *bool  `json:"auto_recover"`
+	AccountID                   int64  `json:"account_id" binding:"required"`
+	ModelID                     string `json:"model_id"`
+	CronExpression              string `json:"cron_expression"`
+	Enabled                     *bool  `json:"enabled"`
+	MaxResults                  int    `json:"max_results" binding:"omitempty,min=1,max=1000"`
+	AutoRecover                 *bool  `json:"auto_recover"`
+	ProbeIntervalSeconds        *int   `json:"probe_interval_seconds" binding:"omitempty,min=1,max=86400"`
+	KeepaliveIntervalSeconds    *int   `json:"keepalive_interval_seconds" binding:"omitempty,min=1,max=86400"`
+	KeepaliveMaxIntervalSeconds *int   `json:"keepalive_max_interval_seconds" binding:"omitempty,min=1,max=86400"`
 }
 
 type updateScheduledTestPlanRequest struct {
-	ModelID        string `json:"model_id"`
-	CronExpression string `json:"cron_expression"`
-	Enabled        *bool  `json:"enabled"`
-	MaxResults     int    `json:"max_results"`
-	AutoRecover    *bool  `json:"auto_recover"`
+	ModelID                     string `json:"model_id"`
+	CronExpression              string `json:"cron_expression"`
+	Enabled                     *bool  `json:"enabled"`
+	MaxResults                  int    `json:"max_results" binding:"omitempty,min=1,max=1000"`
+	AutoRecover                 *bool  `json:"auto_recover"`
+	ProbeIntervalSeconds        *int   `json:"probe_interval_seconds" binding:"omitempty,min=1,max=86400"`
+	KeepaliveIntervalSeconds    *int   `json:"keepalive_interval_seconds" binding:"omitempty,min=1,max=86400"`
+	KeepaliveMaxIntervalSeconds *int   `json:"keepalive_max_interval_seconds" binding:"omitempty,min=1,max=86400"`
 }
 
 // ListByAccount GET /admin/accounts/:id/scheduled-test-plans
@@ -72,6 +78,15 @@ func (h *ScheduledTestHandler) Create(c *gin.Context) {
 	}
 	if req.AutoRecover != nil {
 		plan.AutoRecover = *req.AutoRecover
+	}
+	if req.ProbeIntervalSeconds != nil {
+		plan.ProbeIntervalSeconds = *req.ProbeIntervalSeconds
+	}
+	if req.KeepaliveIntervalSeconds != nil {
+		plan.KeepaliveIntervalSeconds = *req.KeepaliveIntervalSeconds
+	}
+	if req.KeepaliveMaxIntervalSeconds != nil {
+		plan.KeepaliveMaxIntervalSeconds = *req.KeepaliveMaxIntervalSeconds
 	}
 
 	created, err := h.scheduledTestSvc.CreatePlan(c.Request.Context(), plan)
@@ -116,6 +131,15 @@ func (h *ScheduledTestHandler) Update(c *gin.Context) {
 	}
 	if req.AutoRecover != nil {
 		existing.AutoRecover = *req.AutoRecover
+	}
+	if req.ProbeIntervalSeconds != nil {
+		existing.ProbeIntervalSeconds = *req.ProbeIntervalSeconds
+	}
+	if req.KeepaliveIntervalSeconds != nil {
+		existing.KeepaliveIntervalSeconds = *req.KeepaliveIntervalSeconds
+	}
+	if req.KeepaliveMaxIntervalSeconds != nil {
+		existing.KeepaliveMaxIntervalSeconds = *req.KeepaliveMaxIntervalSeconds
 	}
 
 	updated, err := h.scheduledTestSvc.UpdatePlan(c.Request.Context(), existing)

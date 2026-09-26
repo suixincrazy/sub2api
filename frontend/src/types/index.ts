@@ -2474,13 +2474,18 @@ export interface TotpLogin2FARequest {
   totp_code: string
 }
 
-// ==================== Scheduled Test Types ====================
+// ==================== Scheduled Keepalive Types ====================
 
 export interface ScheduledTestPlan {
   id: number
   account_id: number
   model_id: string
   cron_expression: string
+  probe_interval_seconds: number
+  keepalive_interval_seconds: number
+  keepalive_max_interval_seconds: number
+  last_status: string
+  consecutive_failures: number
   enabled: boolean
   max_results: number
   auto_recover: boolean
@@ -2505,7 +2510,10 @@ export interface ScheduledTestResult {
 export interface CreateScheduledTestPlanRequest {
   account_id: number
   model_id: string
-  cron_expression: string
+  cron_expression?: string
+  probe_interval_seconds?: number
+  keepalive_interval_seconds?: number
+  keepalive_max_interval_seconds?: number
   enabled?: boolean
   max_results?: number
   auto_recover?: boolean
@@ -2514,6 +2522,9 @@ export interface CreateScheduledTestPlanRequest {
 export interface UpdateScheduledTestPlanRequest {
   model_id?: string
   cron_expression?: string
+  probe_interval_seconds?: number
+  keepalive_interval_seconds?: number
+  keepalive_max_interval_seconds?: number
   enabled?: boolean
   max_results?: number
   auto_recover?: boolean

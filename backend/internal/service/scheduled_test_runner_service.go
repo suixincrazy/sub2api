@@ -2,148 +2,224 @@ package service
 
 import (
 	"context"
+	"math/rand/v2"
+	"net/http"
 	"sync"
 	"time"
 
 	"github.com/Wei-Shaw/sub2api/internal/config"
 	"github.com/Wei-Shaw/sub2api/internal/pkg/logger"
-	"github.com/robfig/cron/v3"
 )
 
-const scheduledTestDefaultMaxWorkers = 10
+const (
+	scheduledTestDefaultMaxWorkers = 10
+	keepaliveRequestTimeout        = 30 * time.Second
+)
 
-// ScheduledTestRunnerService periodically scans due test plans and executes them.
+type keepaliveRun struct {
+	plan   *ScheduledTestPlan
+	cancel context.CancelFunc
+}
+
+// ScheduledTestRunnerService maintains persistent probe/keepalive schedules.
+// A single dispatcher owns admission; slow requests never block other accounts.
 type ScheduledTestRunnerService struct {
-	planRepo       ScheduledTestPlanRepository
-	scheduledSvc   *ScheduledTestService
-	accountTestSvc *AccountTestService
-	rateLimitSvc   *RateLimitService
-	cfg            *config.Config
+	planRepo     ScheduledTestPlanRepository
+	scheduledSvc *ScheduledTestService
+	runTest      func(context.Context, int64, string) (*ScheduledTestResult, error)
+	rateLimitSvc *RateLimitService
 
-	cron      *cron.Cron
+	ctx       context.Context
+	cancel    context.CancelFunc
+	done      chan struct{}
+	running   map[int64]*keepaliveRun
+	mu        sync.Mutex
+	workers   sync.WaitGroup
 	startOnce sync.Once
 	stopOnce  sync.Once
 }
 
-// NewScheduledTestRunnerService creates a new runner.
 func NewScheduledTestRunnerService(
 	planRepo ScheduledTestPlanRepository,
 	scheduledSvc *ScheduledTestService,
 	accountTestSvc *AccountTestService,
 	rateLimitSvc *RateLimitService,
-	cfg *config.Config,
+	_ *config.Config,
 ) *ScheduledTestRunnerService {
+	ctx, cancel := context.WithCancel(context.Background())
 	return &ScheduledTestRunnerService{
-		planRepo:       planRepo,
-		scheduledSvc:   scheduledSvc,
-		accountTestSvc: accountTestSvc,
-		rateLimitSvc:   rateLimitSvc,
-		cfg:            cfg,
+		planRepo: planRepo, scheduledSvc: scheduledSvc,
+		runTest:      accountTestSvc.RunKeepaliveBackground,
+		rateLimitSvc: rateLimitSvc, ctx: ctx, cancel: cancel,
+		done: make(chan struct{}), running: make(map[int64]*keepaliveRun),
 	}
 }
 
-// Start begins the cron ticker (every minute).
 func (s *ScheduledTestRunnerService) Start() {
 	if s == nil {
 		return
 	}
 	s.startOnce.Do(func() {
-		loc := time.Local
-		if s.cfg != nil {
-			if parsed, err := time.LoadLocation(s.cfg.Timezone); err == nil && parsed != nil {
-				loc = parsed
+		go func() {
+			defer close(s.done)
+			ticker := time.NewTicker(time.Second)
+			defer ticker.Stop()
+			for {
+				s.runScheduled()
+				select {
+				case <-s.ctx.Done():
+					s.workers.Wait()
+					return
+				case <-ticker.C:
+				}
 			}
-		}
-
-		c := cron.New(cron.WithParser(scheduledTestCronParser), cron.WithLocation(loc))
-		_, err := c.AddFunc("* * * * *", func() { s.runScheduled() })
-		if err != nil {
-			logger.LegacyPrintf("service.scheduled_test_runner", "[ScheduledTestRunner] not started (invalid schedule): %v", err)
-			return
-		}
-		s.cron = c
-		s.cron.Start()
-		logger.LegacyPrintf("service.scheduled_test_runner", "[ScheduledTestRunner] started (tick=every minute)")
+		}()
+		logger.LegacyPrintf("service.scheduled_test_runner", "[KeepaliveRunner] started (tick=1s, workers=%d)", scheduledTestDefaultMaxWorkers)
 	})
 }
 
-// Stop gracefully shuts down the cron scheduler.
 func (s *ScheduledTestRunnerService) Stop() {
 	if s == nil {
 		return
 	}
 	s.stopOnce.Do(func() {
-		if s.cron != nil {
-			ctx := s.cron.Stop()
-			select {
-			case <-ctx.Done():
-			case <-time.After(3 * time.Second):
-				logger.LegacyPrintf("service.scheduled_test_runner", "[ScheduledTestRunner] cron stop timed out")
-			}
+		s.cancel()
+		// Also makes Stop safe when startup never reached Start.
+		s.Start()
+		select {
+		case <-s.done:
+		case <-time.After(5 * time.Second):
+			logger.LegacyPrintf("service.scheduled_test_runner", "[KeepaliveRunner] shutdown timed out")
 		}
 	})
 }
 
 func (s *ScheduledTestRunnerService) runScheduled() {
-	// Delay 10s so execution lands at ~:10 of each minute instead of :00.
-	time.Sleep(10 * time.Second)
-
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+	if s.ctx.Err() != nil {
+		return
+	}
+	ctx, cancel := context.WithTimeout(s.ctx, 5*time.Second)
 	defer cancel()
-
-	now := time.Now()
-	plans, err := s.planRepo.ListDue(ctx, now)
+	plans, err := s.planRepo.ListEnabled(ctx)
 	if err != nil {
-		logger.LegacyPrintf("service.scheduled_test_runner", "[ScheduledTestRunner] ListDue error: %v", err)
+		logger.LegacyPrintf("service.scheduled_test_runner", "[KeepaliveRunner] list plans: %v", err)
 		return
 	}
-	if len(plans) == 0 {
-		return
+	enabled := make(map[int64]*ScheduledTestPlan, len(plans))
+	for _, p := range plans {
+		enabled[p.ID] = p
 	}
 
-	logger.LegacyPrintf("service.scheduled_test_runner", "[ScheduledTestRunner] found %d due plans", len(plans))
-
-	sem := make(chan struct{}, scheduledTestDefaultMaxWorkers)
-	var wg sync.WaitGroup
-
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	busyAccounts := make(map[int64]bool)
+	for id, run := range s.running {
+		current := enabled[id]
+		if current == nil || !current.UpdatedAt.Equal(run.plan.UpdatedAt) {
+			run.cancel()
+		}
+		// A cancelled transport still owns its slot until it actually exits.
+		busyAccounts[run.plan.AccountID] = true
+	}
+	now := time.Now()
 	for _, plan := range plans {
-		sem <- struct{}{}
-		wg.Add(1)
-		go func(p *ScheduledTestPlan) {
-			defer wg.Done()
-			defer func() { <-sem }()
-			s.runOnePlan(ctx, p)
-		}(plan)
+		if len(s.running) >= scheduledTestDefaultMaxWorkers || s.ctx.Err() != nil {
+			break
+		}
+		if s.running[plan.ID] != nil || busyAccounts[plan.AccountID] {
+			continue
+		}
+		if plan.NextRunAt != nil && plan.NextRunAt.After(now) {
+			continue
+		}
+		runCtx, runCancel := context.WithCancel(s.ctx)
+		run := &keepaliveRun{plan: plan, cancel: runCancel}
+		s.running[plan.ID] = run
+		busyAccounts[plan.AccountID] = true
+		s.workers.Add(1)
+		go func() {
+			defer s.workers.Done()
+			defer runCancel()
+			defer func() {
+				s.mu.Lock()
+				delete(s.running, run.plan.ID)
+				s.mu.Unlock()
+			}()
+			s.runOnePlan(runCtx, run.plan)
+		}()
 	}
-
-	wg.Wait()
 }
 
 func (s *ScheduledTestRunnerService) runOnePlan(ctx context.Context, plan *ScheduledTestPlan) {
-	result, err := s.accountTestSvc.RunTestBackground(ctx, plan.AccountID, plan.ModelID)
-	if err != nil {
-		logger.LegacyPrintf("service.scheduled_test_runner", "[ScheduledTestRunner] plan=%d RunTestBackground error: %v", plan.ID, err)
+	// Recheck after admission: a previous request may have finished while the
+	// dispatcher was loading its snapshot, or the administrator paused the plan.
+	checkCtx, checkCancel := context.WithTimeout(ctx, 5*time.Second)
+	current, err := s.planRepo.GetByID(checkCtx, plan.ID)
+	checkCancel()
+	if err != nil || current == nil || !current.Enabled || !current.UpdatedAt.Equal(plan.UpdatedAt) ||
+		(current.NextRunAt != nil && current.NextRunAt.After(time.Now())) {
 		return
 	}
-
-	if err := s.scheduledSvc.SaveResult(ctx, plan.ID, plan.MaxResults, result); err != nil {
-		logger.LegacyPrintf("service.scheduled_test_runner", "[ScheduledTestRunner] plan=%d SaveResult error: %v", plan.ID, err)
+	plan = current
+	startedAt := time.Now()
+	requestCtx, cancel := context.WithTimeout(ctx, keepaliveRequestTimeout)
+	result, err := s.runTest(requestCtx, plan.AccountID, plan.ModelID)
+	cancel()
+	// Pause/delete/edit/shutdown cancels the run. It must not revive the old plan.
+	if ctx.Err() != nil {
+		return
+	}
+	if err != nil || result == nil {
+		result = &ScheduledTestResult{Status: "failed", StartedAt: startedAt, FinishedAt: time.Now()}
+		result.LatencyMs = result.FinishedAt.Sub(startedAt).Milliseconds()
+		result.ErrorMessage = "keepalive returned no result"
+		if err != nil {
+			result.ErrorMessage = err.Error()
+		}
 	}
 
-	// Auto-recover account if test succeeded and auto_recover is enabled.
+	s.scheduledSvc.planMu.Lock()
+	defer s.scheduledSvc.planMu.Unlock()
+	if ctx.Err() != nil {
+		return
+	}
+	delay, failures := nextKeepaliveDelay(plan, result)
+	nextRun := time.Now().Add(delay)
+	saveCtx, saveCancel := context.WithTimeout(ctx, 5*time.Second)
+	defer saveCancel()
+	applied, err := s.planRepo.UpdateAfterRun(saveCtx, plan, startedAt, nextRun, result.Status, failures)
+	if err != nil {
+		logger.LegacyPrintf("service.scheduled_test_runner", "[KeepaliveRunner] plan=%d update schedule: %v", plan.ID, err)
+		return
+	}
+	if !applied {
+		return
+	}
+	if err := s.scheduledSvc.SaveResult(saveCtx, plan.ID, plan.MaxResults, result); err != nil {
+		logger.LegacyPrintf("service.scheduled_test_runner", "[KeepaliveRunner] plan=%d save result: %v", plan.ID, err)
+	}
 	if result.Status == "success" && plan.AutoRecover {
-		s.tryRecoverAccount(ctx, plan.AccountID, plan.ID)
+		s.tryRecoverAccount(saveCtx, plan.AccountID, plan.ID)
 	}
+}
 
-	nextRun, err := computeNextRun(plan.CronExpression, time.Now())
-	if err != nil {
-		logger.LegacyPrintf("service.scheduled_test_runner", "[ScheduledTestRunner] plan=%d computeNextRun error: %v", plan.ID, err)
-		return
+func nextKeepaliveDelay(plan *ScheduledTestPlan, result *ScheduledTestResult) (time.Duration, int) {
+	if result.Status == "success" {
+		minimum := max(1, plan.KeepaliveIntervalSeconds)
+		maximum := max(minimum, plan.KeepaliveMaxIntervalSeconds)
+		return time.Duration(minimum+rand.IntN(maximum-minimum+1)) * time.Second, 0
 	}
-
-	if err := s.planRepo.UpdateAfterRun(ctx, plan.ID, time.Now(), nextRun); err != nil {
-		logger.LegacyPrintf("service.scheduled_test_runner", "[ScheduledTestRunner] plan=%d UpdateAfterRun error: %v", plan.ID, err)
+	failures := min(plan.ConsecutiveFailures+1, 30)
+	delay := time.Duration(max(1, plan.ProbeIntervalSeconds)) * time.Second
+	if result.HTTPStatus == http.StatusTooManyRequests {
+		if backoff := time.Duration(min(1<<min(failures, 6), 60)) * time.Second; backoff > delay {
+			delay = backoff
+		}
 	}
+	if result.RetryAfter > delay {
+		delay = result.RetryAfter
+	}
+	return delay, failures
 }
 
 // tryRecoverAccount attempts to recover an account from recoverable runtime state.

@@ -19,7 +19,6 @@ import (
 	"log"
 	"mime/multipart"
 	"net/http"
-	"net/http/httptest"
 	"net/url"
 	"regexp"
 	"strings"
@@ -378,6 +377,10 @@ func (s *AccountTestService) TestAccountConnection(c *gin.Context, accountID int
 		return s.sendErrorAndEnd(c, "Account not found")
 	}
 
+	if keepaliveState(c) != nil && (isKeepaliveMediaModel(modelID) || isKeepaliveMediaModel(account.GetMappedModel(modelID))) {
+		return s.sendErrorAndEnd(c, "keepalive requires a text model")
+	}
+
 	// Synthetic UI load-test accounts exercise the real SSE parsing and modal
 	// interactions, but intentionally do not send their placeholder credentials
 	// to an upstream provider.
@@ -396,6 +399,9 @@ func (s *AccountTestService) TestAccountConnection(c *gin.Context, accountID int
 	if account.IsCNProvider() {
 		switch account.GetAPIProtocol() {
 		case APIProtocolAdaptive:
+			if keepaliveState(c) != nil {
+				return s.testCNProviderChatCompletionsConnection(c, account, modelID, prompt)
+			}
 			return s.testCNProviderAdaptiveConnection(c, account, modelID, prompt)
 		case APIProtocolResponses:
 			return s.testOpenAIAccountConnection(c, account, modelID, prompt, normalizeAccountTestMode(mode))
@@ -557,6 +563,7 @@ func (s *AccountTestService) testClaudeAccountConnection(c *gin.Context, account
 	if err != nil {
 		return s.sendErrorAndEnd(c, "Failed to create test payload")
 	}
+	applyKeepalivePayload(c, payload, "anthropic", false)
 	payloadBytes, _ := json.Marshal(payload)
 
 	// Send test_start event
@@ -605,6 +612,7 @@ func (s *AccountTestService) testClaudeAccountConnection(c *gin.Context, account
 	if err != nil {
 		return s.sendErrorAndEnd(c, fmt.Sprintf("Request failed: %s", err.Error()))
 	}
+	observeKeepaliveResponse(c, resp)
 	defer func() { _ = resp.Body.Close() }()
 
 	if resp.StatusCode != http.StatusOK {
@@ -640,6 +648,7 @@ func (s *AccountTestService) testClaudeVertexServiceAccountConnection(c *gin.Con
 	if err != nil {
 		return s.sendErrorAndEnd(c, "Failed to create test payload")
 	}
+	applyKeepalivePayload(c, payload, "anthropic", false)
 	payloadBytes, _ := json.Marshal(payload)
 	vertexBody, err := buildVertexAnthropicRequestBody(payloadBytes)
 	if err != nil {
@@ -677,6 +686,7 @@ func (s *AccountTestService) testClaudeVertexServiceAccountConnection(c *gin.Con
 	if err != nil {
 		return s.sendErrorAndEnd(c, fmt.Sprintf("Request failed: %s", err.Error()))
 	}
+	observeKeepaliveResponse(c, resp)
 	defer func() { _ = resp.Body.Close() }()
 
 	if resp.StatusCode != http.StatusOK {
@@ -724,6 +734,10 @@ func (s *AccountTestService) testBedrockAccountConnection(c *gin.Context, ctx co
 		"max_tokens":  256,
 		"temperature": 1,
 	}
+	if keepaliveState(c) != nil {
+		bedrockPayload["messages"] = []map[string]any{{"role": "user", "content": []map[string]any{{"type": "text", "text": keepalivePrompt}}}}
+		applyKeepalivePayload(c, bedrockPayload, "anthropic", false)
+	}
 	bedrockBody, _ := json.Marshal(bedrockPayload)
 
 	// Use non-streaming endpoint (response is standard Claude JSON)
@@ -763,6 +777,7 @@ func (s *AccountTestService) testBedrockAccountConnection(c *gin.Context, ctx co
 	if err != nil {
 		return s.sendErrorAndEnd(c, fmt.Sprintf("Request failed: %s", err.Error()))
 	}
+	observeKeepaliveResponse(c, resp)
 	defer func() { _ = resp.Body.Close() }()
 
 	body, _ := io.ReadAll(resp.Body)
@@ -889,6 +904,7 @@ func (s *AccountTestService) testOpenAIAccountConnection(c *gin.Context, account
 		upstreamTestModelID = normalizeOpenAIModelForUpstream(credentialAccount, testModelID)
 	}
 	payload := createOpenAIClientTestPayload(upstreamTestModelID, isOAuth, prompt)
+	applyKeepalivePayload(c, payload, "responses", isOAuth)
 	payloadBytes, _ := json.Marshal(payload)
 
 	// Send test_start event once. A task-invalid Agent Identity response may
@@ -954,6 +970,7 @@ func (s *AccountTestService) testOpenAIAccountConnection(c *gin.Context, account
 	if err != nil {
 		return s.sendErrorAndEnd(c, fmt.Sprintf("Request failed: %s", err.Error()))
 	}
+	observeKeepaliveResponse(c, resp)
 	defer func() { _ = resp.Body.Close() }()
 
 	if isOAuth && s.accountRepo != nil {
@@ -1271,6 +1288,7 @@ func (s *AccountTestService) testGrokResponsesConnection(c *gin.Context, ctx con
 	if err != nil {
 		return s.sendErrorAndEnd(c, fmt.Sprintf("Grok Responses API request failed: %s", err.Error()))
 	}
+	observeKeepaliveResponse(c, resp)
 	defer func() { _ = resp.Body.Close() }()
 
 	s.observeGrokTestResponse(withGrokTeamRateLimitModel(ctx, testModelID), account, resp)
@@ -1363,6 +1381,7 @@ func (s *AccountTestService) testGrokImageGeneration(c *gin.Context, ctx context
 			return s.sendErrorAndEnd(c, formatGrokImageTransportError(doErr, hasSourceImage, len(payloadBytes)))
 		}
 	}
+	observeKeepaliveResponse(c, resp)
 	defer func() { _ = resp.Body.Close() }()
 	s.observeGrokTestResponse(ctx, account, resp)
 
@@ -1450,6 +1469,7 @@ func (s *AccountTestService) testGrokVideoGeneration(c *gin.Context, ctx context
 	if err != nil {
 		return s.sendErrorAndEnd(c, fmt.Sprintf("Grok video request failed: %s", err.Error()))
 	}
+	observeKeepaliveResponse(c, resp)
 	defer func() { _ = resp.Body.Close() }()
 	s.observeGrokTestResponse(ctx, account, resp)
 
@@ -1548,6 +1568,7 @@ func (s *AccountTestService) emitGrokVideoResult(c *gin.Context, ctx context.Con
 	if err != nil {
 		return s.sendErrorAndEnd(c, fmt.Sprintf("Grok video content download failed: %s", err.Error()))
 	}
+	observeKeepaliveResponse(c, resp)
 	defer func() { _ = resp.Body.Close() }()
 	body, _ := io.ReadAll(io.LimitReader(resp.Body, 64<<20)) // 64 MiB cap for admin preview
 	if resp.StatusCode != http.StatusOK {
@@ -1620,6 +1641,7 @@ User query:
 	if err != nil {
 		return s.sendErrorAndEnd(c, fmt.Sprintf("standalone web_search probe failed: %s", err.Error()))
 	}
+	observeKeepaliveResponse(c, resp)
 	defer func() { _ = resp.Body.Close() }()
 	s.observeGrokTestResponse(withGrokTeamRateLimitModel(ctx, grokDefaultResponsesModel), account, resp)
 
@@ -1792,6 +1814,7 @@ func (s *AccountTestService) testGrokSTT(c *gin.Context, ctx context.Context, ac
 	if err != nil {
 		return s.sendErrorAndEnd(c, fmt.Sprintf("Grok STT failed: %s", err.Error()))
 	}
+	observeKeepaliveResponse(c, resp)
 	defer func() { _ = resp.Body.Close() }()
 	s.observeGrokTestResponse(ctx, account, resp)
 	respBody, _ := io.ReadAll(resp.Body)
@@ -2132,6 +2155,7 @@ func (s *AccountTestService) testOpenAIChatCompletionsConnection(
 	c.Writer.Flush()
 
 	payload := createOpenAIChatCompletionsTestPayload(testModelID, prompt)
+	applyKeepalivePayload(c, payload, "chat", false)
 	payloadBytes, _ := json.Marshal(payload)
 
 	s.sendEvent(c, TestEvent{Type: "test_start", Model: testModelID})
@@ -2167,6 +2191,7 @@ func (s *AccountTestService) testOpenAIChatCompletionsConnection(
 	if err != nil {
 		return s.sendErrorAndEnd(c, fmt.Sprintf("Chat Completions API (/v1/chat/completions) request failed: %s", err.Error()))
 	}
+	observeKeepaliveResponse(c, resp)
 	defer func() { _ = resp.Body.Close() }()
 
 	if resp.StatusCode != http.StatusOK {
@@ -2307,6 +2332,7 @@ func (s *AccountTestService) testOpenAICompactConnection(c *gin.Context, account
 		}
 		return s.sendErrorAndEnd(c, fmt.Sprintf("Request failed: %s", err.Error()))
 	}
+	observeKeepaliveResponse(c, resp)
 	defer func() { _ = resp.Body.Close() }()
 
 	body, _ := io.ReadAll(io.LimitReader(resp.Body, 2<<20))
@@ -2417,6 +2443,14 @@ func (s *AccountTestService) testGeminiAccountConnection(c *gin.Context, account
 
 	// Create test payload (Gemini format)
 	payload := createGeminiTestPayload(testModelID, prompt)
+	if keepaliveState(c) != nil {
+		var body map[string]any
+		if err := json.Unmarshal(payload, &body); err != nil {
+			return s.sendErrorAndEnd(c, "Failed to create keepalive payload")
+		}
+		body["generationConfig"] = map[string]any{"maxOutputTokens": keepaliveMaxTokens}
+		payload, _ = json.Marshal(body)
+	}
 
 	// Build request based on account type
 	var req *http.Request
@@ -2450,6 +2484,7 @@ func (s *AccountTestService) testGeminiAccountConnection(c *gin.Context, account
 	if err != nil {
 		return s.sendErrorAndEnd(c, fmt.Sprintf("Request failed: %s", err.Error()))
 	}
+	observeKeepaliveResponse(c, resp)
 	defer func() { _ = resp.Body.Close() }()
 
 	if resp.StatusCode != http.StatusOK {
@@ -2704,6 +2739,9 @@ func (s *AccountTestService) processGeminiStream(c *gin.Context, body io.Reader)
 		line, err := reader.ReadString('\n')
 		if err != nil {
 			if err == io.EOF {
+				if keepaliveState(c) != nil {
+					return s.sendErrorAndEnd(c, "Gemini stream ended before finishReason")
+				}
 				s.sendEvent(c, TestEvent{Type: "test_complete", Success: true})
 				return nil
 			}
@@ -2717,6 +2755,9 @@ func (s *AccountTestService) processGeminiStream(c *gin.Context, body io.Reader)
 
 		jsonStr := strings.TrimPrefix(line, "data: ")
 		if jsonStr == "[DONE]" {
+			if keepaliveState(c) != nil {
+				return s.sendErrorAndEnd(c, "Gemini stream ended before finishReason")
+			}
 			s.sendEvent(c, TestEvent{Type: "test_complete", Success: true})
 			return nil
 		}
@@ -3079,6 +3120,7 @@ func (s *AccountTestService) testOpenAIImageAPIKey(c *gin.Context, ctx context.C
 	if err != nil {
 		return s.sendErrorAndEnd(c, fmt.Sprintf("Request failed: %s", err.Error()))
 	}
+	observeKeepaliveResponse(c, resp)
 	defer func() { _ = resp.Body.Close() }()
 
 	body, err := io.ReadAll(resp.Body)
@@ -3294,63 +3336,4 @@ func (s *AccountTestService) sendErrorAndEnd(c *gin.Context, errorMsg string) er
 	log.Printf("Account test error: %s", errorMsg)
 	s.sendEvent(c, TestEvent{Type: "error", Error: errorMsg})
 	return fmt.Errorf("%s", errorMsg)
-}
-
-// RunTestBackground executes an account test in-memory (no real HTTP client),
-// capturing SSE output via httptest.NewRecorder, then parses the result.
-func (s *AccountTestService) RunTestBackground(ctx context.Context, accountID int64, modelID string) (*ScheduledTestResult, error) {
-	startedAt := time.Now()
-
-	w := httptest.NewRecorder()
-	ginCtx, _ := gin.CreateTestContext(w)
-	ginCtx.Request = (&http.Request{}).WithContext(ctx)
-
-	testErr := s.TestAccountConnection(ginCtx, accountID, modelID, "", AccountTestModeDefault)
-
-	finishedAt := time.Now()
-	body := w.Body.String()
-	responseText, errMsg := parseTestSSEOutput(body)
-
-	status := "success"
-	if testErr != nil || errMsg != "" {
-		status = "failed"
-		if errMsg == "" && testErr != nil {
-			errMsg = testErr.Error()
-		}
-	}
-
-	return &ScheduledTestResult{
-		Status:       status,
-		ResponseText: responseText,
-		ErrorMessage: errMsg,
-		LatencyMs:    finishedAt.Sub(startedAt).Milliseconds(),
-		StartedAt:    startedAt,
-		FinishedAt:   finishedAt,
-	}, nil
-}
-
-// parseTestSSEOutput extracts response text and error message from captured SSE output.
-func parseTestSSEOutput(body string) (responseText, errMsg string) {
-	var texts []string
-	for _, line := range strings.Split(body, "\n") {
-		line = strings.TrimSpace(line)
-		if !strings.HasPrefix(line, "data: ") {
-			continue
-		}
-		jsonStr := strings.TrimPrefix(line, "data: ")
-		var event TestEvent
-		if err := json.Unmarshal([]byte(jsonStr), &event); err != nil {
-			continue
-		}
-		switch event.Type {
-		case "content":
-			if event.Text != "" {
-				texts = append(texts, event.Text)
-			}
-		case "error":
-			errMsg = event.Error
-		}
-	}
-	responseText = strings.Join(texts, "")
-	return
 }

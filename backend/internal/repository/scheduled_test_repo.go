@@ -20,16 +20,16 @@ func NewScheduledTestPlanRepository(db *sql.DB) service.ScheduledTestPlanReposit
 
 func (r *scheduledTestPlanRepository) Create(ctx context.Context, plan *service.ScheduledTestPlan) (*service.ScheduledTestPlan, error) {
 	row := r.db.QueryRowContext(ctx, `
-		INSERT INTO scheduled_test_plans (account_id, model_id, cron_expression, enabled, max_results, auto_recover, next_run_at, created_at, updated_at)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, NOW(), NOW())
-		RETURNING id, account_id, model_id, cron_expression, enabled, max_results, auto_recover, last_run_at, next_run_at, created_at, updated_at
-	`, plan.AccountID, plan.ModelID, plan.CronExpression, plan.Enabled, plan.MaxResults, plan.AutoRecover, plan.NextRunAt)
+		INSERT INTO scheduled_test_plans (account_id, model_id, cron_expression, enabled, max_results, auto_recover, next_run_at, created_at, updated_at, probe_interval_seconds, keepalive_interval_seconds, keepalive_max_interval_seconds)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, NOW(), NOW(), $8, $9, $10)
+		RETURNING id, account_id, model_id, cron_expression, enabled, max_results, auto_recover, last_run_at, next_run_at, created_at, updated_at, probe_interval_seconds, keepalive_interval_seconds, keepalive_max_interval_seconds, last_status, consecutive_failures
+	`, plan.AccountID, plan.ModelID, plan.CronExpression, plan.Enabled, plan.MaxResults, plan.AutoRecover, plan.NextRunAt, plan.ProbeIntervalSeconds, plan.KeepaliveIntervalSeconds, plan.KeepaliveMaxIntervalSeconds)
 	return scanPlan(row)
 }
 
 func (r *scheduledTestPlanRepository) GetByID(ctx context.Context, id int64) (*service.ScheduledTestPlan, error) {
 	row := r.db.QueryRowContext(ctx, `
-		SELECT id, account_id, model_id, cron_expression, enabled, max_results, auto_recover, last_run_at, next_run_at, created_at, updated_at
+		SELECT id, account_id, model_id, cron_expression, enabled, max_results, auto_recover, last_run_at, next_run_at, created_at, updated_at, probe_interval_seconds, keepalive_interval_seconds, keepalive_max_interval_seconds, last_status, consecutive_failures
 		FROM scheduled_test_plans WHERE id = $1
 	`, id)
 	return scanPlan(row)
@@ -37,7 +37,7 @@ func (r *scheduledTestPlanRepository) GetByID(ctx context.Context, id int64) (*s
 
 func (r *scheduledTestPlanRepository) ListByAccountID(ctx context.Context, accountID int64) ([]*service.ScheduledTestPlan, error) {
 	rows, err := r.db.QueryContext(ctx, `
-		SELECT id, account_id, model_id, cron_expression, enabled, max_results, auto_recover, last_run_at, next_run_at, created_at, updated_at
+		SELECT id, account_id, model_id, cron_expression, enabled, max_results, auto_recover, last_run_at, next_run_at, created_at, updated_at, probe_interval_seconds, keepalive_interval_seconds, keepalive_max_interval_seconds, last_status, consecutive_failures
 		FROM scheduled_test_plans WHERE account_id = $1
 		ORDER BY created_at DESC
 	`, accountID)
@@ -48,13 +48,13 @@ func (r *scheduledTestPlanRepository) ListByAccountID(ctx context.Context, accou
 	return scanPlans(rows)
 }
 
-func (r *scheduledTestPlanRepository) ListDue(ctx context.Context, now time.Time) ([]*service.ScheduledTestPlan, error) {
+func (r *scheduledTestPlanRepository) ListEnabled(ctx context.Context) ([]*service.ScheduledTestPlan, error) {
 	rows, err := r.db.QueryContext(ctx, `
-		SELECT id, account_id, model_id, cron_expression, enabled, max_results, auto_recover, last_run_at, next_run_at, created_at, updated_at
+		SELECT id, account_id, model_id, cron_expression, enabled, max_results, auto_recover, last_run_at, next_run_at, created_at, updated_at, probe_interval_seconds, keepalive_interval_seconds, keepalive_max_interval_seconds, last_status, consecutive_failures
 		FROM scheduled_test_plans
-		WHERE enabled = true AND next_run_at <= $1
-		ORDER BY next_run_at ASC
-	`, now)
+		WHERE enabled = true
+		ORDER BY next_run_at ASC NULLS FIRST, id ASC
+	`)
 	if err != nil {
 		return nil, err
 	}
@@ -65,10 +65,10 @@ func (r *scheduledTestPlanRepository) ListDue(ctx context.Context, now time.Time
 func (r *scheduledTestPlanRepository) Update(ctx context.Context, plan *service.ScheduledTestPlan) (*service.ScheduledTestPlan, error) {
 	row := r.db.QueryRowContext(ctx, `
 		UPDATE scheduled_test_plans
-		SET model_id = $2, cron_expression = $3, enabled = $4, max_results = $5, auto_recover = $6, next_run_at = $7, updated_at = NOW()
+		SET model_id = $2, cron_expression = $3, enabled = $4, max_results = $5, auto_recover = $6, next_run_at = $7, updated_at = NOW(), probe_interval_seconds = $8, keepalive_interval_seconds = $9, keepalive_max_interval_seconds = $10
 		WHERE id = $1
-		RETURNING id, account_id, model_id, cron_expression, enabled, max_results, auto_recover, last_run_at, next_run_at, created_at, updated_at
-	`, plan.ID, plan.ModelID, plan.CronExpression, plan.Enabled, plan.MaxResults, plan.AutoRecover, plan.NextRunAt)
+		RETURNING id, account_id, model_id, cron_expression, enabled, max_results, auto_recover, last_run_at, next_run_at, created_at, updated_at, probe_interval_seconds, keepalive_interval_seconds, keepalive_max_interval_seconds, last_status, consecutive_failures
+	`, plan.ID, plan.ModelID, plan.CronExpression, plan.Enabled, plan.MaxResults, plan.AutoRecover, plan.NextRunAt, plan.ProbeIntervalSeconds, plan.KeepaliveIntervalSeconds, plan.KeepaliveMaxIntervalSeconds)
 	return scanPlan(row)
 }
 
@@ -77,11 +77,18 @@ func (r *scheduledTestPlanRepository) Delete(ctx context.Context, id int64) erro
 	return err
 }
 
-func (r *scheduledTestPlanRepository) UpdateAfterRun(ctx context.Context, id int64, lastRunAt time.Time, nextRunAt time.Time) error {
-	_, err := r.db.ExecContext(ctx, `
-		UPDATE scheduled_test_plans SET last_run_at = $2, next_run_at = $3, updated_at = NOW() WHERE id = $1
-	`, id, lastRunAt, nextRunAt)
-	return err
+func (r *scheduledTestPlanRepository) UpdateAfterRun(ctx context.Context, plan *service.ScheduledTestPlan, lastRunAt time.Time, nextRunAt time.Time, status string, failures int) (bool, error) {
+	// updated_at is the configuration revision. A late request must not overwrite
+	// a pause, deletion, or edited schedule; execution does not change that revision.
+	result, err := r.db.ExecContext(ctx, `
+		UPDATE scheduled_test_plans SET last_run_at = $2, next_run_at = $3, last_status = $4, consecutive_failures = $5
+		WHERE id = $1 AND enabled = true AND updated_at = $6
+	`, plan.ID, lastRunAt, nextRunAt, status, failures, plan.UpdatedAt)
+	if err != nil {
+		return false, err
+	}
+	affected, err := result.RowsAffected()
+	return affected > 0, err
 }
 
 // --- Result Repository ---
@@ -124,7 +131,7 @@ func (r *scheduledTestResultRepository) ListByPlanID(ctx context.Context, planID
 	}
 	defer func() { _ = rows.Close() }()
 
-	var results []*service.ScheduledTestResult
+	results := make([]*service.ScheduledTestResult, 0)
 	for rows.Next() {
 		r := &service.ScheduledTestResult{}
 		if err := rows.Scan(
@@ -164,6 +171,7 @@ func scanPlan(row scannable) (*service.ScheduledTestPlan, error) {
 	if err := row.Scan(
 		&p.ID, &p.AccountID, &p.ModelID, &p.CronExpression, &p.Enabled, &p.MaxResults, &p.AutoRecover,
 		&p.LastRunAt, &p.NextRunAt, &p.CreatedAt, &p.UpdatedAt,
+		&p.ProbeIntervalSeconds, &p.KeepaliveIntervalSeconds, &p.KeepaliveMaxIntervalSeconds, &p.LastStatus, &p.ConsecutiveFailures,
 	); err != nil {
 		return nil, err
 	}
@@ -171,7 +179,7 @@ func scanPlan(row scannable) (*service.ScheduledTestPlan, error) {
 }
 
 func scanPlans(rows *sql.Rows) ([]*service.ScheduledTestPlan, error) {
-	var plans []*service.ScheduledTestPlan
+	plans := make([]*service.ScheduledTestPlan, 0)
 	for rows.Next() {
 		p, err := scanPlan(rows)
 		if err != nil {

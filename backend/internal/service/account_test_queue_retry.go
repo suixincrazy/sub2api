@@ -72,6 +72,11 @@ func (s *AccountTestService) doAccountTestUpstreamWithQueueRetry(
 	account *Account,
 	do func(*http.Request) (*http.Response, error),
 ) (*http.Response, error) {
+	if keepaliveState(c) != nil {
+		resp, err := do(req)
+		observeKeepaliveResponse(c, resp)
+		return resp, err
+	}
 	ctx := req.Context()
 	deadline := time.Now().Add(accountTestQueueRetryBudget)
 	attempt := req
