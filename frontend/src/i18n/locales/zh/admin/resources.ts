@@ -36,7 +36,7 @@ export default {
       maxResultsTooltipExample: '例如填写 100，则保留最近 100 次请求。',
       maxResultsTooltipRange: '可填写 1–1000。',
       autoRecover: '自动恢复',
-      autoRecoverHelp: '收到成功响应后，清除可恢复异常并开启账号调度；已禁用或因到期自动暂停的账号不会开启调度'
+      autoRecoverHelp: '探活成功后清除可恢复异常，调度关闭时自动开启；已禁用或因到期自动暂停的账号不会恢复。手动关闭调度会关闭现有计划的自动恢复，保活继续；需再次明确开启自动恢复才会恢复调度。'
     },
 
     // Proxies Management

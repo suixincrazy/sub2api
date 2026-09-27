@@ -66,9 +66,9 @@ func (r *scheduledTestPlanRepository) Update(ctx context.Context, plan *service.
 	row := r.db.QueryRowContext(ctx, `
 		UPDATE scheduled_test_plans
 		SET model_id = $2, cron_expression = $3, enabled = $4, max_results = $5, auto_recover = $6, next_run_at = $7, updated_at = NOW(), probe_interval_seconds = $8, keepalive_interval_seconds = $9, keepalive_max_interval_seconds = $10
-		WHERE id = $1
+		WHERE id = $1 AND updated_at = $11
 		RETURNING id, account_id, model_id, cron_expression, enabled, max_results, auto_recover, last_run_at, next_run_at, created_at, updated_at, probe_interval_seconds, keepalive_interval_seconds, keepalive_max_interval_seconds, last_status, consecutive_failures
-	`, plan.ID, plan.ModelID, plan.CronExpression, plan.Enabled, plan.MaxResults, plan.AutoRecover, plan.NextRunAt, plan.ProbeIntervalSeconds, plan.KeepaliveIntervalSeconds, plan.KeepaliveMaxIntervalSeconds)
+	`, plan.ID, plan.ModelID, plan.CronExpression, plan.Enabled, plan.MaxResults, plan.AutoRecover, plan.NextRunAt, plan.ProbeIntervalSeconds, plan.KeepaliveIntervalSeconds, plan.KeepaliveMaxIntervalSeconds, plan.UpdatedAt)
 	return scanPlan(row)
 }
 

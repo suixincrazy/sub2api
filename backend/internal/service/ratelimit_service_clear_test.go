@@ -24,6 +24,7 @@ type rateLimitClearRepoStub struct {
 	clearTempUnschedCalls     int
 	setSchedulableCalls       []bool
 	setSchedulableErr         error
+	keepalivePlans            *keepalivePlanRepoStub
 	clearErrorErr             error
 	clearRateLimitErr         error
 	clearAntigravityErr       error
@@ -73,7 +74,32 @@ func (r *rateLimitClearRepoStub) SetSchedulable(ctx context.Context, id int64, s
 		return r.setSchedulableErr
 	}
 	r.getByIDAccount.Schedulable = schedulable
+	if !schedulable && r.keepalivePlans != nil {
+		r.keepalivePlans.mu.Lock()
+		defer r.keepalivePlans.mu.Unlock()
+		for _, plan := range r.keepalivePlans.plans {
+			if plan.AccountID == id && plan.AutoRecover {
+				plan.AutoRecover = false
+				plan.UpdatedAt = plan.UpdatedAt.Add(time.Microsecond)
+			}
+		}
+	}
 	return nil
+}
+
+func (r *rateLimitClearRepoStub) RecoverAfterKeepalive(ctx context.Context, plan *ScheduledTestPlan) (*SuccessfulTestRecoveryResult, error) {
+	if r.keepalivePlans != nil {
+		current, err := r.keepalivePlans.GetByID(ctx, plan.ID)
+		if err != nil || !current.Enabled || !current.AutoRecover || !current.UpdatedAt.Equal(plan.UpdatedAt) {
+			return &SuccessfulTestRecoveryResult{}, nil
+		}
+	}
+	account := r.getByIDAccount
+	if (!account.IsActive() && account.Status != StatusError) ||
+		(account.AutoPauseOnExpired && account.ExpiresAt != nil && !time.Now().Before(*account.ExpiresAt)) {
+		return &SuccessfulTestRecoveryResult{}, nil
+	}
+	return (&RateLimitService{accountRepo: r}).RecoverAccountState(ctx, plan.AccountID, AccountRecoveryOptions{ResumeScheduling: true})
 }
 
 type tempUnschedCacheRecorder struct {

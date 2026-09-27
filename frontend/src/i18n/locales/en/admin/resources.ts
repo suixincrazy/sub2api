@@ -36,7 +36,7 @@ export default {
       maxResultsTooltipExample: 'For example, 100 keeps the latest 100 requests.',
       maxResultsTooltipRange: 'Allowed range: 1–1000.',
       autoRecover: 'Auto Recover',
-      autoRecoverHelp: 'Clear recoverable errors and enable account scheduling after a successful response. Disabled accounts and accounts automatically paused on expiration remain paused.'
+      autoRecoverHelp: 'After a successful probe, clear recoverable errors and enable scheduling if it is off. Disabled or automatically expired accounts remain paused. Manually turning scheduling off disables auto recovery for existing plans while keepalive continues. Explicitly enable auto recovery again to allow scheduling to resume.'
     },
 
     // Proxies

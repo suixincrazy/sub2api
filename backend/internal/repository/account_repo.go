@@ -2740,20 +2740,8 @@ func (r *accountRepository) UpdateSessionWindowEnd(ctx context.Context, id int64
 }
 
 func (r *accountRepository) SetSchedulable(ctx context.Context, id int64, schedulable bool) error {
-	_, err := r.client.Account.Update().
-		Where(dbaccount.IDEQ(id)).
-		SetSchedulable(schedulable).
-		Save(ctx)
-	if err != nil {
-		return err
-	}
-	if err := enqueueSchedulerOutbox(ctx, r.sql, service.SchedulerOutboxEventAccountChanged, &id, nil, nil); err != nil {
-		logger.LegacyPrintf("repository.account", "[SchedulerOutbox] enqueue schedulable change failed: account=%d err=%v", id, err)
-	}
-	if !schedulable {
-		r.syncSchedulerAccountSnapshot(ctx, id)
-	}
-	return nil
+	_, err := r.BulkUpdate(ctx, []int64{id}, service.AccountBulkUpdate{Schedulable: &schedulable})
+	return err
 }
 
 func (r *accountRepository) AutoPauseExpiredAccounts(ctx context.Context, now time.Time) (int64, error) {
@@ -3348,6 +3336,17 @@ func (r *accountRepository) BulkUpdate(ctx context.Context, ids []int64, updates
 		}
 	}
 	if rows > 0 {
+		if updates.Schedulable != nil && !*updates.Schedulable {
+			// A manual pause revokes every existing plan's recovery permission.
+			// Keep probing, but invalidate in-flight recovery in this transaction.
+			if _, err := exec.ExecContext(ctx, `
+				UPDATE scheduled_test_plans p SET auto_recover = false, updated_at = clock_timestamp()
+				WHERE p.account_id = ANY($1) AND p.auto_recover = true
+					AND EXISTS (SELECT 1 FROM accounts a WHERE a.id = p.account_id AND a.deleted_at IS NULL)
+			`, pq.Array(ids)); err != nil {
+				return 0, err
+			}
+		}
 		payload := map[string]any{"account_ids": ids}
 		if err := enqueueSchedulerOutbox(ctx, exec, service.SchedulerOutboxEventAccountBulkChanged, nil, nil, payload); err != nil {
 			return 0, err

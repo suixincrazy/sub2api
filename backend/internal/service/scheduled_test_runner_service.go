@@ -199,7 +199,7 @@ func (s *ScheduledTestRunnerService) runOnePlan(ctx context.Context, plan *Sched
 		logger.LegacyPrintf("service.scheduled_test_runner", "[KeepaliveRunner] plan=%d save result: %v", plan.ID, err)
 	}
 	if result.Status == "success" && plan.AutoRecover {
-		s.tryRecoverAccount(saveCtx, plan.AccountID, plan.ID)
+		s.tryRecoverAccount(saveCtx, plan)
 	}
 }
 
@@ -223,12 +223,13 @@ func nextKeepaliveDelay(plan *ScheduledTestPlan, result *ScheduledTestResult) (t
 }
 
 // tryRecoverAccount attempts to recover an account from recoverable runtime state.
-func (s *ScheduledTestRunnerService) tryRecoverAccount(ctx context.Context, accountID int64, planID int64) {
+func (s *ScheduledTestRunnerService) tryRecoverAccount(ctx context.Context, plan *ScheduledTestPlan) {
 	if s.rateLimitSvc == nil {
 		return
 	}
 
-	recovery, err := s.rateLimitSvc.RecoverAccountState(ctx, accountID, AccountRecoveryOptions{ResumeScheduling: true})
+	accountID, planID := plan.AccountID, plan.ID
+	recovery, err := s.rateLimitSvc.RecoverAccountAfterKeepalive(ctx, plan)
 	if err != nil {
 		logger.LegacyPrintf("service.scheduled_test_runner", "[ScheduledTestRunner] plan=%d auto-recover failed: %v", planID, err)
 		return

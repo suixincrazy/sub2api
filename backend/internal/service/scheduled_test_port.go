@@ -51,6 +51,12 @@ type ScheduledTestPlanRepository interface {
 	UpdateAfterRun(ctx context.Context, plan *ScheduledTestPlan, lastRunAt time.Time, nextRunAt time.Time, status string, failures int) (bool, error)
 }
 
+// AccountKeepaliveRecoveryRepository applies recovery only while both the
+// account and the opted-in plan still allow it, under the same database lock.
+type AccountKeepaliveRecoveryRepository interface {
+	RecoverAfterKeepalive(ctx context.Context, plan *ScheduledTestPlan) (*SuccessfulTestRecoveryResult, error)
+}
+
 // ScheduledTestResultRepository defines the data access interface for test results.
 type ScheduledTestResultRepository interface {
 	Create(ctx context.Context, result *ScheduledTestResult) (*ScheduledTestResult, error)
