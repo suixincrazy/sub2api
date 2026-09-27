@@ -62,6 +62,55 @@ func historyFilterRequest(router *gin.Engine, method, path string, body []byte, 
 	return response
 }
 
+func TestCodexHistoryFilterDefersOpenAIUntilAccountSelection(t *testing.T) {
+	for _, gateway := range []bool{false, true} {
+		for _, override := range []any{nil, false, true} {
+			svc := service.NewSettingService(&panelRateLimitStubRepo{}, nil)
+			require.NoError(t, svc.SetCodexHistoryFilterEnabled(context.Background(), gateway))
+			filter := NewCodexHistoryFilter(svc)
+			router := gin.New()
+			router.Use(func(c *gin.Context) {
+				key := allowlistAPIKey(true, "mock-model")
+				key.Group.Platform = service.PlatformOpenAI
+				c.Set(string(ContextKeyAPIKey), key)
+			})
+			router.Use(filter.Prepare, GroupModelAllowlist(), filter.Apply)
+			router.POST("/v1/responses", func(c *gin.Context) {
+				body, err := httputil.ReadRequestBodyWithPrealloc(c.Request)
+				require.NoError(t, err)
+				require.Equal(t, historyFilterSample, string(body), "account selection must receive the unfiltered request")
+				account := &service.Account{Platform: service.PlatformOpenAI, Extra: map[string]any{service.CodexHistoryFilterAccountExtraKey: override}}
+				ctx, filtered, err := service.ApplyCodexHistoryFilterForAccount(c.Request.Context(), c, account, body)
+				require.NoError(t, err)
+				finalBody, err := codexhistory.Apply(ctx, filtered)
+				require.NoError(t, err)
+				c.Data(200, "application/json", finalBody)
+			})
+			var compressed bytes.Buffer
+			writer := gzip.NewWriter(&compressed)
+			_, err := writer.Write([]byte(historyFilterSample))
+			require.NoError(t, err)
+			require.NoError(t, writer.Close())
+			response := historyFilterRequest(router, http.MethodPost, "/v1/responses", compressed.Bytes(), map[string]string{"Content-Encoding": "gzip"})
+			require.Equal(t, 200, response.Code)
+			wantFiltered := gateway
+			if value, ok := override.(bool); ok {
+				wantFiltered = value
+			}
+			require.Equal(t, !wantFiltered, strings.Contains(response.Body.String(), "HISTORY_CANARY"))
+			require.Contains(t, response.Body.String(), "reasoning.encrypted_content")
+			status, err := svc.GetCodexHistoryFilterStatus(context.Background())
+			require.NoError(t, err)
+			if wantFiltered {
+				require.EqualValues(t, 1, status.Stats.FilteredRequests)
+				require.EqualValues(t, 1, status.Stats.RemovedReasoningItems)
+			} else {
+				require.Zero(t, status.Stats.FilteredRequests)
+			}
+		}
+	}
+}
+
 func TestCodexHistoryFilterCompressedRequestsAndAliases(t *testing.T) {
 	calls := 0
 	want, err := codexhistory.Filter([]byte(historyFilterSample))
@@ -298,7 +347,7 @@ func TestCodexHistoryFilterPortableHistoryAndMetrics(t *testing.T) {
 	}
 	status, err := svc.GetCodexHistoryFilterStatus(context.Background())
 	require.NoError(t, err)
-	require.Equal(t, 3, status.FilterVersion)
+	require.Equal(t, 4, status.FilterVersion)
 	require.EqualValues(t, 6, status.Stats.RemovedItemIDs)
 	require.EqualValues(t, 3, status.Stats.NormalizedAgentTextParts)
 	require.Zero(t, status.Stats.RemovedReasoningItems)

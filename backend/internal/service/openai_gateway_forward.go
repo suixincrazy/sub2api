@@ -20,6 +20,12 @@ import (
 
 // Forward forwards request to OpenAI API
 func (s *OpenAIGatewayService) Forward(ctx context.Context, c *gin.Context, account *Account, body []byte) (*OpenAIForwardResult, error) {
+	var err error
+	ctx, body, err = ApplyCodexHistoryFilterForAccount(ctx, c, account, body)
+	if err != nil {
+		MarkCodexHistoryFilterBlocked(c)
+		return nil, err
+	}
 	return retryUpstream429(ctx, c, account, func(ctx context.Context) (*OpenAIForwardResult, error) {
 		return s.forwardOnce(ctx, c, account, body)
 	})

@@ -23,8 +23,8 @@ func NewCodexHistoryFilter(settings *service.SettingService) *CodexHistoryFilter
 	return &CodexHistoryFilter{settings: settings}
 }
 
-// Prepare bounds and decodes the original body before model allowlist checks.
-// Apply runs after those checks so JSON normalization cannot hide duplicate models.
+// OpenAI requests retain the original body until account selection. Other
+// providers are decoded here and filtered after model admission and routing.
 func (f *CodexHistoryFilter) Prepare(c *gin.Context) {
 	route := c.FullPath()
 	if !strings.HasSuffix(route, "/responses") && !strings.Contains(route, "/responses/") {
@@ -43,33 +43,36 @@ func (f *CodexHistoryFilter) Prepare(c *gin.Context) {
 		f.reject(c, &codexhistory.Error{Code: "filter_settings_unavailable", Message: "Codex history filter settings are temporarily unavailable.", Status: http.StatusServiceUnavailable})
 		return
 	}
+	if codexHistoryNeedsAccountPolicy(c) {
+		state := &service.CodexHistoryFilterRequest{DefaultEnabled: enabled, PolicyError: service.CodexHistoryFilterTransportError(c, compact)}
+		c.Set(service.CodexHistoryFilterRequestKey, state)
+		c.Next()
+		if state.Blocked {
+			f.settings.RecordCodexHistoryBlocked()
+		}
+		if state.Filtered != nil {
+			f.recordFiltered(c, *state.Filtered)
+		}
+		f.recordResponse(c)
+		return
+	}
 	if !enabled {
 		c.Next()
 		return
 	}
-	if compact {
-		f.reject(c, &codexhistory.Error{Code: "encrypted_compaction_disabled", Message: "Encrypted Responses compaction is disabled. Use a text summary and start a new session.", Status: http.StatusConflict})
+	if !f.prepareEnabledRequest(c, compact) {
 		return
 	}
-	if c.Request.Method == http.MethodGet {
-		f.reject(c, &codexhistory.Error{Code: "websocket_filtering_unsupported", Message: "Use Responses over HTTP/SSE; WebSocket filtering is not supported.", Status: http.StatusUpgradeRequired})
-		return
-	}
-	if c.GetHeader("Origin") != "" || c.GetHeader("Sec-Fetch-Site") != "" {
-		f.reject(c, &codexhistory.Error{Code: "browser_request_rejected", Message: "Browser Responses requests are not supported while the Codex history filter is enabled.", Status: http.StatusForbidden})
-		return
+	c.Next()
+	f.recordResponse(c)
+}
+
+func (f *CodexHistoryFilter) prepareEnabledRequest(c *gin.Context, compact bool) bool {
+	if policyError := service.CodexHistoryFilterTransportError(c, compact); policyError != nil {
+		f.reject(c, policyError)
+		return false
 	}
 	encoding := strings.ToLower(strings.TrimSpace(c.GetHeader("Content-Encoding")))
-	switch encoding {
-	case "", "identity", "gzip", "x-gzip", "deflate", "br", "zstd":
-	default:
-		f.reject(c, &codexhistory.Error{Code: "unsupported_content_encoding", Message: "Unsupported request Content-Encoding.", Status: http.StatusUnsupportedMediaType})
-		return
-	}
-	if c.Request.ContentLength > codexhistory.MaxBodySize {
-		f.reject(c, &codexhistory.Error{Code: "request_too_large", Message: "Request exceeds filter size limit.", Status: http.StatusRequestEntityTooLarge})
-		return
-	}
 	if c.Request.Body != nil {
 		c.Request.Body = http.MaxBytesReader(c.Writer, c.Request.Body, codexhistory.MaxBodySize)
 	}
@@ -83,15 +86,18 @@ func (f *CodexHistoryFilter) Prepare(c *gin.Context) {
 		} else {
 			f.reject(c, codexhistory.Invalid("invalid_request_json", "Cannot read Responses request."))
 		}
-		return
+		return false
 	}
 	if int64(len(body)) > codexhistory.MaxBodySize {
 		f.reject(c, &codexhistory.Error{Code: "request_too_large", Message: "Decoded request exceeds filter size limit.", Status: http.StatusRequestEntityTooLarge})
-		return
+		return false
 	}
 	requestmodel.ResetRequestBody(c.Request, body)
 	c.Request = c.Request.WithContext(codexhistory.WithEnabled(c.Request.Context()))
-	c.Next()
+	return true
+}
+
+func (f *CodexHistoryFilter) recordResponse(c *gin.Context) {
 	if filtered, _ := c.Get(codexHistoryFilteredKey); filtered == true {
 		transportError := false
 		if events, ok := c.Get(service.OpsUpstreamErrorsKey); ok {
@@ -106,6 +112,22 @@ func (f *CodexHistoryFilter) Prepare(c *gin.Context) {
 }
 
 func (f *CodexHistoryFilter) Apply(c *gin.Context) {
+	if state := service.CodexHistoryFilterRequestFromContext(c); state != nil {
+		if codexHistoryNeedsAccountPolicy(c) || !state.DefaultEnabled {
+			c.Next()
+			return
+		}
+		// Composite routing selected another provider; apply the gateway
+		// default before that provider converts its Responses request.
+		if state.PolicyError != nil {
+			f.reject(c, state.PolicyError)
+			return
+		}
+		if !f.prepareEnabledRequest(c, false) {
+			return
+		}
+		c.Set(service.CodexHistoryFilterRequestKey, nil)
+	}
 	if !codexhistory.Enabled(c.Request.Context()) {
 		c.Next()
 		return
@@ -130,10 +152,28 @@ func (f *CodexHistoryFilter) Apply(c *gin.Context) {
 	c.Request.Header.Del("Expect")
 	c.Request.Header.Set("Content-Type", "application/json")
 	c.Request.TransferEncoding = nil
+	f.recordFiltered(c, result)
+	c.Next()
+}
+
+func (f *CodexHistoryFilter) recordFiltered(c *gin.Context, result codexhistory.Result) {
 	f.settings.RecordCodexHistoryFiltered(result.RemovedReasoningItems, result.RemovedItemIDs, result.NormalizedAgentTextParts)
 	c.Set(codexHistoryFilteredKey, true)
 	slog.InfoContext(c.Request.Context(), "codex_history_filtered", "removed_reasoning_items", result.RemovedReasoningItems, "removed_item_ids", result.RemovedItemIDs, "normalized_agent_text_parts", result.NormalizedAgentTextParts)
-	c.Next()
+}
+
+func codexHistoryNeedsAccountPolicy(c *gin.Context) bool {
+	apiKey, ok := GetAPIKeyFromContext(c)
+	if !ok || apiKey == nil || apiKey.Group == nil {
+		return false
+	}
+	platform := apiKey.Group.Platform
+	if platform == service.PlatformComposite {
+		if target, resolved := service.ResolvedTargetPlatformFromContext(c.Request.Context()); resolved {
+			platform = target
+		}
+	}
+	return platform == service.PlatformOpenAI || platform == service.PlatformComposite
 }
 
 func (f *CodexHistoryFilter) reject(c *gin.Context, err *codexhistory.Error) {

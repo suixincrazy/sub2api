@@ -742,6 +742,11 @@ export default {
           '默认关闭：/responses 上的 namespace 工具声明原样转发，这正是 ChatGPT Codex 后端期望的形态。仅当该 OAuth 账号指向不认识 namespace 的兼容上游时才开启——摊平会把工具改名为 namespace__tool，使按 functions.<命名空间>.<工具> 寻址的模型（如 gpt-5.6 多智能体）无法调用。压缩（compact）请求不受该开关影响，始终摊平。',
         longContextBilling: 'API 长上下文计费',
         longContextBillingDesc: '默认关闭。仅当该账号的上游会按模型阈值收取 OpenAI API 长上下文费率时开启。',
+        historyFilter: 'Codex 历史过滤',
+        historyFilterDesc: '清理跨账号历史中的推理密文和记录引用。账号设置优先于网关默认值，仅支持 HTTP/SSE。',
+        historyFilterInherited: '跟随网关：{state}',
+        historyFilterInherit: '恢复为跟随网关',
+        historyFilterLoadError: '无法读取网关默认设置',
         responsesWebsocketsV2: 'Responses WebSocket v2',
         responsesWebsocketsV2Desc:
           '默认关闭。开启后可启用 responses_websockets_v2 协议能力（受网关全局开关与账号类型开关约束）。',

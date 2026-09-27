@@ -17,6 +17,7 @@ import (
 	"time"
 
 	"github.com/Wei-Shaw/sub2api/internal/config"
+	"github.com/Wei-Shaw/sub2api/internal/pkg/codexhistory"
 	"github.com/Wei-Shaw/sub2api/internal/pkg/ctxkey"
 	"github.com/Wei-Shaw/sub2api/internal/pkg/ip"
 	"github.com/Wei-Shaw/sub2api/internal/pkg/logger"
@@ -844,6 +845,13 @@ func (h *OpenAIGatewayHandler) Responses(c *gin.Context) {
 			})
 		}
 		if err != nil {
+			var historyError *codexhistory.Error
+			if errors.As(err, &historyError) {
+				compactCommitted := service.StopOpenAICompactSSEKeepaliveCommitted(c)
+				h.handleStreamingAwareErrorWithCode(c, historyError.Status, "invalid_request_error", historyError.Code, historyError.Message,
+					streamStarted || compactCommitted || c.Writer.Written(), false)
+				return
+			}
 			if result != nil && result.ClientDisconnect {
 				reqLog.Info("openai.client_disconnected",
 					zap.Int64("account_id", account.ID),
@@ -2682,6 +2690,14 @@ func (h *OpenAIGatewayHandler) ResponsesWebSocket(c *gin.Context) {
 		}
 
 		account := selection.Account
+		if service.CodexHistoryFilterEnabledForAccount(ctx, c, account) {
+			if selection.ReleaseFunc != nil {
+				selection.ReleaseFunc()
+			}
+			service.MarkCodexHistoryFilterBlocked(c)
+			closeOpenAIClientWS(wsConn, coderws.StatusPolicyViolation, "Codex history filtering requires Responses over HTTP/SSE")
+			return
+		}
 		accountMaxConcurrency := account.Concurrency
 		if selection.WaitPlan != nil && selection.WaitPlan.MaxConcurrency > 0 {
 			accountMaxConcurrency = selection.WaitPlan.MaxConcurrency

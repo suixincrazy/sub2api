@@ -1544,6 +1544,15 @@ func TestOpenAIResponsesWebSocket_PassthroughTracksModelPerTurn(t *testing.T) {
 		"each turn must be billed with its own channel-mapped model")
 }
 
+func TestOpenAIResponsesWebSocket_AccountHistoryFilterRejectsWebSocket(t *testing.T) {
+	runOpenAIResponsesWebSocketUsageLogCase(t, openAIResponsesWSUsageLogCase{
+		firstPayload:            `{"type":"response.create","model":"gpt-6-astra","input":"hello","stream":false}`,
+		historyFilterEnabled:    true,
+		firstFrameCloseExpected: true,
+		closeReason:             "Codex history filtering requires Responses over HTTP/SSE",
+	})
+}
+
 func TestOpenAIResponsesWebSocket_ChannelMappedTargetSelectsAccountWithoutRequestedAlias(t *testing.T) {
 	got := runOpenAIResponsesWebSocketUsageLogCase(t, openAIResponsesWSUsageLogCase{
 		firstPayload:  `{"type":"response.create","model":"public-alias","stream":false}`,
@@ -1930,6 +1939,7 @@ func newOpenAIWSHandlerTestServer(t *testing.T, h *OpenAIGatewayHandler, subject
 }
 
 type openAIResponsesWSUsageLogCase struct {
+	historyFilterEnabled   bool
 	simpleModeRejectAtRead int64
 	closeReason            string
 	firstPayload           string
@@ -2948,6 +2958,9 @@ func runOpenAIResponsesWebSocketUsageLogCase(t *testing.T, tc openAIResponsesWSU
 	}
 	if strings.TrimSpace(tc.ingressMode) != "" {
 		account.Extra["openai_apikey_responses_websockets_v2_mode"] = tc.ingressMode
+	}
+	if tc.historyFilterEnabled {
+		account.Extra[service.CodexHistoryFilterAccountExtraKey] = true
 	}
 
 	cfg := &config.Config{}

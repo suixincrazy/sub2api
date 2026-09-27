@@ -10,8 +10,9 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-// Generated from the user's restored proxy.cjs v2, not from the Go implementation.
-func TestFilterMatchesOriginalV2(t *testing.T) {
+// The independent v2 fixture still specifies history and rejection behavior.
+// v4 deliberately preserves include options required by Codex relays.
+func TestFilterRetainsOriginalV2HistorySemantics(t *testing.T) {
 	data, err := os.ReadFile("testdata/reference-v2.json")
 	require.NoError(t, err)
 	var cases []struct {
@@ -38,7 +39,15 @@ func TestFilterMatchesOriginalV2(t *testing.T) {
 				return
 			}
 			require.NoError(t, err)
-			require.JSONEq(t, string(tt.Output), string(result.Body))
+			var inputFields, expected map[string]json.RawMessage
+			require.NoError(t, json.Unmarshal(tt.Input, &inputFields))
+			require.NoError(t, json.Unmarshal(tt.Output, &expected))
+			if include, ok := inputFields["include"]; ok {
+				expected["include"] = include
+			}
+			want, err := json.Marshal(expected)
+			require.NoError(t, err)
+			require.JSONEq(t, string(want), string(result.Body))
 			require.Equal(t, tt.RemovedReasoningItems, result.RemovedReasoningItems)
 			require.Equal(t, tt.RemovedItemIDs, result.RemovedItemIDs)
 			again, err := Filter(result.Body)
@@ -57,6 +66,15 @@ func TestFilterPreservesOpaqueNumbersAndToolData(t *testing.T) {
 	require.Equal(t, 3, strings.Count(string(result.Body), "9007199254740993"))
 	require.NotContains(t, string(result.Body), `"old"`)
 	require.Contains(t, string(result.Body), `"effort":"xhigh"`)
+}
+
+func TestFilterPreservesNewResponseReasoningInclude(t *testing.T) {
+	body := []byte(`{"model":"gpt-6-astra","store":false,"include":["reasoning.encrypted_content","web_search_call.action.sources"],"reasoning":{"effort":"medium"},"input":[{"type":"reasoning","id":"rs_old","encrypted_content":"foreign-ciphertext"},{"type":"message","id":"msg_old","role":"user","content":"hello"}]}`)
+	result, err := Filter(body)
+	require.NoError(t, err)
+	require.JSONEq(t, `{"model":"gpt-6-astra","store":false,"include":["reasoning.encrypted_content","web_search_call.action.sources"],"reasoning":{"effort":"medium"},"input":[{"type":"message","role":"user","content":"hello"}]}`, string(result.Body))
+	require.Equal(t, 1, result.RemovedReasoningItems)
+	require.Equal(t, 1, result.RemovedItemIDs)
 }
 
 func TestFilterMalformedJSONAndDisabledContext(t *testing.T) {

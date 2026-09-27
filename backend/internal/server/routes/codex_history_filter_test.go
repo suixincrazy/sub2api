@@ -33,7 +33,7 @@ func TestNativeCodexHistoryFilterMountedOnAllResponsesAliases(t *testing.T) {
 		AsyncImage: handler.NewAsyncImageHandler(nil, nil),
 	}, middleware.APIKeyAuthMiddleware(func(c *gin.Context) {
 		groupID := int64(1)
-		c.Set(string(middleware.ContextKeyAPIKey), &service.APIKey{GroupID: &groupID, Group: &service.Group{Platform: service.PlatformOpenAI}})
+		c.Set(string(middleware.ContextKeyAPIKey), &service.APIKey{GroupID: &groupID, Group: &service.Group{Platform: service.PlatformAnthropic}})
 		c.Next()
 	}), nil, nil, nil, settings, nil, &config.Config{Gateway: config.GatewayConfig{MaxBodySize: 1 << 20}})
 	for _, prefix := range []string{"", "/v1", "/backend-api/codex"} {
@@ -61,4 +61,36 @@ func TestNativeCodexHistoryFilterMountedOnAllResponsesAliases(t *testing.T) {
 	status, err := settings.GetCodexHistoryFilterStatus(context.Background())
 	require.NoError(t, err)
 	require.EqualValues(t, 24, status.Stats.BlockedRequests)
+}
+
+func TestNativeCodexHistoryAccountPolicyMountedOnAllResponsesAliases(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	router := gin.New()
+	var observed *service.CodexHistoryFilterRequest
+	router.Use(func(c *gin.Context) {
+		c.Next()
+		observed = service.CodexHistoryFilterRequestFromContext(c)
+	})
+	settings := service.NewSettingService(codexHistoryRouteRepo{}, nil)
+	RegisterGatewayRoutes(router, &handler.Handlers{
+		Gateway: &handler.GatewayHandler{}, OpenAIGateway: &handler.OpenAIGatewayHandler{},
+		AsyncImage: handler.NewAsyncImageHandler(nil, nil),
+	}, middleware.APIKeyAuthMiddleware(func(c *gin.Context) {
+		groupID := int64(1)
+		c.Set(string(middleware.ContextKeyAPIKey), &service.APIKey{GroupID: &groupID, Group: &service.Group{Platform: service.PlatformOpenAI}})
+		c.Next()
+	}), nil, nil, nil, settings, nil, &config.Config{Gateway: config.GatewayConfig{MaxBodySize: 1 << 20}})
+	for _, prefix := range []string{"", "/v1", "/backend-api/codex"} {
+		for _, suffix := range []string{"/responses", "/responses/", "/responses/compact"} {
+			observed = nil
+			req := httptest.NewRequest(http.MethodPost, prefix+suffix, strings.NewReader(`{"model":"gpt-6-astra","input":"hello"}`))
+			router.ServeHTTP(httptest.NewRecorder(), req)
+			require.NotNil(t, observed, "account policy must be installed on %s", prefix+suffix)
+			require.True(t, observed.DefaultEnabled)
+			if strings.HasSuffix(suffix, "/compact") {
+				require.NotNil(t, observed.PolicyError)
+				require.Equal(t, "encrypted_compaction_disabled", observed.PolicyError.Code)
+			}
+		}
+	}
 }

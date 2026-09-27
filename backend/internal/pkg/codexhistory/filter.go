@@ -9,13 +9,17 @@ import (
 	"strings"
 )
 
-const Version = 3
+const Version = 4
 const MaxBodySize int64 = 64 << 20
 
 type enabledKey struct{}
 
 func WithEnabled(ctx context.Context) context.Context {
-	return context.WithValue(ctx, enabledKey{}, true)
+	return WithFilterEnabled(ctx, true)
+}
+
+func WithFilterEnabled(ctx context.Context, enabled bool) context.Context {
+	return context.WithValue(ctx, enabledKey{}, enabled)
 }
 
 func Enabled(ctx context.Context) bool {
@@ -71,17 +75,8 @@ func Filter(body []byte) (Result, error) {
 	}
 	result := Result{}
 	fields["store"] = json.RawMessage("false")
-	if include, ok := fields["include"]; ok {
-		var values []json.RawMessage
-		_ = json.Unmarshal(include, &values)
-		kept := make([]json.RawMessage, 0, len(values))
-		for _, value := range values {
-			if stringValue(value) != "reasoning.encrypted_content" {
-				kept = append(kept, value)
-			}
-		}
-		fields["include"], _ = json.Marshal(kept)
-	}
+	// include controls this response, not replayed history. Codex relays may
+	// require reasoning.encrypted_content even after old reasoning is removed.
 	if input := fields["input"]; isArray(input) {
 		var values []json.RawMessage
 		_ = json.Unmarshal(input, &values)

@@ -40,7 +40,7 @@ func TestCodexHistoryFilterSurvivesAccountTransformsAndRetries(t *testing.T) {
 						require.NoError(t, err)
 						require.Equal(t, gjson.False, gjson.GetBytes(body, "store").Type)
 						require.Equal(t, "xhigh", gjson.GetBytes(body, "reasoning.effort").String())
-						require.NotContains(t, string(body), "reasoning.encrypted_content")
+						require.Contains(t, gjson.GetBytes(body, "include").String(), "reasoning.encrypted_content")
 						require.NotContains(t, string(body), "foreign-ciphertext")
 						var sawWebSearch, sawAgent bool
 						for _, item := range gjson.GetBytes(body, "input").Array() {

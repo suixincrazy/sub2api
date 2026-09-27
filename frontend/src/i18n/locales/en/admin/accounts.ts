@@ -680,6 +680,11 @@ export default {
         planTypeDesc:
           "Manually correct this account's ChatGPT plan tier (Plus / Pro / Free). Note: a token refresh near expiry or a 429 rate-limit response will auto-overwrite this with the real tier.",
         planTypeClear: 'Clear (auto-detect)',
+        historyFilter: 'Codex history filter',
+        historyFilterDesc: 'Remove encrypted reasoning and record references from cross-account history. The account setting overrides the gateway default. HTTP/SSE only.',
+        historyFilterInherited: 'Gateway default: {state}',
+        historyFilterInherit: 'Use gateway default',
+        historyFilterLoadError: 'Unable to load the gateway default',
         codexCLIOnly: 'Codex official clients only',
         codexCLIOnlyDesc:
           'Only applies to OpenAI OAuth. When enabled, only Codex official client families are allowed; when disabled, the gateway bypasses this restriction and keeps existing behavior.',
