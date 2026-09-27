@@ -12,6 +12,7 @@ import (
 	"time"
 
 	sqlmock "github.com/DATA-DOG/go-sqlmock"
+	"github.com/Wei-Shaw/sub2api/migrations"
 	"github.com/stretchr/testify/require"
 )
 
@@ -257,6 +258,34 @@ func TestApplyMigrationsFS_ChecksumMismatchRejected(t *testing.T) {
 	require.Error(t, err)
 	require.Contains(t, err.Error(), "checksum mismatch")
 	require.NoError(t, mock.ExpectationsWereMet())
+}
+
+func TestApplyMigrationsFS_KeepaliveLegacyCRLFChecksum(t *testing.T) {
+	const name = "242_account_scheduled_keepalive.sql"
+	content, err := fs.ReadFile(migrations.FS, name)
+	require.NoError(t, err)
+	lf := strings.ReplaceAll(string(content), "\r\n", "\n")
+	currentChecksum := migrationChecksum(lf)
+	legacyChecksum := migrationChecksum(strings.ReplaceAll(lf, "\n", "\r\n"))
+	require.Equal(t, "d53e64c0e21b8dc9197b1f5eb55bcfb72ca4f06abc307dc98e6aafe4950584ff", currentChecksum)
+	require.Equal(t, "cb48229485c2113d282783e3f7fab71d83fb327b5d1284d8382b848cd34689d5", legacyChecksum)
+
+	db, mock, err := sqlmock.New()
+	require.NoError(t, err)
+	defer func() { _ = db.Close() }()
+	prepareMigrationsBootstrapExpectations(mock)
+	mock.ExpectQuery("SELECT checksum FROM schema_migrations WHERE filename = \\$1").
+		WithArgs(name).
+		WillReturnRows(sqlmock.NewRows([]string{"checksum"}).AddRow(legacyChecksum))
+	mock.ExpectExec("SELECT pg_advisory_unlock\\(\\$1\\)").
+		WithArgs(migrationsAdvisoryLockID).
+		WillReturnResult(sqlmock.NewResult(0, 1))
+
+	err = applyMigrationsFS(context.Background(), db, fstest.MapFS{name: &fstest.MapFile{Data: []byte(lf)}})
+	require.NoError(t, err)
+	require.NoError(t, mock.ExpectationsWereMet(), "compatibility must not rerun SQL or rewrite the stored checksum")
+	require.False(t, isMigrationChecksumCompatible(name, "unknown", currentChecksum))
+	require.False(t, isMigrationChecksumCompatible(name, legacyChecksum, "unknown"))
 }
 
 func TestApplyMigrationsFS_CheckMigrationQueryError(t *testing.T) {

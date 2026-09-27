@@ -96,6 +96,9 @@ var migrationChecksumCompatibilityRules = map[string]migrationChecksumCompatibil
 	"220_clear_non_grok_video_generation_config.sql": newMigrationChecksumCompatibilityRule("85e320b9ec64f2d3fcd8cf705b2b4e76a7b49f7a57140c14bff97f32691c818b", "3da48c8fdffe6390325f43d08b8e353e0a365df43d44a78dbbe655d0deb18402"),
 	"219_group_search_price_per_1k.sql":              newMigrationChecksumCompatibilityRule("e86786ebcc3b14206fd2d321380a4e50e80cdadbfcf4962c639255e6a14008db", "df6ffd71b97e30ec2c8fe7b95e15783042dea58c553e32701ee7c42a5619af80"),
 	"218_group_audio_voice_pricing.sql":              newMigrationChecksumCompatibilityRule("40ee9f3a2af0e0a5e99dabc878fd0fe98be1011f26bcfcefcac7197f7081f0e7", "c2a5e5b4ffd6968ad1c10593289fbc11192cdea19fec3ed9bce3a84eff9a8351"),
+	// Migration 242 was first deployed with CRLF; its checked-in LF form has
+	// identical SQL. Keep compatibility restricted to these two known hashes.
+	"242_account_scheduled_keepalive.sql": newMigrationChecksumCompatibilityRule("d53e64c0e21b8dc9197b1f5eb55bcfb72ca4f06abc307dc98e6aafe4950584ff", "cb48229485c2113d282783e3f7fab71d83fb327b5d1284d8382b848cd34689d5"),
 }
 
 // ApplyMigrations 将嵌入的 SQL 迁移文件应用到指定的数据库。
