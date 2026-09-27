@@ -2520,6 +2520,7 @@ export interface CreateScheduledTestPlanRequest {
 }
 
 export interface UpdateScheduledTestPlanRequest {
+  expected_updated_at?: string
   model_id?: string
   cron_expression?: string
   probe_interval_seconds?: number

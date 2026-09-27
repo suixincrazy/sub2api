@@ -488,6 +488,7 @@ const deletingPlan = ref<ScheduledTestPlan | null>(null)
 const editingPlanId = ref<number | null>(null)
 const updating = ref(false)
 const editForm = reactive({
+  expected_updated_at: '',
   model_id: '' as string,
   probe_interval_seconds: '2',
   keepalive_interval_seconds: '60',
@@ -609,7 +610,7 @@ const handleCreate = async () => {
 
 const handleToggleEnabled = async (plan: ScheduledTestPlan, enabled: boolean) => {
   try {
-    const updated = await adminAPI.scheduledTests.update(plan.id, { enabled })
+    const updated = await adminAPI.scheduledTests.update(plan.id, { enabled, expected_updated_at: plan.updated_at })
     const index = plans.value.findIndex((p) => p.id === plan.id)
     if (index !== -1) {
       plans.value[index] = updated
@@ -622,6 +623,7 @@ const handleToggleEnabled = async (plan: ScheduledTestPlan, enabled: boolean) =>
 
 const startEdit = (plan: ScheduledTestPlan) => {
   editingPlanId.value = plan.id
+  editForm.expected_updated_at = plan.updated_at
   editForm.model_id = plan.model_id
   editForm.probe_interval_seconds = String(plan.probe_interval_seconds)
   editForm.keepalive_interval_seconds = String(plan.keepalive_interval_seconds)
@@ -640,6 +642,7 @@ const handleEdit = async () => {
   updating.value = true
   try {
     const updated = await adminAPI.scheduledTests.update(editingPlanId.value, {
+      expected_updated_at: editForm.expected_updated_at,
       model_id: editForm.model_id,
       probe_interval_seconds: Number(editForm.probe_interval_seconds),
       keepalive_interval_seconds: Number(editForm.keepalive_interval_seconds),

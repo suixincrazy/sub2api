@@ -1,8 +1,11 @@
 package admin
 
 import (
+	"database/sql"
+	"errors"
 	"net/http"
 	"strconv"
+	"time"
 
 	"github.com/Wei-Shaw/sub2api/internal/pkg/response"
 	"github.com/Wei-Shaw/sub2api/internal/service"
@@ -32,14 +35,15 @@ type createScheduledTestPlanRequest struct {
 }
 
 type updateScheduledTestPlanRequest struct {
-	ModelID                     string `json:"model_id"`
-	CronExpression              string `json:"cron_expression"`
-	Enabled                     *bool  `json:"enabled"`
-	MaxResults                  int    `json:"max_results" binding:"omitempty,min=1,max=1000"`
-	AutoRecover                 *bool  `json:"auto_recover"`
-	ProbeIntervalSeconds        *int   `json:"probe_interval_seconds" binding:"omitempty,min=1,max=86400"`
-	KeepaliveIntervalSeconds    *int   `json:"keepalive_interval_seconds" binding:"omitempty,min=1,max=86400"`
-	KeepaliveMaxIntervalSeconds *int   `json:"keepalive_max_interval_seconds" binding:"omitempty,min=1,max=86400"`
+	ExpectedUpdatedAt           *time.Time `json:"expected_updated_at"`
+	ModelID                     string     `json:"model_id"`
+	CronExpression              string     `json:"cron_expression"`
+	Enabled                     *bool      `json:"enabled"`
+	MaxResults                  int        `json:"max_results" binding:"omitempty,min=1,max=1000"`
+	AutoRecover                 *bool      `json:"auto_recover"`
+	ProbeIntervalSeconds        *int       `json:"probe_interval_seconds" binding:"omitempty,min=1,max=86400"`
+	KeepaliveIntervalSeconds    *int       `json:"keepalive_interval_seconds" binding:"omitempty,min=1,max=86400"`
+	KeepaliveMaxIntervalSeconds *int       `json:"keepalive_max_interval_seconds" binding:"omitempty,min=1,max=86400"`
 }
 
 // ListByAccount GET /admin/accounts/:id/scheduled-test-plans
@@ -116,6 +120,14 @@ func (h *ScheduledTestHandler) Update(c *gin.Context) {
 		response.BadRequest(c, err.Error())
 		return
 	}
+	// Use the revision the editor observed, not just the freshly loaded row.
+	// Old clients cannot re-arm recovery from a cached form without a revision.
+	stale := req.ExpectedUpdatedAt != nil && !req.ExpectedUpdatedAt.Equal(existing.UpdatedAt)
+	unguardedOptIn := req.AutoRecover != nil && *req.AutoRecover && !existing.AutoRecover && req.ExpectedUpdatedAt == nil
+	if stale || unguardedOptIn {
+		response.Error(c, http.StatusConflict, "Keepalive plan changed; refresh and retry")
+		return
+	}
 
 	if req.ModelID != "" {
 		existing.ModelID = req.ModelID
@@ -144,6 +156,10 @@ func (h *ScheduledTestHandler) Update(c *gin.Context) {
 
 	updated, err := h.scheduledTestSvc.UpdatePlan(c.Request.Context(), existing)
 	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			response.Error(c, http.StatusConflict, "Keepalive plan changed; refresh and retry")
+			return
+		}
 		response.BadRequest(c, err.Error())
 		return
 	}

@@ -18,7 +18,7 @@ const plan: ScheduledTestPlan = {
   id: 1, account_id: 8, model_id: 'gpt-6-astra', cron_expression: '', enabled: true,
   probe_interval_seconds: 2, keepalive_interval_seconds: 60, keepalive_max_interval_seconds: 90,
   max_results: 100, auto_recover: false, last_status: 'success', consecutive_failures: 0,
-  last_run_at: null, next_run_at: null, created_at: '', updated_at: ''
+  last_run_at: null, next_run_at: null, created_at: '', updated_at: '2026-09-27T00:00:00.123456Z'
 }
 const wrappers: ReturnType<typeof mount>[] = []
 async function open() {
@@ -78,7 +78,7 @@ describe('Scheduled keepalive panel', () => {
     expect(wrapper.text()).toContain('admin.scheduledTests.keepingAlive')
     await wrapper.find('[role=switch]').trigger('click')
     await flushPromises()
-    expect(mocks.update).toHaveBeenCalledWith(1, { enabled: false })
+    expect(mocks.update).toHaveBeenCalledWith(1, { enabled: false, expected_updated_at: plan.updated_at })
     expect(wrapper.text()).toContain('admin.scheduledTests.paused')
   })
 
@@ -90,6 +90,24 @@ describe('Scheduled keepalive panel', () => {
     await wrapper.setProps({ show: false })
     await vi.advanceTimersByTimeAsync(9000)
     expect(mocks.listByAccount).toHaveBeenCalledTimes(2)
+  })
+
+  it('keeps the edit revision when polling observes a manual recovery opt-out', async () => {
+    mocks.listByAccount.mockResolvedValue([{ ...plan, auto_recover: true }])
+    const wrapper = await open()
+    await wrapper.find('button[title="admin.scheduledTests.editPlan"]').trigger('click')
+    mocks.listByAccount.mockResolvedValue([{ ...plan, auto_recover: false, updated_at: '2026-09-27T01:00:00.123456Z' }])
+    await vi.advanceTimersByTimeAsync(3000)
+    await wrapper.findAll('input[type=number]')[0].setValue('3')
+    mocks.update.mockRejectedValueOnce(new Error('Keepalive plan changed; refresh and retry'))
+    await wrapper.findAll('button').find(button => button.text() === 'common.save')!.trigger('click')
+    await flushPromises()
+
+    expect(mocks.update).toHaveBeenCalledWith(1, expect.objectContaining({
+      probe_interval_seconds: 3, auto_recover: true, expected_updated_at: plan.updated_at
+    }))
+    expect(mocks.showError).toHaveBeenCalledWith('Keepalive plan changed; refresh and retry')
+    expect(wrapper.find('input[type=number]').exists()).toBe(true)
   })
 
   it('does not display results from an account that was closed while loading', async () => {
