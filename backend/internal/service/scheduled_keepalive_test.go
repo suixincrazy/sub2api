@@ -124,6 +124,85 @@ func waitKeepaliveIdle(t *testing.T, runner *ScheduledTestRunnerService) {
 	require.Eventually(t, func() bool { runner.mu.Lock(); defer runner.mu.Unlock(); return len(runner.running) == 0 }, time.Second, time.Millisecond)
 }
 
+func TestScheduledKeepaliveAutoRecoverResumesScheduling(t *testing.T) {
+	runner, plans, results := newKeepaliveTestRunner(t, 1)
+	plans.plans[1].AccountID = 7
+	plans.plans[1].AutoRecover = true
+	account := &Account{ID: 7, Platform: PlatformOpenAI, Type: AccountTypeAPIKey, Status: StatusActive, Schedulable: false}
+	accountRepo := &rateLimitClearRepoStub{getByIDAccount: account}
+	runner.rateLimitSvc = &RateLimitService{accountRepo: accountRepo}
+	runner.runTest = func(context.Context, int64, string) (*ScheduledTestResult, error) {
+		return &ScheduledTestResult{Status: "success", ResponseText: "OK"}, nil
+	}
+
+	runner.runOnePlan(context.Background(), plans.plans[1])
+
+	require.Equal(t, 1, results.count())
+	require.Equal(t, "success", plans.plans[1].LastStatus)
+	require.True(t, account.Schedulable, "a successful keepalive with auto-recover must reopen scheduling")
+	require.Equal(t, []bool{true}, accountRepo.setSchedulableCalls)
+}
+
+func TestScheduledKeepaliveQueuedAccountRecoversAndKeepsAlive(t *testing.T) {
+	runner, plans, results := newKeepaliveTestRunner(t, 1)
+	plans.plans[1].AccountID = 7
+	plans.plans[1].AutoRecover = true
+	account := &Account{ID: 7, Platform: PlatformOpenAI, Type: AccountTypeAPIKey, Status: StatusActive,
+		Concurrency: 1, Credentials: map[string]any{"api_key": "test-key", "base_url": "https://upstream.example"}}
+	accountRepo := &rateLimitClearRepoStub{getByIDAccount: account}
+	runner.rateLimitSvc = &RateLimitService{accountRepo: accountRepo}
+	testSvc, upstream := adaptiveCNAccountTestService(account,
+		newJSONResponse(429, accountTestQueued429Body),
+		adaptiveCNResponsesTestResponse(), adaptiveCNResponsesTestResponse())
+	runner.runTest = testSvc.RunKeepaliveBackground
+
+	for i := 0; i < 3; i++ {
+		plans.due(1)
+		runner.runOnePlan(context.Background(), plans.plans[1])
+		require.Len(t, upstream.requests, i+1)
+		require.Equal(t, i+1, results.count())
+		if i == 0 {
+			require.Equal(t, "failed", plans.plans[1].LastStatus)
+			require.False(t, account.Schedulable)
+			require.Empty(t, accountRepo.setSchedulableCalls)
+		} else {
+			require.Equal(t, "success", plans.plans[1].LastStatus)
+			require.True(t, account.Schedulable)
+			require.Equal(t, []bool{true}, accountRepo.setSchedulableCalls, "ongoing keepalives must not repeatedly enable scheduling")
+		}
+	}
+}
+
+func TestScheduledKeepaliveRecoveryRequiresOptInAndSuccess(t *testing.T) {
+	for _, tc := range []struct {
+		name        string
+		autoRecover bool
+		status      string
+		err         error
+	}{
+		{name: "recovery_disabled", status: "success"},
+		{name: "failed_probe", autoRecover: true, status: "failed"},
+		{name: "timed_out_probe", autoRecover: true, err: context.DeadlineExceeded},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			runner, plans, _ := newKeepaliveTestRunner(t, 1)
+			plans.plans[1].AutoRecover = tc.autoRecover
+			account := &Account{ID: 1, Status: StatusActive}
+			accountRepo := &rateLimitClearRepoStub{getByIDAccount: account}
+			runner.rateLimitSvc = &RateLimitService{accountRepo: accountRepo}
+			runner.runTest = func(context.Context, int64, string) (*ScheduledTestResult, error) {
+				return &ScheduledTestResult{Status: tc.status}, tc.err
+			}
+
+			runner.runOnePlan(context.Background(), plans.plans[1])
+
+			require.False(t, account.Schedulable)
+			require.Empty(t, accountRepo.setSchedulableCalls)
+			require.Zero(t, accountRepo.getByIDCalls)
+		})
+	}
+}
+
 func TestScheduledKeepaliveRetriesAndContinuesAfterRecovery(t *testing.T) {
 	runner, repo, results := newKeepaliveTestRunner(t, 1)
 	var calls atomic.Int32

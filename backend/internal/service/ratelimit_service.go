@@ -51,13 +51,15 @@ type AccountRuntimeBlocker interface {
 
 // SuccessfulTestRecoveryResult 表示测试成功后恢复了哪些运行时状态。
 type SuccessfulTestRecoveryResult struct {
-	ClearedError     bool
-	ClearedRateLimit bool
+	ClearedError      bool
+	ClearedRateLimit  bool
+	ResumedScheduling bool
 }
 
 // AccountRecoveryOptions 控制账号恢复时的附加行为。
 type AccountRecoveryOptions struct {
-	InvalidateToken bool
+	InvalidateToken  bool
+	ResumeScheduling bool
 }
 
 type geminiUsageCacheEntry struct {
@@ -2175,9 +2177,19 @@ func (s *RateLimitService) RecoverAccountState(ctx context.Context, accountID in
 		}
 		result.ClearedRateLimit = true
 	}
-	if result.ClearedError || result.ClearedRateLimit {
+	// Only an opted-in keepalive resumes a paused account. Disabled accounts
+	// and accounts paused by their expiration policy must remain paused.
+	if options.ResumeScheduling && !account.Schedulable &&
+		(account.IsActive() || result.ClearedError) &&
+		!(account.AutoPauseOnExpired && account.ExpiresAt != nil && !time.Now().Before(*account.ExpiresAt)) {
+		if err := s.accountRepo.SetSchedulable(ctx, accountID, true); err != nil {
+			return nil, err
+		}
+		result.ResumedScheduling = true
+	}
+	if result.ClearedError || result.ClearedRateLimit || result.ResumedScheduling {
 		s.ResetOpenAI403Counter(ctx, accountID)
-		if result.ClearedError && !result.ClearedRateLimit {
+		if !result.ClearedRateLimit {
 			s.notifyAccountSchedulingBlockCleared(accountID)
 		}
 	}

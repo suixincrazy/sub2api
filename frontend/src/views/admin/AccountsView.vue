@@ -2333,7 +2333,15 @@ const handleSchedule = async (a: Account) => {
     scheduleModelOptions.value = []
   }
 }
-const closeSchedulePanel = () => { showSchedulePanel.value = false; scheduleAcc.value = null; scheduleModelOptions.value = [] }
+const closeSchedulePanel = async () => {
+  const account = scheduleAcc.value
+  showSchedulePanel.value = false
+  scheduleAcc.value = null
+  scheduleModelOptions.value = []
+  if (!account) return
+  const updated = await loadAccountDetails(account)
+  if (updated) patchAccountInList(updated)
+}
 const handleReAuth = (a: Account) => { reAuthAcc.value = a; showReAuth.value = true }
 const duplicatingAccountIDs = new Set<number>()
 const handleDuplicateAccount = async (a: Account) => {

@@ -4,6 +4,7 @@ import { defineComponent } from 'vue'
 
 import AccountsView from '../AccountsView.vue'
 import AccountActionMenu from '@/components/admin/account/AccountActionMenu.vue'
+import ScheduledTestsPanel from '@/components/admin/account/ScheduledTestsPanel.vue'
 
 const {
   listAccounts,
@@ -34,6 +35,7 @@ vi.mock('@/api/admin', () => ({
     accounts: {
       list: listAccounts,
       getById,
+      getAvailableModels: vi.fn().mockResolvedValue([]),
       listWithEtag,
       getBatchTodayStats,
       getUpstreamBillingProbeSettings,
@@ -292,6 +294,23 @@ describe('admin AccountsView lite account list', () => {
     expect(showError).toHaveBeenCalledWith('detail failed')
     expect(wrapper.get('[data-test="edit-account"]').text()).toBe('')
     consoleError.mockRestore()
+    wrapper.unmount()
+  })
+
+  it('refreshes the recovered scheduling switch when the keepalive panel closes', async () => {
+    const paused = { ...listRow, schedulable: false }
+    listAccounts.mockResolvedValue({ items: [paused], total: 1, page: 1, page_size: 20, pages: 1 })
+    const wrapper = mountView()
+    await flushPromises()
+    expect(wrapper.getComponent(DataTableStub).props('data')).toEqual([expect.objectContaining({ schedulable: false })])
+
+    wrapper.findComponent(AccountActionMenu).vm.$emit('schedule', paused)
+    await flushPromises()
+    wrapper.findComponent(ScheduledTestsPanel).vm.$emit('close')
+    await flushPromises()
+
+    expect(getById).toHaveBeenCalledWith(42)
+    expect(wrapper.getComponent(DataTableStub).props('data')).toEqual([expect.objectContaining({ schedulable: true })])
     wrapper.unmount()
   })
 })

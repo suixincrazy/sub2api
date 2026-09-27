@@ -22,6 +22,8 @@ type rateLimitClearRepoStub struct {
 	clearAntigravityCalls     int
 	clearModelRateLimitCalls  int
 	clearTempUnschedCalls     int
+	setSchedulableCalls       []bool
+	setSchedulableErr         error
 	clearErrorErr             error
 	clearRateLimitErr         error
 	clearAntigravityErr       error
@@ -60,6 +62,18 @@ func (r *rateLimitClearRepoStub) ClearModelRateLimits(ctx context.Context, id in
 func (r *rateLimitClearRepoStub) ClearTempUnschedulable(ctx context.Context, id int64) error {
 	r.clearTempUnschedCalls++
 	return r.clearTempUnschedulableErr
+}
+
+func (r *rateLimitClearRepoStub) SetSchedulable(ctx context.Context, id int64, schedulable bool) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	r.setSchedulableCalls = append(r.setSchedulableCalls, schedulable)
+	if r.setSchedulableErr != nil {
+		return r.setSchedulableErr
+	}
+	r.getByIDAccount.Schedulable = schedulable
+	return nil
 }
 
 type tempUnschedCacheRecorder struct {
@@ -306,4 +320,89 @@ func TestRateLimitService_RecoverAccountState_InvalidatesOAuthTokenOnErrorRecove
 	require.Equal(t, 1, repo.clearErrorCalls)
 	require.Len(t, invalidator.accounts, 1)
 	require.Equal(t, int64(21), invalidator.accounts[0].ID)
+}
+
+func TestRateLimitService_RecoverAccountState_ResumeScheduling(t *testing.T) {
+	past := time.Now().Add(-time.Hour)
+	future := time.Now().Add(time.Hour)
+	for _, tc := range []struct {
+		name            string
+		account         Account
+		wantResumed     bool
+		wantSchedulable bool
+	}{
+		{name: "paused", account: Account{Status: StatusActive}, wantResumed: true, wantSchedulable: true},
+		{name: "already_enabled", account: Account{Status: StatusActive, Schedulable: true}, wantSchedulable: true},
+		{name: "error", account: Account{Status: StatusError}, wantResumed: true, wantSchedulable: true},
+		{name: "disabled", account: Account{Status: StatusDisabled}},
+		{name: "expired_auto_pause", account: Account{Status: StatusActive, ExpiresAt: &past, AutoPauseOnExpired: true}},
+		{name: "not_expired", account: Account{Status: StatusActive, ExpiresAt: &future, AutoPauseOnExpired: true}, wantResumed: true, wantSchedulable: true},
+		{name: "expiry_does_not_pause", account: Account{Status: StatusActive, ExpiresAt: &past}, wantResumed: true, wantSchedulable: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			account := tc.account
+			account.ID = 7
+			repo := &rateLimitClearRepoStub{getByIDAccount: &account}
+			blocker := &runtimeBlockRecorder{}
+			svc := NewRateLimitService(repo, nil, &config.Config{}, nil, nil)
+			svc.SetAccountRuntimeBlocker(blocker)
+
+			result, err := svc.RecoverAccountState(context.Background(), 7, AccountRecoveryOptions{ResumeScheduling: true})
+
+			require.NoError(t, err)
+			require.Equal(t, tc.wantResumed, result.ResumedScheduling)
+			require.Equal(t, tc.wantSchedulable, account.Schedulable)
+			if tc.wantResumed {
+				require.Equal(t, []bool{true}, repo.setSchedulableCalls)
+				require.Contains(t, blocker.clearedIDs, int64(7))
+			} else {
+				require.Empty(t, repo.setSchedulableCalls)
+			}
+		})
+	}
+}
+
+func TestRateLimitService_RecoverAccountAfterSuccessfulTest_KeepsManualPause(t *testing.T) {
+	account := &Account{ID: 7, Status: StatusActive}
+	repo := &rateLimitClearRepoStub{getByIDAccount: account}
+	svc := NewRateLimitService(repo, nil, &config.Config{}, nil, nil)
+
+	result, err := svc.RecoverAccountAfterSuccessfulTest(context.Background(), 7)
+
+	require.NoError(t, err)
+	require.False(t, result.ResumedScheduling)
+	require.False(t, account.Schedulable)
+	require.Empty(t, repo.setSchedulableCalls)
+}
+
+func TestRateLimitService_RecoverAccountState_ResumeFailure(t *testing.T) {
+	repo := &rateLimitClearRepoStub{
+		getByIDAccount:    &Account{ID: 7, Status: StatusActive},
+		setSchedulableErr: errors.New("resume failed"),
+	}
+	blocker := &runtimeBlockRecorder{}
+	svc := NewRateLimitService(repo, nil, &config.Config{}, nil, nil)
+	svc.SetAccountRuntimeBlocker(blocker)
+
+	result, err := svc.RecoverAccountState(context.Background(), 7, AccountRecoveryOptions{ResumeScheduling: true})
+
+	require.ErrorIs(t, err, repo.setSchedulableErr)
+	require.Nil(t, result)
+	require.False(t, repo.getByIDAccount.Schedulable)
+	require.Empty(t, blocker.clearedIDs)
+}
+
+func TestRateLimitService_RecoverAccountState_ClearsRuntimeBeforeResuming(t *testing.T) {
+	now := time.Now()
+	repo := &rateLimitClearRepoStub{
+		getByIDAccount:    &Account{ID: 7, Status: StatusActive, RateLimitedAt: &now},
+		clearRateLimitErr: errors.New("clear rate limit failed"),
+	}
+	svc := NewRateLimitService(repo, nil, &config.Config{}, nil, nil)
+
+	result, err := svc.RecoverAccountState(context.Background(), 7, AccountRecoveryOptions{ResumeScheduling: true})
+
+	require.ErrorIs(t, err, repo.clearRateLimitErr)
+	require.Nil(t, result)
+	require.Empty(t, repo.setSchedulableCalls)
 }

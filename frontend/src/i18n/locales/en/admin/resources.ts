@@ -36,7 +36,7 @@ export default {
       maxResultsTooltipExample: 'For example, 100 keeps the latest 100 requests.',
       maxResultsTooltipRange: 'Allowed range: 1–1000.',
       autoRecover: 'Auto Recover',
-      autoRecoverHelp: 'Clear recoverable account errors after a successful response'
+      autoRecoverHelp: 'Clear recoverable errors and enable account scheduling after a successful response. Disabled accounts and accounts automatically paused on expiration remain paused.'
     },
 
     // Proxies
