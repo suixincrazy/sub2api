@@ -6,6 +6,14 @@ import (
 	"log/slog"
 )
 
+func (s *RateLimitService) PauseAccountAfterKeepaliveFailure(ctx context.Context, plan *ScheduledTestPlan) (bool, error) {
+	repo, ok := s.accountRepo.(AccountKeepaliveRecoveryRepository)
+	if !ok {
+		return false, fmt.Errorf("account repository does not support keepalive recovery")
+	}
+	return repo.PauseAfterKeepaliveFailure(ctx, plan)
+}
+
 // RecoverAccountAfterKeepalive never uses the manual recovery path: a completed
 // request must not overwrite a newer scheduling pause or plan edit.
 func (s *RateLimitService) RecoverAccountAfterKeepalive(ctx context.Context, plan *ScheduledTestPlan) (*SuccessfulTestRecoveryResult, error) {

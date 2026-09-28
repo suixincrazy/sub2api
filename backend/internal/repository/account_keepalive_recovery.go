@@ -9,6 +9,38 @@ import (
 
 var _ service.AccountKeepaliveRecoveryRepository = (*accountRepository)(nil)
 
+func (r *accountRepository) PauseAfterKeepaliveFailure(ctx context.Context, plan *service.ScheduledTestPlan) (bool, error) {
+	// Match recovery/manual-pause lock order, but retain auto_recover for retries.
+	result, err := r.sql.ExecContext(ctx, `
+		WITH candidate AS MATERIALIZED (
+			SELECT id FROM accounts
+			WHERE id = $1 AND deleted_at IS NULL AND schedulable
+			FOR UPDATE
+		), pause AS MATERIALIZED (
+			SELECT candidate.id FROM candidate
+			JOIN scheduled_test_plans p ON p.account_id = candidate.id
+			WHERE p.id = $2 AND p.enabled AND p.auto_recover AND p.updated_at = $3
+			FOR UPDATE OF p
+		)
+		UPDATE accounts a SET schedulable = false, updated_at = NOW()
+		FROM pause WHERE a.id = pause.id
+	`, plan.AccountID, plan.ID, plan.UpdatedAt)
+	if err != nil {
+		return false, err
+	}
+	count, err := result.RowsAffected()
+	if err != nil {
+		return false, err
+	}
+	if count > 0 {
+		if err := enqueueSchedulerOutbox(ctx, r.sql, service.SchedulerOutboxEventAccountChanged, &plan.AccountID, nil, nil); err != nil {
+			logger.LegacyPrintf("repository.account", "[SchedulerOutbox] enqueue keepalive pause failed: account=%d err=%v", plan.AccountID, err)
+		}
+		r.syncSchedulerAccountSnapshot(ctx, plan.AccountID)
+	}
+	return count > 0, nil
+}
+
 func (r *accountRepository) RecoverAfterKeepalive(ctx context.Context, plan *service.ScheduledTestPlan) (*service.SuccessfulTestRecoveryResult, error) {
 	// Lock the account before the plan, matching manual scheduling changes.
 	// The locking reads recheck current values after a concurrent writer commits.

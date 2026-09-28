@@ -200,6 +200,13 @@ func (s *ScheduledTestRunnerService) runOnePlan(ctx context.Context, plan *Sched
 	}
 	if result.Status == "success" && plan.AutoRecover {
 		s.tryRecoverAccount(saveCtx, plan)
+	} else if result.Status != "success" && plan.AutoRecover && s.rateLimitSvc != nil {
+		paused, err := s.rateLimitSvc.PauseAccountAfterKeepaliveFailure(saveCtx, plan)
+		if err != nil {
+			logger.LegacyPrintf("service.scheduled_test_runner", "[KeepaliveRunner] plan=%d pause scheduling: %v", plan.ID, err)
+		} else if paused {
+			logger.LegacyPrintf("service.scheduled_test_runner", "[KeepaliveRunner] plan=%d account=%d scheduling paused until successful probe", plan.ID, plan.AccountID)
+		}
 	}
 }
 
