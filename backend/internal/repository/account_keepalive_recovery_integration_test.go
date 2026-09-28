@@ -21,6 +21,9 @@ func newKeepaliveRecoveryFixture(t *testing.T) (*accountRepository, service.Sche
 	t.Cleanup(func() {
 		_, err := integrationDB.ExecContext(context.Background(), "DELETE FROM accounts WHERE id = $1", account.ID)
 		require.NoError(t, err)
+		_, err = integrationDB.ExecContext(context.Background(), `DELETE FROM scheduler_outbox
+			WHERE account_id = $1 OR payload->'account_ids' @> jsonb_build_array($1::bigint)`, account.ID)
+		require.NoError(t, err)
 	})
 	// A schedule that was already off when recovery was explicitly enabled may resume.
 	require.NoError(t, repo.SetSchedulable(ctx, account.ID, false))
