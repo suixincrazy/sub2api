@@ -998,7 +998,10 @@ func (s *OpenAIGatewayService) tryStickySessionHit(ctx context.Context, groupID 
 
 	// 验证账号是否可用于当前请求
 	// Verify account is usable for current request
-	if !isOpenAICompatibleAccountEligibleForRequest(ctx, account, platform, requestedModel, false, requiredCapability) {
+	if reason := openAICompatibleAccountEligibilityFailureReason(ctx, account, platform, requestedModel, false, requiredCapability); reason != "" {
+		if reason == "account_model_not_owned" {
+			_ = s.deleteStickySessionAccountID(ctx, groupID, sessionHash)
+		}
 		return nil
 	}
 	if !parentHealthyForShadow(account, s.parentAccountLookup(ctx)) {
@@ -1227,11 +1230,12 @@ func (s *OpenAIGatewayService) selectAccountWithLoadAwareness(ctx context.Contex
 		if accountID > 0 && !isExcluded(accountID) {
 			account, err := s.getSchedulableAccount(ctx, accountID)
 			if err == nil {
-				clearSticky := shouldClearStickySession(account, requestedModel)
+				eligibilityReason := openAICompatibleAccountEligibilityFailureReason(ctx, account, platform, requestedModel, false, requiredCapability)
+				clearSticky := shouldClearStickySession(account, requestedModel) || eligibilityReason == "account_model_not_owned"
 				if clearSticky {
 					_ = s.deleteStickySessionAccountID(ctx, groupID, sessionHash)
 				}
-				if !clearSticky && isOpenAICompatibleAccountEligibleForRequest(ctx, account, platform, requestedModel, false, requiredCapability) {
+				if !clearSticky && eligibilityReason == "" {
 					account = s.recheckSelectedOpenAIAccountFromDB(ctx, account, groupID, platform, requestedModel, requireCompact, requiredCapability)
 					if account == nil {
 						_ = s.deleteStickySessionAccountID(ctx, groupID, sessionHash)

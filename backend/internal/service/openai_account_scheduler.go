@@ -546,7 +546,7 @@ func (s *defaultOpenAIAccountScheduler) selectBySessionHash(
 		//   - 瞬时不可用（限流暂停 / 运行时封锁 / 母号不健康 / 利润门）：保留绑定，
 		//     本次回退到别的账号，恢复后仍切回原账号。
 		if stickyBindingDeterministicallyIncompatible(reason) {
-			_ = s.service.deleteStickySessionAccountID(ctx, req.GroupID, sessionHash)
+			clearBinding()
 		}
 		return nil, false, nil
 	}
@@ -1543,6 +1543,9 @@ func (s *defaultOpenAIAccountScheduler) selectByLoadBalance(
 			continue
 		}
 		if compatible, reason := s.isAccountRequestCompatibleReason(ctx, account, req); !compatible {
+			if req.StickyWeighted && !req.PreserveStickyBinding && account.ID == req.StickyAccountID && reason == "account_model_not_owned" {
+				_ = s.service.deleteStickySessionAccountID(ctx, req.GroupID, req.SessionHash)
+			}
 			filterStats.exclude(reason)
 			continue
 		}
@@ -1846,7 +1849,7 @@ func (s *defaultOpenAIAccountScheduler) lookupShadowParentAccount(ctx context.Co
 // 非破坏性绑定守卫互锁，让会话永久钉死在一个服务不了它的账号上。
 func stickyBindingDeterministicallyIncompatible(reason string) bool {
 	switch reason {
-	case "account_nil", "model_not_supported", "capability_mismatch", "channel_upstream_restricted":
+	case "account_nil", "model_not_supported", "account_model_not_owned", "capability_mismatch", "channel_upstream_restricted":
 		return true
 	default:
 		return false
