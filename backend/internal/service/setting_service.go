@@ -136,6 +136,7 @@ type SettingService struct {
 	codexRestrictionPolicySF    singleflight.Group
 	codexHistoryFilter          codexHistoryFilterRuntime
 
+	cyberSessionBlockRuntimeMu    sync.Mutex
 	cyberSessionBlockRuntimeCache atomic.Value // *cachedCyberSessionBlockRuntime
 	cyberSessionBlockRuntimeSF    singleflight.Group
 
