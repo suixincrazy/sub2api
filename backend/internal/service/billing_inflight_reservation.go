@@ -3,6 +3,7 @@ package service
 import (
 	"context"
 	"math"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -171,7 +172,7 @@ type inflightReservationCtxKey struct{}
 
 // WithInflightReservation 把预留句柄挂到 context 上，供计费任务提交时交接。
 func WithInflightReservation(ctx context.Context, r *InflightReservation) context.Context {
-	if r == nil {
+	if r == nil && InflightReservationFromContext(ctx) == nil {
 		return ctx
 	}
 	return context.WithValue(ctx, inflightReservationCtxKey{}, r)
@@ -307,10 +308,13 @@ const (
 
 // InflightEstimateRequest 单请求估算输入。
 type InflightEstimateRequest struct {
-	Model     string
-	BodyBytes int
-	MaxTokens int
-	Kind      InflightEstimateKind
+	Model           string
+	BodyBytes       int
+	MaxTokens       int
+	Kind            InflightEstimateKind
+	ServiceTier     string
+	ReasoningEffort string
+	Speed           string
 	// Units 按次/按张数量（<=0 视为 1）。
 	Units int
 	// SearchCalls 叠加的搜索次数（按分组 search_price_per_1k 计）。
@@ -330,10 +334,12 @@ type inflightEstimateDeps struct {
 	resolver       *ModelPricingResolver
 	resolveMapping func(ctx context.Context, groupID int64, model string) ChannelMappingResult
 	userGroupRate  func(ctx context.Context, userID, groupID int64, groupDefault float64) float64
+	serviceTiers   func(model, requestedTier string) []string
+	mapPolicyModel bool
 	// accountMappedModels 返回调度器可选账号对 model 的账号级映射结果（去重，不含 model 本身）。
 	// 准入时账号尚未选定，计费侧 billableModelWithFallback 会回退到实际转发模型（UpstreamModel，
 	// 即账号映射后的模型），因此这里取所有候选映射模型的最高估算。
-	// 仅在首选/渠道候选均无法定价（或 composite 分组）时才调用；实现只读调度器快照，
+	// 仅在候选无法定价、composite 分组或 Fast 策略依赖映射模型时调用；只读调度器快照，
 	// 不在请求路径上直接查库，也不按模型名缓存（内存不随请求模型名增长）。
 	accountMappedModels func(ctx context.Context, apiKey *APIKey, model string) []string
 }
@@ -477,7 +483,7 @@ func maxPerRequestPrice(resolved *ResolvedPricing) float64 {
 func validCost(v float64) bool { return v > 0 && !math.IsNaN(v) && !math.IsInf(v, 0) }
 
 // estimateOne 估算单个候选计费模型（未乘倍率的 token 部分与按次部分分开返回，便于套用不同倍率）。
-func (d inflightEstimateDeps) estimateOne(ctx context.Context, apiKey *APIKey, model string, req InflightEstimateRequest, textRate, imageRate float64) float64 {
+func (d inflightEstimateDeps) estimateOne(ctx context.Context, apiKey *APIKey, model string, req InflightEstimateRequest, serviceTiers []string, textRate, imageRate float64) float64 {
 	cfg := inflightReservationCfg(d.cfg)
 	units := req.Units
 	if units <= 0 {
@@ -495,17 +501,53 @@ func (d inflightEstimateDeps) estimateOne(ctx context.Context, apiKey *APIKey, m
 
 	inputTokens, outputTokens := tokenCounts(cfg, req.BodyBytes, req.MaxTokens)
 	tokenCost := func() float64 {
-		var pricing *ModelPricing
-		if resolved != nil && (resolved.Mode == BillingModeToken || resolved.Mode == "") && d.resolver != nil {
-			pricing = d.resolver.GetIntervalPricing(resolved, inputTokens)
-		}
-		if pricing == nil && d.billing != nil {
-			pricing, _ = d.billing.GetModelPricing(model)
-		}
-		if pricing == nil {
+		if d.billing == nil {
 			return 0
 		}
-		return (float64(inputTokens)*pricing.InputPricePerToken + float64(outputTokens)*pricing.OutputPricePerToken) * textRate
+		if resolved != nil && resolved.BasePricing == nil && len(resolved.Intervals) == 0 {
+			return 0
+		}
+		input := CostInput{
+			Ctx: ctx, Model: model, Tokens: UsageTokens{InputTokens: inputTokens, OutputTokens: outputTokens},
+			RateMultiplier: textRate, ReasoningEffort: req.ReasoningEffort,
+			PricingAt: GatewayTokenRequestPricingAtFromContext(ctx),
+		}
+		if input.PricingAt.IsZero() && ctx != nil {
+			input.PricingAt = OpenAIPricingAtFromContext(ctx)
+		}
+		if apiKey != nil {
+			input.GroupID, input.Group = apiKey.GroupID, apiKey.Group
+		}
+		if resolved != nil && (resolved.Mode == BillingModeToken || resolved.Mode == "") {
+			input.Resolver, input.Resolved = d.resolver, resolved
+		}
+		// Share the actual billing calculation, including tier, reasoning and context prices.
+		best := 0.0
+		for _, tier := range serviceTiers {
+			input.ServiceTier = tier
+			cost, err := d.billing.CalculateCostUnified(input)
+			if err == nil && cost != nil && cost.ActualCost > best {
+				best = cost.ActualCost
+			}
+		}
+		return best
+	}
+	perRequestCost := func(units, rate float64) float64 {
+		if d.billing == nil || d.resolver == nil || resolved == nil {
+			return 0
+		}
+		// Keep the largest configured unit price while sharing billing's effort multiplier.
+		maxPriced := *resolved
+		maxPriced.DefaultPerRequestPrice = maxPerRequestPrice(resolved)
+		maxPriced.RequestTiers = nil
+		cost, err := d.billing.CalculateCostUnified(CostInput{
+			Ctx: ctx, Model: model, UsageUnits: units, RateMultiplier: rate,
+			ReasoningEffort: req.ReasoningEffort, Resolver: d.resolver, Resolved: &maxPriced,
+		})
+		if err != nil || cost == nil {
+			return 0
+		}
+		return cost.ActualCost
 	}
 
 	var cost float64
@@ -513,7 +555,7 @@ func (d inflightEstimateDeps) estimateOne(ctx context.Context, apiKey *APIKey, m
 	switch req.Kind {
 	case InflightEstimateImage:
 		if perRequestMode {
-			cost = maxPerRequestPrice(resolved) * float64(units) * imageRate
+			cost = perRequestCost(float64(units), imageRate)
 		}
 		if d.billing != nil {
 			cfgImg := imagePriceConfigFromAPIKey(apiKey)
@@ -528,7 +570,7 @@ func (d inflightEstimateDeps) estimateOne(ctx context.Context, apiKey *APIKey, m
 		}
 	case InflightEstimateVideo:
 		if perRequestMode {
-			cost = maxPerRequestPrice(resolved) * float64(units) * math.Max(textRate, imageRate)
+			cost = perRequestCost(float64(units), math.Max(textRate, imageRate))
 		}
 		if d.billing != nil {
 			if b := d.billing.CalculateVideoCost(model, req.VideoResolution, units, req.VideoDurationSeconds, videoPriceConfigFromAPIKey(apiKey), math.Max(textRate, imageRate)); b != nil && b.ActualCost > cost {
@@ -541,7 +583,7 @@ func (d inflightEstimateDeps) estimateOne(ctx context.Context, apiKey *APIKey, m
 			if u <= 0 {
 				u = 1
 			}
-			cost = maxPerRequestPrice(resolved) * u * textRate
+			cost = perRequestCost(u, textRate)
 		}
 		if d.billing != nil && req.AudioUnits > 0 {
 			if b := d.billing.CalculateAudioCost(req.AudioMode, req.AudioUnits, groupAudioPriceConfigFromAPIKey(apiKey), textRate); b != nil && b.ActualCost > cost {
@@ -554,7 +596,7 @@ func (d inflightEstimateDeps) estimateOne(ctx context.Context, apiKey *APIKey, m
 			if resolved.Mode == BillingModeImage {
 				rate = imageRate
 			}
-			cost = maxPerRequestPrice(resolved) * float64(units) * rate
+			cost = perRequestCost(float64(units), rate)
 		} else if req.Kind != InflightEstimatePerRequest {
 			cost = tokenCost()
 		}
@@ -587,10 +629,41 @@ func (d inflightEstimateDeps) estimate(ctx context.Context, apiKey *APIKey, req 
 		return 0, true
 	}
 	primary, fallbacks, upstreamInput := inflightBillingModelCandidates(ctx, d, apiKey, req.Model)
+	var accountModels []string
+	loadedAccountModels := false
+	loadAccountModels := func() []string {
+		if !loadedAccountModels && d.accountMappedModels != nil {
+			accountModels = d.accountMappedModels(ctx, apiKey, upstreamInput)
+			loadedAccountModels = true
+		}
+		return accountModels
+	}
+	// Policy matching uses upstream models, even when billing keeps a priced request alias.
+	policyModels := []string{upstreamInput}
+	platform := QuotaPlatform(ctx, apiKey)
+	anthropicFast := req.Speed == "fast" && (platform == PlatformAnthropic || platform == "")
+	if d.mapPolicyModel || anthropicFast {
+		policyModels = append(policyModels, loadAccountModels()...)
+	}
+	var serviceTiers []string
+	for _, model := range policyModels {
+		tiers := []string{req.ServiceTier}
+		if d.serviceTiers != nil {
+			tiers = d.serviceTiers(model, req.ServiceTier)
+		}
+		if anthropicFast && modelSupportsAnthropicFastMode(model) && !isLikelyBedrockModelID(model) {
+			tiers = append(tiers, "fast")
+		}
+		for _, tier := range tiers {
+			if !slices.Contains(serviceTiers, tier) {
+				serviceTiers = append(serviceTiers, tier)
+			}
+		}
+	}
 	bestOf := func(models []string) float64 {
 		best := 0.0
 		for _, m := range models {
-			if c := d.estimateOne(ctx, apiKey, m, req, textRate, imageRate); c > best {
+			if c := d.estimateOne(ctx, apiKey, m, req, serviceTiers, textRate, imageRate); c > best {
 				best = c
 			}
 		}
@@ -607,7 +680,7 @@ func (d inflightEstimateDeps) estimate(ctx context.Context, apiKey *APIKey, req 
 		}
 		// 账号级映射候选（读调度器快照）仅在仍无法定价或 composite 时才查，已定价模型不触发。
 		if (best <= 0 || composite) && d.accountMappedModels != nil {
-			if c := bestOf(d.accountMappedModels(ctx, apiKey, upstreamInput)); c > best {
+			if c := bestOf(loadAccountModels()); c > best {
 				best = c
 			}
 		}
@@ -710,5 +783,71 @@ func (s *OpenAIGatewayService) EstimateInflightReservation(ctx context.Context, 
 	if s == nil {
 		return 0, false
 	}
-	return s.inflightEstimateDeps().estimate(ctx, apiKey, req)
+	deps := s.inflightEstimateDeps()
+	platform := QuotaPlatform(ctx, apiKey)
+	if apiKey != nil && apiKey.User != nil && (platform == PlatformOpenAI || platform == "") {
+		settings := openAIFastPolicySettingsFromContext(ctx)
+		if settings == nil && s.settingService != nil {
+			settings, _ = s.settingService.GetOpenAIFastPolicySettings(ctx)
+		}
+		if settings != nil {
+			for _, rule := range settings.Rules {
+				if len(rule.ModelWhitelist) > 0 {
+					deps.mapPolicyModel = true
+					break
+				}
+			}
+		}
+		deps.serviceTiers = func(model, requestedTier string) []string {
+			tiers := inflightOpenAIServiceTiers(settings, apiKey, model, requestedTier)
+			if platform == "" && apiKey.Group != nil && apiKey.Group.Platform == PlatformComposite {
+				// An unresolved composite route may still select a non-OpenAI account.
+				tiers = append(tiers, requestedTier)
+			}
+			return tiers
+		}
+	}
+	return deps.estimate(ctx, apiKey, req)
+}
+
+func inflightOpenAIServiceTiers(settings *OpenAIFastPolicySettings, apiKey *APIKey, model, requestedTier string) []string {
+	var tiers []string
+	// Account selection happens later; reserve the higher actual price across credential scopes.
+	for _, accountType := range []string{AccountTypeAPIKey, AccountTypeOAuth} {
+		account := &Account{Platform: PlatformOpenAI, Type: accountType}
+		tier := requestedTier
+		group := apiKey.Group
+		if IsGroupContextValid(group) && groupSupportsOpenAIFast(group.Platform) && group.ForceOpenAIFast {
+			tier = OpenAIFastTierPriority
+		}
+		policyTier := normalizedOpenAIServiceTierValue(tier)
+		if tier == "" {
+			policyTier = OpenAIFastTierMissing
+		}
+		if policyTier != "" {
+			if tier != "" {
+				tier = policyTier
+			}
+			policyModel := model
+			if account.IsOAuth() {
+				policyModel = normalizeCodexModel(model)
+			}
+			action, _ := evaluateOpenAIFastPolicyWithSettings(settings, apiKey.User.ID, account, policyModel, policyTier)
+			switch action {
+			case OpenAIFastPolicyActionForcePriority:
+				tier = OpenAIFastTierPriority
+			case BetaPolicyActionFilter:
+				if policyTier != OpenAIFastTierMissing {
+					tier = ""
+				}
+			}
+		}
+		if groupBillsOpenAIFastAtStandard(apiKey, account, tier) {
+			tier = ""
+		}
+		if len(tiers) == 0 || tiers[0] != tier {
+			tiers = append(tiers, tier)
+		}
+	}
+	return tiers
 }

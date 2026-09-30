@@ -623,6 +623,11 @@ func (h *OpenAIGatewayHandler) Responses(c *gin.Context) {
 		return
 	}
 
+	// 分组利润控制：请求级装配定价上下文，预占、利润门与计费共用同一时刻。
+	// 生图意图只影响能力路由与图片计费，混合请求的 token 部分仍受利润门保护。
+	pricingCtx, pricingAt := h.gatewayService.WithOpenAIRequestPricingContext(c.Request.Context(), apiKey.GroupID)
+	c.Request = c.Request.WithContext(pricingCtx)
+
 	// 余额模式在途预留：防止并发请求在预检时看到同一份余额而集体透支。
 	inflightRelease, err := reserveInflightBalance(c, h.billingCacheService, h.gatewayService, apiKey, subscription, tokenInflightEstimate(reqModel, body))
 	if err != nil {
@@ -663,13 +668,6 @@ func (h *OpenAIGatewayHandler) Responses(c *gin.Context) {
 	// 该判断已排除 Codex 被动 image_gen namespace，避免 CC-only 账号被误过滤（#4476）。
 	needsResponses := nativeV2 || legacyCompact
 	requiredCapability := openAIResponsesRequiredCapabilityForRequest(imageIntent, needsResponses, requestPlatform)
-
-	// 分组利润控制：请求级装配定价上下文——pricingAt 固定本请求的
-	// D 与计费高峰因子，选号、槽位终检与全部 failover 重入共用同一门与阈值。
-	// 生图意图只影响能力路由与图片计费，不关门：混合 /v1/responses 请求的
-	// token 计费部分仍受利润门保护，独立图片/视频端点才在门外。
-	pricingCtx, pricingAt := h.gatewayService.WithOpenAIRequestPricingContext(c.Request.Context(), apiKey.GroupID)
-	c.Request = c.Request.WithContext(pricingCtx)
 
 	for {
 		// Streaming Forward intentionally detaches the upstream request so usage can
@@ -1280,6 +1278,10 @@ func (h *OpenAIGatewayHandler) Messages(c *gin.Context) {
 		return
 	}
 
+	// 分组利润控制：Messages 文本入口同样在预占前固定 pricingAt。
+	msgPricingCtx, pricingAt := h.gatewayService.WithOpenAIRequestPricingContext(c.Request.Context(), apiKey.GroupID)
+	c.Request = c.Request.WithContext(msgPricingCtx)
+
 	// 余额模式在途预留（与计费同口径估算；计费任务扣减余额缓存后才释放）。
 	inflightDone, inflightErr := reserveInflightBalance(c, h.billingCacheService, h.gatewayService, apiKey, subscription, tokenInflightEstimate(reqModel, body))
 	if inflightErr != nil {
@@ -1307,10 +1309,6 @@ func (h *OpenAIGatewayHandler) Messages(c *gin.Context) {
 	var lastFailoverErr *service.UpstreamFailoverError
 	var oauth429FailoverState service.OpenAIOAuth429FailoverState
 	effectiveMappedModel := preferredMappedModel
-
-	// 分组利润控制：Messages 文本入口同样请求级装门并固定 pricingAt。
-	msgPricingCtx, pricingAt := h.gatewayService.WithOpenAIRequestPricingContext(c.Request.Context(), apiKey.GroupID)
-	c.Request = c.Request.WithContext(msgPricingCtx)
 
 	for {
 		if failoverClientGone(c) {
@@ -2114,23 +2112,33 @@ const (
 	openAISlotAcquireProfitVetoed
 )
 
-// openAIWSTurnPricing 持有 WebSocket 连接内「当前 turn」的计费定价时刻。
-// 由 BeforeTurn 在每个 turn 开始时冻结，AfterTurn 的用量提交读取它；turn 在
-// 连接内串行推进，互斥锁只为跨用量提交 goroutine 的读取安全。
-//
-// 零值语义（重要）：首轮准入由握手路径完成，不调用 BeforeTurn，因此首轮保持
-// 零值并回退到 TurnStarted 记录的首轮开始时刻。后续 turn 在 response.create
-// 写入上游前调用 BeforeTurn，按当时的利润门复核并冻结定价。绝不能用建连时刻
-// 初始化，否则会把长连接的所有 turn 钉死在建连时的峰谷因子。
+// openAIWSTurnPricing freezes one pricing time and profit gate before each
+// turn's reservation. Admission and billing reuse it, including internal retries.
+// Without a prepared context, callers retain the turn-start fallback.
 type openAIWSTurnPricing struct {
-	mu sync.Mutex
-	at time.Time
+	mu  sync.Mutex
+	at  time.Time
+	ctx context.Context
 }
 
 func (p *openAIWSTurnPricing) freeze(at time.Time) {
+	p.freezeContext(nil, at)
+}
+
+func (p *openAIWSTurnPricing) freezeContext(ctx context.Context, at time.Time) {
 	p.mu.Lock()
 	p.at = at
+	p.ctx = ctx
 	p.mu.Unlock()
+}
+
+func (p *openAIWSTurnPricing) contextOr(fallback context.Context) context.Context {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.ctx != nil {
+		return p.ctx
+	}
+	return fallback
 }
 
 func (p *openAIWSTurnPricing) currentOr(fallback time.Time) time.Time {
@@ -2591,16 +2599,8 @@ func (h *OpenAIGatewayHandler) ResponsesWebSocket(c *gin.Context) {
 		return
 	}
 
-	// 余额模式在途预留（会话级）：按首帧估算一次，会话期间续期；每轮计费任务接管引用，
-	// 会话结束且所有轮次扣减落地后释放。
-	inflightCtx, inflightDone, inflightErr := reserveInflightBalanceCtx(ctx, h.billingCacheService, h.gatewayService, apiKey, subscription, tokenInflightEstimate(reqModel, firstMessage))
-	if inflightErr != nil {
-		reqLog.Info("openai.websocket_inflight_reservation_rejected", zap.Error(inflightErr))
-		closeOpenAIClientWS(wsConn, coderws.StatusPolicyViolation, "billing check failed")
-		return
-	}
-	defer inflightDone()
-	ctx = inflightCtx
+	var turnInflight openAIWSTurnReservation
+	defer turnInflight.End()
 
 	// A WebSocket may outlive a key's remaining spending window. Recheck
 	// after acquiring turn slots, including the first account-selection wait.
@@ -2701,7 +2701,7 @@ func (h *OpenAIGatewayHandler) ResponsesWebSocket(c *gin.Context) {
 	}
 
 	// 分组利润控制：WS 桥按连接装配定价上下文并装门（选号与抢槽共用该
-	// ctx）。连接内不重选号，但每个 turn 开始经 BeforeTurn 重新冻结 pricingAt
+	// ctx）。连接内不重选号，但每个 turn 开始在预占前重新冻结 pricingAt
 	// 并按最新门复核当前账号（准入与计费同源），峰前建连保活不能让后续 turn
 	// 继续按建连时刻的谷价计费。生图意图只影响能力路由与图片计费，不关门。
 	// 建连时刻只用于选号/准入，不作为任何 turn 的计费定价时刻。
@@ -2878,9 +2878,13 @@ func (h *OpenAIGatewayHandler) ResponsesWebSocket(c *gin.Context) {
 		// turn-tagged slot preserves the exact mapping used for the in-flight request.
 		var turnChannelMapping atomic.Pointer[openAIWSTurnChannelMappingSnapshot]
 		turnChannelMapping.Store(&openAIWSTurnChannelMappingSnapshot{turn: 1, mapping: channelMappingWS})
-		// turn 级定价：首轮回退到 TurnStarted 的所属 turn 时刻；后续 turn 由
-		// BeforeTurn 重新冻结 pricingAt 并按最新门复核当前账号。
+		// Freeze before reservation so pricing, the profit gate and billing agree.
 		var turnPricing openAIWSTurnPricing
+		beginTurnReservation := func(model string, payload []byte) error {
+			turnCtx, turnAt := h.gatewayService.WithOpenAITurnPricingContext(ctx, apiKey.GroupID)
+			turnPricing.freezeContext(turnCtx, turnAt)
+			return turnInflight.Begin(turnCtx, h.billingCacheService, h.gatewayService, apiKey, subscription, tokenInflightEstimate(model, payload))
+		}
 		var overloadFailureObserved atomic.Bool
 		var overloadRoutingModel atomic.Pointer[string]
 		overloadRoutingModel.Store(&wsForwardModel)
@@ -2936,6 +2940,16 @@ func (h *OpenAIGatewayHandler) ResponsesWebSocket(c *gin.Context) {
 					writeSecurityAuditWSError(ctx, wsConn, decision)
 					return service.NewOpenAIWSClientCloseError(securityAuditWSCloseStatus(decision), securityAuditWSCloseReason(decision), nil)
 				}
+				// A new logical turn rechecks billing once. Internal retries reuse
+				// this turn; simple-mode windows retain their post-slot check.
+				if h.cfg == nil || h.cfg.RunMode != config.RunModeSimple {
+					if err := h.billingCacheService.CheckBillingEligibility(ctx, apiKey.User, apiKey, apiKey.Group, subscription, service.QuotaPlatform(ctx, apiKey)); err != nil {
+						return service.NewOpenAIWSClientCloseError(coderws.StatusPolicyViolation, "billing check failed", err)
+					}
+				}
+				if err := beginTurnReservation(model, payload); err != nil {
+					return service.NewOpenAIWSClientCloseError(coderws.StatusPolicyViolation, "billing check failed", err)
+				}
 				return nil
 			},
 			MapRequestModel: func(turn int, originalModel string) (string, error) {
@@ -2975,10 +2989,9 @@ func (h *OpenAIGatewayHandler) ResponsesWebSocket(c *gin.Context) {
 				if cyberBlockedThisConn && !h.cyberPolicyLogOnly(c, apiKey) {
 					return service.NewOpenAIWSClientCloseError(coderws.StatusPolicyViolation, cyberSessionBlockedClientMsg, nil)
 				}
-				// 长连接跨峰谷/倍率刷新防护：每个 turn 按当前时刻重装门并复核
-				// 当前账号，越线即要求客户端重连重选（连接绑定单一上游账号，
-				// 无法中途换号）。本 turn 的准入与计费共用同一 pricingAt。
-				turnCtx, turnAt := h.gatewayService.WithOpenAITurnPricingContext(ctx, apiKey.GroupID)
+				// Use the gate frozen before this turn's reservation. Recheck the
+				// current account against it without changing the billing instant.
+				turnCtx := turnPricing.contextOr(ctx)
 				if _, vetoed, reason := h.gatewayService.ProfitControlVetoLatest(turnCtx, account); vetoed {
 					reqLog.Info("openai.websocket_turn_profit_vetoed",
 						zap.Int("turn", turn),
@@ -2986,7 +2999,6 @@ func (h *OpenAIGatewayHandler) ResponsesWebSocket(c *gin.Context) {
 						zap.String("reason", reason))
 					return service.NewOpenAIWSClientCloseError(coderws.StatusTryAgainLater, "account is no longer eligible for this connection, please reconnect", nil)
 				}
-				turnPricing.freeze(turnAt)
 				if turn == 1 {
 					return nil
 				}
@@ -3018,6 +3030,8 @@ func (h *OpenAIGatewayHandler) ResponsesWebSocket(c *gin.Context) {
 				return checkSimpleModeTurnBilling()
 			},
 			AfterTurn: func(turn int, result *service.OpenAIForwardResult, turnErr error) {
+				turnCtx := turnInflight.Context(turnPricing.contextOr(ctx))
+				defer turnInflight.End()
 				turnStart := getTurnStart(turn)
 				cyberBlockBody := takeCyberTurnBody(turn)
 				// 每次 attempt 都清 cyber mark；failover 链结束前保留 recorded guard，
@@ -3054,7 +3068,7 @@ func (h *OpenAIGatewayHandler) ResponsesWebSocket(c *gin.Context) {
 				}
 				turnUsageFields := turnMapping.ToUsageFields(turnRequestedModel, turnUpstreamModel)
 				cyberMarked := service.GetOpsCyberPolicy(c) != nil
-				h.recordCyberPolicyIfMarked(c, apiKey, account, subscription, turnRequestedModel, turnErr != nil, cyberBlockBody, turnUsageFields, requestPayloadHash)
+				h.recordCyberPolicyIfMarkedContext(turnCtx, c, apiKey, account, subscription, turnRequestedModel, turnErr != nil, cyberBlockBody, turnUsageFields, requestPayloadHash)
 				cyberBlockedThisConn, cyberBlockPendingAfterFailover = advanceOpenAIWSCyberBlockState(
 					cyberBlockedThisConn,
 					cyberBlockPendingAfterFailover,
@@ -3103,7 +3117,7 @@ func (h *OpenAIGatewayHandler) ResponsesWebSocket(c *gin.Context) {
 				sessionID := service.ExtractClientSessionID(c)
 				turnRecordPricingAt := turnPricing.currentOr(turnStart)
 				cyberBlocked := service.GetOpsCyberPolicy(c) != nil
-				h.submitOpenAIUsageRecordTask(ctx, result, func(taskCtx context.Context) {
+				h.submitOpenAIUsageRecordTask(turnCtx, result, func(taskCtx context.Context) {
 					if err := h.gatewayService.RecordUsage(taskCtx, &service.OpenAIRecordUsageInput{
 						Result:             result,
 						APIKey:             apiKey,
@@ -3153,8 +3167,18 @@ func (h *OpenAIGatewayHandler) ResponsesWebSocket(c *gin.Context) {
 		}
 
 		for {
+			inflightModel := strings.TrimSpace(gjson.GetBytes(wsFirstMessage, "model").String())
+			if inflightModel == "" {
+				inflightModel = reqModel
+			}
+			if err := beginTurnReservation(inflightModel, wsFirstMessage); err != nil {
+				reqLog.Info("openai.websocket_inflight_reservation_rejected", zap.Error(err))
+				closeOpenAIClientWS(wsConn, coderws.StatusPolicyViolation, "billing check failed")
+				return
+			}
 			overloadFailureObserved.Store(false)
 			err := h.gatewayService.ProxyResponsesWebSocketFromClient(ctx, c, wsConn, account, token, wsFirstMessage, hooks)
+			turnInflight.End()
 			if err != nil && !overloadFailureObserved.Load() {
 				h.gatewayService.ObserveOpenAIAccountOverloadResult(apiKey.GroupID, account, *overloadRoutingModel.Load(), false, err)
 			}
@@ -4278,6 +4302,14 @@ func (h *OpenAIGatewayHandler) enqueueCyberSessionBlockedOpsEntry(c *gin.Context
 // 当前请求已发给用户，本方法只做事后记录，不影响响应。forwardErrored 为 true 时才写用量行，
 // 避免与正常 RecordUsage(forward 成功路径)重复。每请求至多记录一次。
 func (h *OpenAIGatewayHandler) recordCyberPolicyIfMarked(c *gin.Context, apiKey *service.APIKey, account *service.Account, subscription *service.UserSubscription, model string, forwardErrored bool, cyberBlockBody []byte, channelFields service.ChannelUsageFields, requestPayloadHash string) {
+	requestCtx := context.Background()
+	if c != nil && c.Request != nil {
+		requestCtx = c.Request.Context()
+	}
+	h.recordCyberPolicyIfMarkedContext(requestCtx, c, apiKey, account, subscription, model, forwardErrored, cyberBlockBody, channelFields, requestPayloadHash)
+}
+
+func (h *OpenAIGatewayHandler) recordCyberPolicyIfMarkedContext(requestCtx context.Context, c *gin.Context, apiKey *service.APIKey, account *service.Account, subscription *service.UserSubscription, model string, forwardErrored bool, cyberBlockBody []byte, channelFields service.ChannelUsageFields, requestPayloadHash string) {
 	mark := service.GetOpsCyberPolicy(c)
 	if mark == nil {
 		return
@@ -4325,10 +4357,6 @@ func (h *OpenAIGatewayHandler) recordCyberPolicyIfMarked(c *gin.Context, apiKey 
 	if c.Request != nil && c.Request.URL != nil {
 		requestPath = c.Request.URL.Path
 	}
-	requestCtx := context.Background()
-	if c.Request != nil {
-		requestCtx = c.Request.Context()
-	}
 	platform := resolveOpsPlatform(requestCtx, apiKey, guessPlatformFromPath(requestPath))
 	var clientRequestID, userAgent, clientIPStr string
 	if c.Request != nil {
@@ -4369,7 +4397,12 @@ func (h *OpenAIGatewayHandler) recordCyberPolicyIfMarked(c *gin.Context, apiKey 
 			cancel()
 		}
 	}
+	inflightDone := inflightNoop
+	if forwardErrored && gwSvc != nil {
+		inflightDone = service.InflightReservationFromContext(requestCtx).Acquire()
+	}
 	go func() {
+		defer inflightDone()
 		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 		defer cancel()
 		if cmSvc != nil {

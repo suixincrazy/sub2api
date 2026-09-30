@@ -128,6 +128,11 @@ type apiKeyAllByUserIDLister interface {
 	ListAllByUserID(ctx context.Context, userID int64, filters APIKeyListFilters) ([]APIKey, error)
 }
 
+// APIKeyActiveLimitCreator checks the active-key limit and creates the key atomically across instances.
+type APIKeyActiveLimitCreator interface {
+	CreateWithActiveLimit(ctx context.Context, key *APIKey, maxActive int) error
+}
+
 // APIKeyRateLimitData holds rate limit usage and window state for an API key.
 type APIKeyRateLimitData struct {
 	Usage5h       float64
@@ -587,7 +592,12 @@ func (s *APIKeyService) Create(ctx context.Context, userID int64, req CreateAPIK
 		apiKey.ExpiresAt = &expiresAt
 	}
 
-	if err := s.apiKeyRepo.Create(ctx, apiKey); err != nil {
+	if creator, ok := s.apiKeyRepo.(APIKeyActiveLimitCreator); ok && s.cfg != nil && s.cfg.APIKeyCreate.MaxActivePerUser > 0 {
+		err = creator.CreateWithActiveLimit(ctx, apiKey, s.cfg.APIKeyCreate.MaxActivePerUser)
+	} else {
+		err = s.apiKeyRepo.Create(ctx, apiKey)
+	}
+	if err != nil {
 		return nil, fmt.Errorf("create api key: %w", err)
 	}
 

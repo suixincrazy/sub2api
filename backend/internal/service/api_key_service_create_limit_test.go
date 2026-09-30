@@ -156,3 +156,30 @@ func TestAPIKeyServiceCreate_RedisErrorFailsOpen(t *testing.T) {
 		require.NoError(t, err)
 	}
 }
+
+type atomicCreateLimitRepoStub struct {
+	*createLimitAPIKeyRepoStub
+	limit int
+	err   error
+}
+
+func (s *atomicCreateLimitRepoStub) CreateWithActiveLimit(_ context.Context, _ *APIKey, maxActive int) error {
+	s.limit = maxActive
+	return s.err
+}
+
+func TestAPIKeyServiceCreate_UsesAtomicActiveLimit(t *testing.T) {
+	for _, createErr := range []error{ErrAPIKeyCountExceeded, errors.New("transaction failed")} {
+		t.Run(createErr.Error(), func(t *testing.T) {
+			repo, cache := newCreateLimitStubs()
+			atomicRepo := &atomicCreateLimitRepoStub{createLimitAPIKeyRepoStub: repo, err: createErr}
+			svc := newCreateLimitService(repo, cache, 5, 0)
+			svc.apiKeyRepo = atomicRepo
+
+			_, err := svc.Create(context.Background(), 7, CreateAPIKeyRequest{Name: "k"})
+			require.ErrorIs(t, err, createErr)
+			require.Equal(t, 5, atomicRepo.limit)
+			require.Empty(t, repo.created, "an atomic rejection must never fall back to unchecked creation")
+		})
+	}
+}

@@ -29,6 +29,8 @@ type apiKeyRepository struct {
 	sql    sqlExecutor
 }
 
+var _ service.APIKeyActiveLimitCreator = (*apiKeyRepository)(nil)
+
 func NewAPIKeyRepository(client *dbent.Client, sqlDB *sql.DB) service.APIKeyRepository {
 	return newAPIKeyRepositoryWithSQL(client, sqlDB)
 }
@@ -43,7 +45,52 @@ func (r *apiKeyRepository) activeQuery() *dbent.APIKeyQuery {
 }
 
 func (r *apiKeyRepository) Create(ctx context.Context, key *service.APIKey) error {
-	builder := r.client.APIKey.Create().
+	return createAPIKeyRecord(ctx, clientFromContext(ctx, r.client), key)
+}
+
+// CreateWithActiveLimit serializes each user's count and insert on the database row lock.
+func (r *apiKeyRepository) CreateWithActiveLimit(ctx context.Context, key *service.APIKey, maxActive int) error {
+	if maxActive <= 0 {
+		return r.Create(ctx, key)
+	}
+	if existingTx := dbent.TxFromContext(ctx); existingTx != nil {
+		return createAPIKeyWithActiveLimit(ctx, existingTx.Client(), key, maxActive)
+	}
+
+	tx, err := r.client.Tx(ctx)
+	if err != nil && !errors.Is(err, dbent.ErrTxStarted) {
+		return err
+	}
+	client := r.client
+	if err == nil {
+		defer func() { _ = tx.Rollback() }()
+		client = tx.Client()
+	}
+	if err := createAPIKeyWithActiveLimit(ctx, client, key, maxActive); err != nil {
+		return err
+	}
+	if tx != nil {
+		return tx.Commit()
+	}
+	return nil
+}
+
+func createAPIKeyWithActiveLimit(ctx context.Context, client *dbent.Client, key *service.APIKey, maxActive int) error {
+	if _, err := client.User.Query().Where(user.IDEQ(key.UserID), user.DeletedAtIsNil()).ForUpdate().OnlyID(ctx); err != nil {
+		return translatePersistenceError(err, service.ErrUserNotFound, nil)
+	}
+	count, err := client.APIKey.Query().Where(apikey.UserIDEQ(key.UserID), apikey.DeletedAtIsNil()).Count(ctx)
+	if err != nil {
+		return err
+	}
+	if count >= maxActive {
+		return service.ErrAPIKeyCountExceeded
+	}
+	return createAPIKeyRecord(ctx, client, key)
+}
+
+func createAPIKeyRecord(ctx context.Context, client *dbent.Client, key *service.APIKey) error {
+	builder := client.APIKey.Create().
 		SetUserID(key.UserID).
 		SetKey(key.Key).
 		SetName(key.Name).

@@ -274,7 +274,7 @@ func (h *GatewayHandler) Messages(c *gin.Context) {
 		h.handleStreamingAwareError(c, status, code, message, streamStarted)
 		return
 	}
-	defer inflightRelease()
+	defer func() { inflightRelease() }()
 
 	// 设置请求所属分组 ID（用于渠道级功能判断，如 WebSearch 模拟）
 	parsedReq.GroupID = apiKey.GroupID
@@ -1034,7 +1034,18 @@ func (h *GatewayHandler) Messages(c *gin.Context) {
 						}
 						// 兜底重试按"直接请求兜底分组"处理：清除强制平台，允许按分组平台调度
 						ctx := context.WithValue(c.Request.Context(), ctxkey.ForcePlatform, "")
-						c.Request = c.Request.WithContext(ctx)
+						// End only this handler's reference; pending billing keeps its own reservation.
+						inflightRelease()
+						c.Request = c.Request.WithContext(service.WithInflightReservation(ctx, nil))
+						inflightRelease, err = reserveInflightBalance(c, h.billingCacheService, h.gatewayService, fallbackAPIKey, nil, tokenInflightEstimate(reqModel, body))
+						if err != nil {
+							status, code, message, retryAfter := billingErrorDetails(err)
+							if retryAfter > 0 {
+								c.Header("Retry-After", strconv.Itoa(retryAfter))
+							}
+							h.handleStreamingAwareError(c, status, code, message, streamStarted)
+							return
+						}
 						currentAPIKey = fallbackAPIKey
 						currentSubscription = nil
 						fallbackUsed = true

@@ -25,11 +25,18 @@ func requestMaxOutputTokens(body []byte) int {
 
 // tokenInflightEstimate 文本类请求的估算输入。
 func tokenInflightEstimate(model string, body []byte) service.InflightEstimateRequest {
+	effort := ""
+	if requested := service.CanonicalRequestedReasoningEffort(body, model); requested != nil {
+		effort = *requested
+	}
 	return service.InflightEstimateRequest{
-		Model:     model,
-		BodyBytes: len(body),
-		MaxTokens: requestMaxOutputTokens(body),
-		Kind:      service.InflightEstimateToken,
+		Model:           model,
+		BodyBytes:       len(body),
+		MaxTokens:       requestMaxOutputTokens(body),
+		Kind:            service.InflightEstimateToken,
+		ServiceTier:     gjson.GetBytes(body, "service_tier").String(),
+		ReasoningEffort: effort,
+		Speed:           gjson.GetBytes(body, "speed").String(),
 	}
 }
 
