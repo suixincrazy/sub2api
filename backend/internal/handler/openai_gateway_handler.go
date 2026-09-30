@@ -2122,7 +2122,10 @@ type openAIWSTurnPricing struct {
 }
 
 func (p *openAIWSTurnPricing) freeze(at time.Time) {
-	p.freezeContext(nil, at)
+	p.mu.Lock()
+	p.at = at
+	p.ctx = nil
+	p.mu.Unlock()
 }
 
 func (p *openAIWSTurnPricing) freezeContext(ctx context.Context, at time.Time) {

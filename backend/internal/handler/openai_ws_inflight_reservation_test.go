@@ -100,7 +100,7 @@ func newWSInflightHarness(t *testing.T, mode string, extraAccounts ...service.Ac
 		if err != nil {
 			return
 		}
-		defer conn.CloseNow()
+		defer func() { _ = conn.CloseNow() }()
 		for {
 			_, payload, err := conn.Read(upstreamCtx)
 			if err != nil {
@@ -279,6 +279,8 @@ func TestOpenAIWSInflight_SubsequentTurnsReestimateAndCheckBalance(t *testing.T)
 			require.False(t, firstPricingAt.IsZero())
 			h.complete(t, 1, "gpt-5.1")
 			h.settle(t)
+			require.Eventually(t, func() bool { return time.Now().After(firstPricingAt) }, time.Second, time.Millisecond,
+				"advance the clock before checking that the next turn freezes a new time")
 
 			h.send(t, `{"type":"response.create","model":"gpt-5.2","input":"two","max_output_tokens":4096}`)
 			wsInflightReceive(t, h.requests)
@@ -391,7 +393,7 @@ func TestOpenAIWSInflight_FailoverRebuildsFirstTurnReservation(t *testing.T) {
 		if err != nil {
 			return
 		}
-		defer conn.CloseNow()
+		defer func() { _ = conn.CloseNow() }()
 		for {
 			_, payload, err := conn.Read(upstreamCtx)
 			if err != nil {
