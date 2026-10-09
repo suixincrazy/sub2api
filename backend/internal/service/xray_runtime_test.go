@@ -1,10 +1,13 @@
 package service
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/json"
+	"fmt"
+	"log/slog"
 	"net"
 	"net/http/httptest"
 	"net/url"
@@ -757,9 +760,133 @@ func TestXrayRuntimeManagerEnforcesPerUserInstanceLimit(t *testing.T) {
 	}
 }
 
+func TestXrayRuntimeManagerReplacementConfigSurvivesOldCleanup(t *testing.T) {
+	manager := NewXrayRuntimeManager("xray-test-helper", t.TempDir())
+	manager.commandFactory = func(_, configPath string) *exec.Cmd {
+		cmd := exec.Command(os.Args[0], "-test.run=^TestXrayRuntimeHelperProcess$") //nolint:gosec // G702: this test binary is relaunched with fixed helper arguments.
+		cmd.Env = append(os.Environ(), "SUB2API_XRAY_HELPER=1", "SUB2API_XRAY_HELPER_CONFIG="+configPath)
+		return cmd
+	}
+	defer func() { _ = manager.Close() }()
+	proxy := &Proxy{ID: 91, Kind: "xray", Extra: map[string]any{
+		"outbound": map[string]any{"protocol": "freedom", "settings": map[string]any{}},
+	}}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	if _, err := manager.ProxyURL(ctx, proxy); err != nil {
+		t.Fatal(err)
+	}
+	manager.mu.Lock()
+	old := manager.instances[proxy.ID]
+	// Stop releases the lock before reaping this detached instance.
+	delete(manager.instances, proxy.ID)
+	manager.mu.Unlock()
+	defer func() { _ = old.stop() }()
+	gate := filepath.Join(t.TempDir(), "start")
+	created := make(chan string, 1)
+	manager.commandFactory = func(_, configPath string) *exec.Cmd {
+		created <- configPath
+		cmd := exec.Command(os.Args[0], "-test.run=^TestXrayRuntimeHelperProcess$") //nolint:gosec // G702: this test binary is relaunched with fixed helper arguments.
+		cmd.Env = append(os.Environ(), "SUB2API_XRAY_HELPER=1", "SUB2API_XRAY_HELPER_CONFIG="+configPath, "SUB2API_XRAY_HELPER_GATE="+gate)
+		return cmd
+	}
+	started := make(chan error, 1)
+	go func() {
+		_, err := manager.ProxyURL(ctx, proxy)
+		started <- err
+	}()
+	var configPath string
+	select {
+	case configPath = <-created:
+	case <-ctx.Done():
+		t.Fatal("replacement did not reach process start")
+	}
+	stopErr := old.stop()
+	_, configErr := os.Stat(configPath)
+	if err := os.WriteFile(gate, []byte("start"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	startErr := <-started
+	if configErr != nil {
+		t.Fatalf("old runtime cleanup removed replacement config: %v; stop: %v; start: %v", configErr, stopErr, startErr)
+	}
+	if stopErr != nil {
+		t.Fatalf("old runtime cleanup failed: %v", stopErr)
+	}
+	if startErr != nil {
+		t.Fatalf("replacement runtime failed to start: %v", startErr)
+	}
+}
+
+func TestXrayRuntimeManagerLogsUnexpectedExit(t *testing.T) {
+	for _, requestedStop := range []bool{false, true} {
+		t.Run(fmt.Sprintf("requested_stop=%t", requestedStop), func(t *testing.T) {
+			var logs bytes.Buffer
+			previous := slog.Default()
+			slog.SetDefault(slog.New(slog.NewJSONHandler(&logs, nil)))
+			defer slog.SetDefault(previous)
+			manager := NewXrayRuntimeManager("xray-test-helper", t.TempDir())
+			manager.commandFactory = func(_, configPath string) *exec.Cmd {
+				cmd := exec.Command(os.Args[0], "-test.run=^TestXrayRuntimeHelperProcess$") //nolint:gosec // G702: this test binary is relaunched with fixed helper arguments.
+				cmd.Env = append(os.Environ(), "SUB2API_XRAY_HELPER=1", "SUB2API_XRAY_HELPER_CONFIG="+configPath)
+				return cmd
+			}
+			defer func() { _ = manager.Close() }()
+			proxy := &Proxy{ID: 92, Kind: "xray", Extra: map[string]any{
+				"outbound": map[string]any{"protocol": "freedom", "settings": map[string]any{}},
+			}}
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			if _, err := manager.ProxyURL(ctx, proxy); err != nil {
+				t.Fatal(err)
+			}
+			instance := manager.instances[proxy.ID]
+			if requestedStop {
+				if err := manager.Stop(proxy.ID); err != nil {
+					t.Fatal(err)
+				}
+			} else if err := instance.cmd.Process.Kill(); err != nil {
+				t.Fatal(err)
+			}
+			select {
+			case <-instance.done:
+			case <-ctx.Done():
+				t.Fatal("runtime exit was not observed")
+			}
+			if requestedStop {
+				if strings.Contains(logs.String(), "xray runtime exited unexpectedly") {
+					t.Fatalf("requested stop logged as unexpected: %s", logs.String())
+				}
+				return
+			}
+			var record map[string]any
+			if err := json.Unmarshal(logs.Bytes(), &record); err != nil {
+				t.Fatalf("missing structured exit log: %v: %s", err, logs.String())
+			}
+			if record["msg"] != "xray runtime exited unexpectedly" || record["level"] != "WARN" ||
+				record["proxy_id"] != float64(proxy.ID) || record["pid"] != float64(instance.cmd.Process.Pid) ||
+				record["error"] == nil || record["exit_code"] == nil || record["uptime_ms"] == nil {
+				t.Fatalf("incomplete exit log: %s", logs.String())
+			}
+		})
+	}
+}
+
 func TestXrayRuntimeHelperProcess(t *testing.T) {
 	if os.Getenv("SUB2API_XRAY_HELPER") != "1" {
 		return
+	}
+	if gate := os.Getenv("SUB2API_XRAY_HELPER_GATE"); gate != "" {
+		deadline := time.Now().Add(5 * time.Second)
+		for {
+			if _, err := os.Stat(gate); err == nil {
+				break
+			}
+			if time.Now().After(deadline) {
+				t.Fatal("helper start gate was not released")
+			}
+			time.Sleep(10 * time.Millisecond)
+		}
 	}
 	raw, err := os.ReadFile(os.Getenv("SUB2API_XRAY_HELPER_CONFIG"))
 	if err != nil {

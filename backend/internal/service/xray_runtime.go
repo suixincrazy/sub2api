@@ -9,6 +9,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"net"
 	"net/url"
 	"os"
@@ -17,6 +18,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -71,16 +73,17 @@ type XrayRuntimeManager struct {
 }
 
 type xrayRuntimeInstance struct {
-	proxyID     int64
-	ownerUserID *int64
-	sourceHash  string
-	hash        string
-	port        int
-	cmd         *exec.Cmd
-	configPath  string
-	logPath     string
-	done        chan error
-	lastUsed    time.Time
+	proxyID       int64
+	ownerUserID   *int64
+	sourceHash    string
+	hash          string
+	port          int
+	cmd           *exec.Cmd
+	configPath    string
+	logPath       string
+	done          chan error
+	lastUsed      time.Time
+	stopRequested atomic.Bool
 }
 
 func NewXrayRuntimeManager(bin, workDir string) *XrayRuntimeManager {
@@ -465,12 +468,20 @@ func (m *XrayRuntimeManager) start(ctx context.Context, proxyID int64, ownerUser
 		return nil, err
 	}
 	prefix := fmt.Sprintf("proxy-%d-%s", proxyID, hash[:12])
-	configPath := filepath.Join(m.workDir, prefix+".json")
-	logPath := filepath.Join(m.workDir, prefix+".log")
-	if err := os.WriteFile(configPath, rawConfig, 0o600); err != nil { //nolint:gosec // G703: 同上；文件名为 proxy-<int64>-<hash 前 12 位>，不含路径分隔符
+	// Stop reaps outside the manager lock; replacements must own different files.
+	configFile, err := os.CreateTemp(m.workDir, prefix+"-*.json")
+	if err != nil {
 		return nil, err
 	}
-	logFile, err := os.OpenFile(logPath, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o600) //nolint:gosec // G703: 同上
+	configPath := configFile.Name()
+	logPath := strings.TrimSuffix(configPath, ".json") + ".log"
+	_, writeErr := configFile.Write(rawConfig)
+	closeErr := configFile.Close()
+	if err := errors.Join(writeErr, closeErr); err != nil {
+		_ = os.Remove(configPath) //nolint:gosec // G703: configPath is the private runtime temp file just created above.
+		return nil, err
+	}
+	logFile, err := os.OpenFile(logPath, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o600) //nolint:gosec // G703: logPath derives from the private runtime temp file.
 	if err != nil {
 		_ = os.Remove(configPath)
 		return nil, err
@@ -481,6 +492,7 @@ func (m *XrayRuntimeManager) start(ctx context.Context, proxyID int64, ownerUser
 	}
 	cmd.Stdout = logFile
 	cmd.Stderr = logFile
+	startedAt := time.Now()
 	if err := cmd.Start(); err != nil {
 		_ = logFile.Close()
 		_ = os.Remove(configPath)
@@ -496,14 +508,20 @@ func (m *XrayRuntimeManager) start(ctx context.Context, proxyID int64, ownerUser
 		configPath:  configPath,
 		logPath:     logPath,
 		done:        make(chan error, 1),
-		lastUsed:    time.Now(),
+		lastUsed:    startedAt,
 	}
 	go func() {
-		inst.done <- cmd.Wait()
-		close(inst.done)
+		err := cmd.Wait()
 		_ = logFile.Close()
 		_ = os.Remove(configPath)
 		_ = os.Remove(logPath)
+		if !inst.stopRequested.Load() {
+			slog.Warn("xray runtime exited unexpectedly", "proxy_id", proxyID,
+				"pid", cmd.Process.Pid, "uptime_ms", time.Since(startedAt).Milliseconds(),
+				"exit_code", cmd.ProcessState.ExitCode(), "error", err)
+		}
+		inst.done <- err
+		close(inst.done)
 	}()
 
 	waitCtx, cancel := context.WithTimeout(ctx, 8*time.Second)
@@ -609,6 +627,7 @@ func (i *xrayRuntimeInstance) stop() error {
 	if i == nil {
 		return nil
 	}
+	i.stopRequested.Store(true)
 	if i.cmd != nil && i.cmd.Process != nil && i.alive() {
 		if err := i.cmd.Process.Kill(); err != nil && !errors.Is(err, os.ErrProcessDone) {
 			return err
