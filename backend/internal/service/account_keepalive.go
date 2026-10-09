@@ -117,6 +117,7 @@ func (s *AccountTestService) RunKeepaliveBackground(ctx context.Context, account
 	c.Request = httptest.NewRequest(http.MethodPost, "/", nil).WithContext(ctx)
 	state := &accountKeepaliveState{}
 	c.Set(accountKeepaliveContextKey, state)
+	c.Set(accountTestBackgroundKey, true)
 	testErr := s.TestAccountConnection(c, accountID, modelID, keepalivePrompt, AccountTestModeDefault)
 	var text strings.Builder
 	errMsg := ""

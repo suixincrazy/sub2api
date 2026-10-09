@@ -447,7 +447,7 @@
 </template>
 
 <script setup lang="ts">
-import { ref, reactive, watch, onUnmounted } from 'vue'
+import { ref, reactive, watch, onBeforeUnmount, onUnmounted } from 'vue'
 import { useI18n } from 'vue-i18n'
 import BaseDialog from '@/components/common/BaseDialog.vue'
 import ConfirmDialog from '@/components/common/ConfirmDialog.vue'
@@ -481,6 +481,13 @@ const loadingResults = ref(false)
 const plans = ref<ScheduledTestPlan[]>([])
 const results = ref<ScheduledTestResult[]>([])
 const expandedPlanId = ref<number | null>(null)
+let resultsRequestId = 0
+watch(expandedPlanId, () => {
+  resultsRequestId++
+  results.value = []
+  loadingResults.value = false
+}, { flush: 'sync' })
+onBeforeUnmount(() => { resultsRequestId++ })
 const expandedResultIds = reactive(new Set<number>())
 const showAddForm = ref(false)
 const showDeleteConfirm = ref(false)
@@ -698,15 +705,18 @@ const toggleExpand = async (planId: number) => {
   expandedPlanId.value = planId
   expandedResultIds.clear()
   loadingResults.value = true
+  const requestId = resultsRequestId
   try {
     const version = viewVersion
     const loaded = await adminAPI.scheduledTests.listResults(planId, 20)
+    if (requestId !== resultsRequestId) return
     if (version === viewVersion && expandedPlanId.value === planId) results.value = loaded || []
   } catch (error: any) {
+    if (requestId !== resultsRequestId) return
     appStore.showError(error?.message || 'Failed to load results')
     results.value = []
   } finally {
-    loadingResults.value = false
+    if (requestId === resultsRequestId) loadingResults.value = false
   }
 }
 

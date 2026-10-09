@@ -8,16 +8,18 @@ import {
   type UpdateSettingsRequest,
   type DefaultPlatformQuotasMap,
 } from "@/api/admin/settings";
+import { listPlatformIds } from "@/constants/platformCatalog";
 
-/** 全 null 的 6 平台 map，用于断言归一化默认值 */
-const allNullQuotas: DefaultPlatformQuotasMap = {
-  anthropic: { daily: null, weekly: null, monthly: null },
-  openai:    { daily: null, weekly: null, monthly: null },
-  gemini:    { daily: null, weekly: null, monthly: null },
-  antigravity: { daily: null, weekly: null, monthly: null },
-  grok: { daily: null, weekly: null, monthly: null },
-  typesafe: { daily: null, weekly: null, monthly: null },
-}
+/** 与后端 AllowedQuotaPlatforms 一致的全部具体平台（平台清单）。 */
+const quotaPlatforms = [
+  "anthropic", "openai", "gemini", "antigravity", "grok",
+  "kimi", "zhipu", "deepseek", "minimax", "opencode_go", "typesafe", "command_code", "cline",
+];
+
+/** 全部平台全 null 的 map，用于断言归一化默认值 */
+const allNullQuotas: DefaultPlatformQuotasMap = Object.fromEntries(
+  quotaPlatforms.map((platform) => [platform, { daily: null, weekly: null, monthly: null }]),
+)
 
 describe("admin settings auth source defaults helpers", () => {
   it("builds auth source defaults state from flat settings fields", () => {
@@ -239,10 +241,14 @@ describe("normalizePlatformQuotasMap", () => {
     expect(result.gemini).toEqual({ daily: null, weekly: null, monthly: null });
     expect(result.antigravity).toEqual({ daily: null, weekly: null, monthly: null });
     expect(result.grok).toEqual({ daily: null, weekly: null, monthly: null });
+    expect(result.kimi).toEqual({ daily: null, weekly: null, monthly: null });
+    expect(result.opencode_go).toEqual({ daily: null, weekly: null, monthly: null });
   });
 
-  it("无参数时返回全 6 平台全 null", () => {
+  it("无参数时返回平台清单中的全部平台全 null", () => {
     const result = normalizePlatformQuotasMap();
+    expect(listPlatformIds()).toEqual(quotaPlatforms);
+    expect(Object.keys(result)).toEqual(quotaPlatforms);
     expect(result).toEqual(allNullQuotas);
     for (const v of Object.values(result)) {
       expect(v).toEqual({ daily: null, weekly: null, monthly: null });
@@ -291,6 +297,7 @@ describe("sanitizePlatformQuotasMap", () => {
 
   it("缺失平台填充为全 null", () => {
     const result = sanitizePlatformQuotasMap({});
+    expect(Object.keys(result)).toEqual(quotaPlatforms);
     expect(result).toEqual(allNullQuotas);
     for (const v of Object.values(result)) {
       expect(v).toEqual({ daily: null, weekly: null, monthly: null });

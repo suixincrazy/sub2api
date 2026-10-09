@@ -312,6 +312,37 @@ func TestOpenAIWSInflight_SubsequentTurnsReestimateAndCheckBalance(t *testing.T)
 	}
 }
 
+func TestOpenAIWSInflight_GroupRateChangeAppliesToNextTurnReservation(t *testing.T) {
+	for _, mode := range []string{service.OpenAIWSIngressModePassthrough, service.OpenAIWSIngressModeCtxPool} {
+		t.Run(mode, func(t *testing.T) {
+			h := newWSInflightHarness(t, mode)
+			payload := `{"type":"response.create","model":"gpt-5.1","input":"one","max_output_tokens":128}`
+			h.send(t, payload)
+			wsInflightReceive(t, h.requests)
+			firstAmount := wsInflightReceive(t, h.cache.reserved)
+			firstBill := h.complete(t, 1, "gpt-5.1")
+			h.settle(t)
+
+			repo := newWSGroupPricingAPIKeyRepoStub(1)
+			apiKeyService := newWSGroupPricingAPIKeyService(repo)
+			h.handler.apiKeyService = apiKeyService
+			h.apiKey.Key = wsGroupPricingKey
+			require.NoError(t, repo.adminUpdate(apiKeyService, func(_ *service.APIKey, group *service.Group) {
+				group.RateMultiplier = 3
+			}))
+
+			h.send(t, payload)
+			wsInflightReceive(t, h.requests)
+			secondAmount := wsInflightReceive(t, h.cache.reserved)
+			secondBill := h.complete(t, 2, "gpt-5.1")
+			h.settle(t)
+			require.InDelta(t, firstBill.BalanceCost*3, secondBill.BalanceCost, 1e-12)
+			require.InDelta(t, firstAmount*3, secondAmount, 1e-12,
+				"reservation must use the same refreshed group rate as turn billing")
+		})
+	}
+}
+
 func TestOpenAIWSInflight_InternalRetryKeepsTurnReservation(t *testing.T) {
 	h := newWSInflightHarness(t, service.OpenAIWSIngressModeCtxPool)
 	h.send(t, `{"type":"response.create","model":"gpt-5.1","input":"one","max_output_tokens":128}`)
