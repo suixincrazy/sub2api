@@ -121,7 +121,7 @@ func (s *OpenAIGatewayService) forwardResponsesInputTokensOnce(
 			return nil
 		}
 		if s.rateLimitService != nil {
-			s.rateLimitService.HandleUpstreamError(ctx, account, resp.StatusCode, resp.Header, respBody)
+			s.rateLimitService.HandleUpstreamError(ctx, account, resp.StatusCode, resp.Header, respBody, prepared.UpstreamModel)
 		}
 		if resp.StatusCode == http.StatusTooManyRequests && upstream429State(ctx, account) != nil {
 			return &UpstreamFailoverError{StatusCode: resp.StatusCode, ResponseHeaders: resp.Header, ResponseBody: respBody}
@@ -383,7 +383,7 @@ func (s *OpenAIGatewayService) forwardCountTokensAsAnthropicOnce(
 		}
 
 		if s.rateLimitService != nil {
-			s.rateLimitService.HandleUpstreamError(ctx, account, resp.StatusCode, resp.Header, respBody)
+			s.rateLimitService.HandleUpstreamError(ctx, account, resp.StatusCode, resp.Header, respBody, prepared.UpstreamModel)
 		}
 		if resp.StatusCode == http.StatusTooManyRequests && upstream429State(ctx, account) != nil {
 			return &UpstreamFailoverError{StatusCode: resp.StatusCode, ResponseHeaders: resp.Header, ResponseBody: respBody}

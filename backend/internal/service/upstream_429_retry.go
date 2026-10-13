@@ -87,7 +87,7 @@ func beginUpstream429Retry(ctx context.Context, c *gin.Context, account *Account
 	// forwarding argument. They must see the same deferred health side effects.
 	if c != nil && c.Request != nil {
 		original := c.Request
-		c.Request = c.Request.WithContext(ctx)
+		c.Request = original.WithContext(context.WithValue(original.Context(), upstream429RetryKey{}, state))
 		restore = func() { c.Request = original }
 	}
 	return ctx, state, restore
@@ -112,6 +112,9 @@ func (state *upstream429RetryState) retry(ctx context.Context, c *gin.Context, a
 	failure.SameAccountRetryDeadline = time.Time{}
 	if ctx.Err() != nil {
 		return false, ctx.Err()
+	}
+	if c != nil && c.Request != nil && c.Request.Context().Err() != nil {
+		return false, c.Request.Context().Err()
 	}
 	if !failure.ShouldRetryNextAccount() || (c != nil && IsResponseCommitted(c)) {
 		return false, err
@@ -143,6 +146,9 @@ func (state *upstream429RetryState) retry(ctx context.Context, c *gin.Context, a
 	slog.WarnContext(ctx, "upstream_429_same_account_retry", "account_id", account.ID, "platform", account.Platform, "retry", retry+1, "max_retries", upstream429MaxRetries, "delay_ms", delay.Milliseconds())
 	if waitErr := sleepWithContext(ctx, delay); waitErr != nil {
 		return false, waitErr
+	}
+	if c != nil && c.Request != nil && c.Request.Context().Err() != nil {
+		return false, c.Request.Context().Err()
 	}
 	return true, err
 }
