@@ -28,7 +28,7 @@ func TestOpenAIOverloadSchedule_FallbackAndImmediateRecovery(t *testing.T) {
 				}
 				pick := func(want int64) {
 					t.Helper()
-					selection, _, err := svc.SelectAccountWithScheduler(context.Background(), &groupID, "", session, "gpt-5.5", nil, OpenAIUpstreamTransportAny, false)
+					selection, _, err := svc.SelectAccountWithScheduler(context.Background(), &groupID, "", session, "gpt-6.1-sol", nil, OpenAIUpstreamTransportAny, false)
 					require.NoError(t, err)
 					require.NotNil(t, selection)
 					require.Equal(t, want, selection.Account.ID)
@@ -39,12 +39,12 @@ func TestOpenAIOverloadSchedule_FallbackAndImmediateRecovery(t *testing.T) {
 				overload := errors.New("stream disconnected before completion: Our servers are currently overloaded. Please try again later.")
 				pick(16)
 				for i := 0; i < 5; i++ {
-					svc.ObserveOpenAIAccountOverloadResult(&groupID, &accounts[0], "gpt-5.5", false, overload)
+					svc.ObserveOpenAIAccountOverloadResult(&groupID, &accounts[0], "gpt-6.1-sol", false, overload)
 					pick(16)
 				}
-				svc.ObserveOpenAIAccountOverloadResult(&groupID, &accounts[0], "gpt-5.5", false, overload)
+				svc.ObserveOpenAIAccountOverloadResult(&groupID, &accounts[0], "gpt-6.1-sol", false, overload)
 				pick(1)
-				svc.ObserveOpenAIAccountOverloadResult(&groupID, &accounts[1], "gpt-5.5", true, nil)
+				svc.ObserveOpenAIAccountOverloadResult(&groupID, &accounts[1], "gpt-6.1-sol", true, nil)
 				pick(16)
 			})
 		}
