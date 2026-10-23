@@ -163,8 +163,12 @@ func newTestGatewayHandler(
 	gatewayCache ...service.GatewayCache,
 ) (*GatewayHandler, func()) {
 	t.Helper()
+	return newTestGatewayHandlerWithSchedulerCache(t, group, &fakeSchedulerCache{accounts: accounts}, gatewayCache...)
+}
 
-	schedulerCache := &fakeSchedulerCache{accounts: accounts}
+func newTestGatewayHandlerWithSchedulerCache(t *testing.T, group *service.Group, schedulerCache service.SchedulerCache, gatewayCache ...service.GatewayCache) (*GatewayHandler, func()) {
+	t.Helper()
+
 	schedulerSnapshot := service.NewSchedulerSnapshotService(schedulerCache, nil, nil, nil, nil)
 
 	var cache service.GatewayCache
