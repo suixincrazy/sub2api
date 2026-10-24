@@ -13,7 +13,10 @@ import (
 
 const (
 	scheduledTestDefaultMaxWorkers = 10
-	keepaliveRequestTimeout        = 30 * time.Second
+	// Relays queue requests before the first response byte; anyrouter's observed
+	// p99 time-to-first-token is ~290s, so a shorter cap fails probes that real
+	// traffic would complete. Each account runs at most one probe at a time.
+	keepaliveRequestTimeout = 6 * time.Minute
 )
 
 type keepaliveRun struct {

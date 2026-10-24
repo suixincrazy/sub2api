@@ -143,6 +143,23 @@ func TestScheduledKeepaliveAutoRecoverResumesScheduling(t *testing.T) {
 	require.Equal(t, []bool{true}, accountRepo.setSchedulableCalls)
 }
 
+func TestScheduledKeepaliveRequestDeadlineCoversRelayQueue(t *testing.T) {
+	runner, plans, results := newKeepaliveTestRunner(t, 1)
+	var remaining time.Duration
+	runner.runTest = func(ctx context.Context, _ int64, _ string) (*ScheduledTestResult, error) {
+		deadline, ok := ctx.Deadline()
+		require.True(t, ok, "keepalive probes must stay bounded")
+		remaining = time.Until(deadline)
+		return &ScheduledTestResult{Status: "success", ResponseText: "OK"}, nil
+	}
+
+	runner.runOnePlan(context.Background(), plans.plans[1])
+
+	require.Equal(t, 1, results.count())
+	require.Greater(t, remaining, 5*time.Minute, "relay queueing routinely exceeds 30s before the first byte")
+	require.LessOrEqual(t, remaining, keepaliveRequestTimeout)
+}
+
 func TestScheduledKeepaliveQueuedAccountRecoversAndKeepsAlive(t *testing.T) {
 	runner, plans, results := newKeepaliveTestRunner(t, 1)
 	plans.plans[1].AccountID = 7
