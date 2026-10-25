@@ -15,7 +15,7 @@ const (
 	scheduledTestDefaultMaxWorkers = 10
 	// Relays queue requests before the first response byte; anyrouter's observed
 	// p99 time-to-first-token is ~290s, so a shorter cap fails probes that real
-	// traffic would complete. Each account runs at most one probe at a time.
+	// traffic would complete. Each plan runs at most one probe at a time.
 	keepaliveRequestTimeout = 6 * time.Minute
 )
 
@@ -25,7 +25,7 @@ type keepaliveRun struct {
 }
 
 // ScheduledTestRunnerService maintains persistent probe/keepalive schedules.
-// A single dispatcher owns admission; slow requests never block other accounts.
+// A single dispatcher owns admission; slow requests never block other plans.
 type ScheduledTestRunnerService struct {
 	planRepo     ScheduledTestPlanRepository
 	scheduledSvc *ScheduledTestService
@@ -115,21 +115,19 @@ func (s *ScheduledTestRunnerService) runScheduled() {
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	busyAccounts := make(map[int64]bool)
 	for id, run := range s.running {
 		current := enabled[id]
 		if current == nil || !current.UpdatedAt.Equal(run.plan.UpdatedAt) {
 			run.cancel()
 		}
-		// A cancelled transport still owns its slot until it actually exits.
-		busyAccounts[run.plan.AccountID] = true
 	}
 	now := time.Now()
 	for _, plan := range plans {
 		if len(s.running) >= scheduledTestDefaultMaxWorkers || s.ctx.Err() != nil {
 			break
 		}
-		if s.running[plan.ID] != nil || busyAccounts[plan.AccountID] {
+		// A cancelled transport still owns its plan slot until it actually exits.
+		if s.running[plan.ID] != nil {
 			continue
 		}
 		if plan.NextRunAt != nil && plan.NextRunAt.After(now) {
@@ -138,7 +136,6 @@ func (s *ScheduledTestRunnerService) runScheduled() {
 		runCtx, runCancel := context.WithCancel(s.ctx)
 		run := &keepaliveRun{plan: plan, cancel: runCancel}
 		s.running[plan.ID] = run
-		busyAccounts[plan.AccountID] = true
 		s.workers.Add(1)
 		go func() {
 			defer s.workers.Done()

@@ -5,6 +5,7 @@ package service
 import (
 	"context"
 	"errors"
+	"fmt"
 	"sort"
 	"sync"
 	"sync/atomic"
@@ -294,17 +295,65 @@ func TestScheduledKeepalivePauseDeleteEditCancelInFlight(t *testing.T) {
 	}
 }
 
-func TestScheduledKeepaliveWorkerLimitAndNoOverlappingAccounts(t *testing.T) {
+func TestScheduledKeepaliveSameAccountPlansRunConcurrently(t *testing.T) {
+	runner, repo, results := newKeepaliveTestRunner(t, 2)
+	repo.plans[1].ModelID = "gpt-6.1-sol"
+	repo.plans[2].AccountID = repo.plans[1].AccountID
+	repo.plans[2].Enabled = false
+	slowStarted := make(chan struct{}, 1)
+	releaseSlow := make(chan struct{})
+	runner.runTest = func(ctx context.Context, _ int64, model string) (*ScheduledTestResult, error) {
+		if model == "gpt-6.1-sol" {
+			slowStarted <- struct{}{}
+			select {
+			case <-releaseSlow:
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			}
+		}
+		return &ScheduledTestResult{Status: "success", ResponseText: "OK"}, nil
+	}
+
+	runner.runScheduled()
+	select {
+	case <-slowStarted:
+	case <-time.After(time.Second):
+		t.Fatal("slow keepalive did not start")
+	}
+	repo.mu.Lock()
+	repo.plans[2].Enabled = true
+	repo.mu.Unlock()
+	runner.runScheduled()
+	require.Eventually(t, func() bool { return results.count() == 1 }, time.Second, time.Millisecond,
+		"a queued Sol keepalive must not block Astra on the same account")
+	fast, err := repo.GetByID(context.Background(), 2)
+	require.NoError(t, err)
+	require.Equal(t, "success", fast.LastStatus)
+	runner.mu.Lock()
+	slowStillRunning := runner.running[1] != nil
+	runner.mu.Unlock()
+	require.True(t, slowStillRunning, "the fast plan must finish while the slow plan is still in flight")
+	runner.runScheduled()
+	require.Empty(t, slowStarted, "another scan must not restart the in-flight plan")
+	close(releaseSlow)
+	waitKeepaliveIdle(t, runner)
+	require.Equal(t, 2, results.count())
+}
+
+func TestScheduledKeepaliveWorkerLimitAndNoOverlappingPlans(t *testing.T) {
 	runner, repo, _ := newKeepaliveTestRunner(t, 12)
-	repo.plans[2].AccountID = 1
-	entered := make(chan int64, 20)
-	runner.runTest = func(ctx context.Context, id int64, _ string) (*ScheduledTestResult, error) {
-		entered <- id
+	for id, plan := range repo.plans {
+		plan.AccountID = 1
+		plan.ModelID = fmt.Sprintf("model-%d", id)
+	}
+	entered := make(chan string, 20)
+	runner.runTest = func(ctx context.Context, _ int64, model string) (*ScheduledTestResult, error) {
+		entered <- model
 		<-ctx.Done()
 		return nil, ctx.Err()
 	}
 	runner.runScheduled()
-	ids := map[int64]bool{}
+	ids := map[string]bool{}
 	for i := 0; i < scheduledTestDefaultMaxWorkers; i++ {
 		select {
 		case id := <-entered:
@@ -315,9 +364,59 @@ func TestScheduledKeepaliveWorkerLimitAndNoOverlappingAccounts(t *testing.T) {
 		}
 	}
 	runner.runScheduled()
+	runner.mu.Lock()
+	running := len(runner.running)
+	runner.mu.Unlock()
+	require.Equal(t, scheduledTestDefaultMaxWorkers, running)
 	require.Empty(t, entered, "repeated scans may not admit duplicates or more workers")
 	runner.cancel()
 	waitKeepaliveIdle(t, runner)
+}
+
+func TestScheduledKeepalivePauseCancelsOnlySelectedPlan(t *testing.T) {
+	runner, repo, results := newKeepaliveTestRunner(t, 2)
+	repo.plans[1].ModelID = "gpt-6.1-sol"
+	repo.plans[2].AccountID = repo.plans[1].AccountID
+	entered := make(chan string, 2)
+	paused := make(chan struct{})
+	finishSibling := make(chan struct{})
+	runner.runTest = func(ctx context.Context, _ int64, model string) (*ScheduledTestResult, error) {
+		entered <- model
+		if model == "gpt-6.1-sol" {
+			<-ctx.Done()
+			close(paused)
+			return nil, ctx.Err()
+		}
+		select {
+		case <-finishSibling:
+			return &ScheduledTestResult{Status: "success", ResponseText: "OK"}, nil
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
+	}
+	runner.runScheduled()
+	for i := 0; i < 2; i++ {
+		select {
+		case <-entered:
+		case <-time.After(time.Second):
+			t.Fatal("both plans must start before pausing one")
+		}
+	}
+	repo.mu.Lock()
+	repo.plans[1].Enabled = false
+	repo.mu.Unlock()
+	runner.runScheduled()
+	select {
+	case <-paused:
+	case <-time.After(time.Second):
+		t.Fatal("the selected plan was not cancelled")
+	}
+	close(finishSibling)
+	waitKeepaliveIdle(t, runner)
+	require.Equal(t, 1, results.count(), "the sibling must complete and the paused run must not save a result")
+	sibling, err := repo.GetByID(context.Background(), 2)
+	require.NoError(t, err)
+	require.Equal(t, "success", sibling.LastStatus)
 }
 
 func TestScheduledKeepaliveErrorPersistsRetryAndStaleSnapshotDoesNotSend(t *testing.T) {
