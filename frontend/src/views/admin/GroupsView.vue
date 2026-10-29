@@ -647,10 +647,7 @@
           v-model:over-limit="createForm.max_reasoning_effort_over_limit"
           v-model:mappings="createForm.reasoning_effort_mappings"
         />
-        <div
-          v-if="createForm.subscription_type !== 'subscription'"
-          data-tour="group-form-exclusive"
-        >
+        <div data-tour="group-form-exclusive">
           <div class="mb-1.5 flex items-center gap-1">
             <label class="text-sm font-medium text-gray-700 dark:text-gray-300">
               {{ t("admin.groups.form.exclusive") }}
@@ -2299,7 +2296,7 @@
           v-model:over-limit="editForm.max_reasoning_effort_over_limit"
           v-model:mappings="editForm.reasoning_effort_mappings"
         />
-        <div v-if="editForm.subscription_type !== 'subscription'">
+        <div>
           <div class="mb-1.5 flex items-center gap-1">
             <label class="text-sm font-medium text-gray-700 dark:text-gray-300">
               {{ t("admin.groups.form.exclusive") }}

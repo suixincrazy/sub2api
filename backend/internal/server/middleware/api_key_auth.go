@@ -184,6 +184,7 @@ func apiKeyAuthWithSubscription(apiKeyService *service.APIKeyService, subscripti
 			if !billingInfoRequest {
 				_ = apiKeyService.TouchLastUsed(c.Request.Context(), apiKey.ID)
 			}
+			defer trackAPIKeyInflight(c, apiKeyService, apiKeyString)()
 			c.Next()
 			return
 		}
@@ -283,6 +284,7 @@ func apiKeyAuthWithSubscription(apiKeyService *service.APIKeyService, subscripti
 			_ = apiKeyService.TouchLastUsed(c.Request.Context(), apiKey.ID)
 		}
 
+		defer trackAPIKeyInflight(c, apiKeyService, apiKeyString)()
 		c.Next()
 	}
 }

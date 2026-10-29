@@ -319,6 +319,7 @@ type APIKeyService struct {
 	authInvalidationFailures  atomic.Uint64
 	lastUsedTouchL1           sync.Map // keyID -> nextAllowedAt(time.Time)
 	lastUsedTouchSF           singleflight.Group
+	inflight                  apiKeyInflightRegistry
 }
 
 type APIKeyAuthLookupMetrics struct {

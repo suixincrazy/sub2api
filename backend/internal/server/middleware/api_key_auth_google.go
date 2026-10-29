@@ -141,6 +141,7 @@ func APIKeyAuthWithSubscriptionGoogle(apiKeyService *service.APIKeyService, subs
 			c.Set(string(ContextKeyUserRole), apiKey.User.Role)
 			setGroupContext(c, apiKey.Group)
 			_ = apiKeyService.TouchLastUsed(c.Request.Context(), apiKey.ID)
+			defer trackAPIKeyInflight(c, apiKeyService, apiKeyString)()
 			c.Next()
 			return
 		}
@@ -214,6 +215,7 @@ func APIKeyAuthWithSubscriptionGoogle(apiKeyService *service.APIKeyService, subs
 		c.Set(string(ContextKeyUserRole), apiKey.User.Role)
 		setGroupContext(c, apiKey.Group)
 		_ = apiKeyService.TouchLastUsed(c.Request.Context(), apiKey.ID)
+		defer trackAPIKeyInflight(c, apiKeyService, apiKeyString)()
 		c.Next()
 	}
 }

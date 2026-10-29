@@ -162,6 +162,7 @@ func (s *APIKeyService) invalidateLocalAuthCache(cacheKey string) {
 	if s.authNegativeCacheL1 != nil {
 		s.authNegativeCacheL1.Del(cacheKey)
 	}
+	s.revalidateInflight(cacheKey)
 }
 
 type AuthCacheInvalidationSubscriberHealth struct {
@@ -258,6 +259,7 @@ func (s *APIKeyService) deleteAuthCache(ctx context.Context, cacheKey string) {
 	if s.authNegativeCacheL1 != nil {
 		s.authNegativeCacheL1.Del(cacheKey)
 	}
+	s.revalidateInflight(cacheKey)
 	if s.cache == nil {
 		return
 	}
