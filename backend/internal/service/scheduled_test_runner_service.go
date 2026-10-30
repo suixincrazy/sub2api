@@ -3,7 +3,6 @@ package service
 import (
 	"context"
 	"math/rand/v2"
-	"net/http"
 	"sync"
 	"time"
 
@@ -218,11 +217,7 @@ func nextKeepaliveDelay(plan *ScheduledTestPlan, result *ScheduledTestResult) (t
 	}
 	failures := min(plan.ConsecutiveFailures+1, 30)
 	delay := time.Duration(max(1, plan.ProbeIntervalSeconds)) * time.Second
-	if result.HTTPStatus == http.StatusTooManyRequests {
-		if backoff := time.Duration(min(1<<min(failures, 6), 60)) * time.Second; backoff > delay {
-			delay = backoff
-		}
-	}
+	// Only an explicit upstream retry/reset hint extends the configured interval.
 	if result.RetryAfter > delay {
 		delay = result.RetryAfter
 	}

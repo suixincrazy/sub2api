@@ -443,12 +443,61 @@ func TestScheduledKeepaliveHonorsRateLimitsAndConfiguredIntervals(t *testing.T) 
 	require.Equal(t, 1, failures)
 	p.ConsecutiveFailures = 20
 	delay, _ = nextKeepaliveDelay(p, &ScheduledTestResult{Status: "failed", HTTPStatus: 429})
-	require.Equal(t, 60*time.Second, delay)
+	require.Equal(t, 2*time.Second, delay)
 	delay, failures = nextKeepaliveDelay(p, &ScheduledTestResult{Status: "success"})
 	require.Equal(t, time.Minute, delay)
 	require.Zero(t, failures)
 	delay, _ = nextKeepaliveDelay(p, &ScheduledTestResult{Status: "failed", HTTPStatus: 503})
 	require.Equal(t, 2*time.Second, delay)
+}
+
+func TestScheduledKeepaliveRepeated429UsesConfiguredProbeInterval(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		probe      int
+		retryAfter string
+		wantDelay  time.Duration
+	}{
+		{"two_seconds", 2, "", 2 * time.Second},
+		{"custom_interval", 7, "", 7 * time.Second},
+		{"short_retry_after", 2, "1", 2 * time.Second},
+		{"explicit_retry_after", 2, "120", 120 * time.Second},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			runner, plans, results := newKeepaliveTestRunner(t, 1)
+			plan := plans.plans[1]
+			plan.AccountID = 8
+			plan.ModelID = "claude-opus-5-5"
+			plan.ProbeIntervalSeconds = tc.probe
+			plan.KeepaliveIntervalSeconds = 300
+			plan.KeepaliveMaxIntervalSeconds = 500
+			plan.ConsecutiveFailures = 29
+			account := &Account{ID: 8, Platform: PlatformAnthropic, Type: AccountTypeAPIKey,
+				Status: StatusActive, Concurrency: 1,
+				Credentials: map[string]any{"api_key": "test-key", "base_url": "https://upstream.example"}}
+			for i := 0; i < 3; i++ {
+				response := newJSONResponse(429, `{"error":{"message":"Service Unavailable","type":"error"},"type":"error"}`)
+				if tc.retryAfter != "" {
+					response.Header.Set("Retry-After", tc.retryAfter)
+				}
+				testSvc, upstream := adaptiveCNAccountTestService(account, response)
+				runner.runTest = testSvc.RunKeepaliveBackground
+				plans.due(1)
+				runner.runOnePlan(context.Background(), plans.plans[1])
+				require.Len(t, upstream.requests, 1)
+				require.Equal(t, i+1, results.count())
+				result := results.results[i]
+				require.Equal(t, "failed", result.Status)
+				require.Equal(t, 429, result.HTTPStatus)
+				require.Contains(t, result.ErrorMessage, "Service Unavailable")
+				current, err := plans.GetByID(context.Background(), 1)
+				require.NoError(t, err)
+				require.Equal(t, 30, current.ConsecutiveFailures)
+				require.WithinDuration(t, result.FinishedAt.Add(tc.wantDelay), *current.NextRunAt, 100*time.Millisecond,
+					"repeated 429 responses must not replace the configured probe interval with implicit backoff")
+			}
+		})
+	}
 }
 
 func TestScheduledKeepalivePlanDefaultsValidationAndPause(t *testing.T) {
