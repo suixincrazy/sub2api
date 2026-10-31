@@ -26,6 +26,14 @@ export function getKeyGroupProvider(platform: GroupPlatform): KeyGroupProvider {
   return PROVIDER_BY_PLATFORM[platform] ?? 'other'
 }
 
+// Composite groups route Claude and GPT requests alike, so they must be pickable from those tabs too.
+const COMPOSITE_EXTRA_PROVIDERS: readonly KeyGroupProvider[] = ['anthropic', 'openai']
+
+export function keyGroupMatchesProvider(platform: GroupPlatform, provider: KeyGroupProvider): boolean {
+  if (getKeyGroupProvider(platform) === provider) return true
+  return platform === 'composite' && COMPOSITE_EXTRA_PROVIDERS.includes(provider)
+}
+
 // Collections use representative provider marks rather than an invented brand logo.
 export const KEY_GROUP_PROVIDER_ICONS: Record<KeyGroupProvider, GroupPlatform[]> = {
   anthropic: ['anthropic'],

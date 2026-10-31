@@ -586,9 +586,10 @@ describe('user KeysView column settings', () => {
     it('classifies all configured platforms and retains the complete table filter', async () => {
       const wrapper = await openCreate()
       expect(wrapper.findAll('input[name="key-provider"]')).toHaveLength(4)
-      expect(optionIds(wrapper)).toEqual([1])
+      // The composite group (id 10) routes both Claude and GPT, so it is offered under those tabs as well.
+      expect(optionIds(wrapper)).toEqual([1, 10])
       await chooseProvider(wrapper, 'openai')
-      expect(optionIds(wrapper)).toEqual([2])
+      expect(optionIds(wrapper)).toEqual([2, 10])
       await chooseProvider(wrapper, 'domestic')
       expect(optionIds(wrapper)).toEqual([3, 4, 5, 6])
       await chooseProvider(wrapper, 'other')
@@ -622,6 +623,21 @@ describe('user KeysView column settings', () => {
       expect(optionIds(wrapper)).toEqual([6])
     })
 
+    it('offers a lone composite group from the default Anthropic tab and submits it', async () => {
+      getAvailableGroups.mockResolvedValue([availableGroups[9]])
+      const wrapper = await openCreate()
+      expect(wrapper.get<HTMLInputElement>('input[value="anthropic"]').element.checked).toBe(true)
+      expect(wrapper.get<HTMLInputElement>('input[value="openai"]').element.disabled).toBe(false)
+      expect(wrapper.get<HTMLInputElement>('input[value="domestic"]').element.disabled).toBe(true)
+      expect(optionIds(wrapper)).toEqual([10])
+      await wrapper.get('[data-tour="key-form-name"]').setValue('Mixed key')
+      await groupSelect(wrapper).vm.$emit('update:modelValue', 10)
+      vi.mocked(keysAPI.create).mockResolvedValue({ ...createApiKey(), group_id: 10 })
+      await wrapper.get('#key-form').trigger('submit')
+      await flushPromises()
+      expect(vi.mocked(keysAPI.create).mock.calls[0].slice(0, 2)).toEqual(['Mixed key', 10])
+    })
+
     it('shows the empty state when no groups are available', async () => {
       getAvailableGroups.mockResolvedValue([])
       const wrapper = await openCreate()
@@ -646,7 +662,7 @@ describe('user KeysView column settings', () => {
       await groupSelect(wrapper).vm.$emit('update:modelValue', 5)
       await wrapper.get('[data-test="close-dialog"]').trigger('click')
       await wrapper.get('[data-tour="keys-create-btn"]').trigger('click')
-      expect(optionIds(wrapper)).toEqual([1])
+      expect(optionIds(wrapper)).toEqual([1, 10])
       expect(groupSelect(wrapper).props('modelValue')).toBeNull()
       await wrapper.get('[data-test="close-dialog"]').trigger('click')
       await getButtonByText(wrapper, 'common.edit').trigger('click')
