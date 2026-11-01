@@ -409,6 +409,12 @@ func (s *GatewayService) forwardOnce(ctx context.Context, c *gin.Context, accoun
 		}
 	}
 
+	// 本轮同号 429 重发里已认出签名错误伪装成 429：原样再发必然同样失败，直接降级
+	// thinking 发出。只改本地 body，不写回 parsed，换号后仍按原始请求发。
+	if maskedSignature429Detected(ctx, account) {
+		body = FilterThinkingBlocksForRetry(body, reqModel)
+	}
+
 	// 重试循环
 	var resp *http.Response
 	lastWireBody := body
@@ -647,6 +653,57 @@ func (s *GatewayService) forwardOnce(ctx context.Context, c *gin.Context, accoun
 				}
 
 				resp.Body = io.NopCloser(bytes.NewReader(respBody))
+			}
+		}
+
+		// 中转站把 thinking 签名错误改写成 429 "Service Unavailable"（见
+		// shouldRectifyMaskedSignature429）：在进入同号 429 重发之前先按签名错误
+		// 降级 thinking 块重发一次。降级后仍失败则交还原始 429，走原有重发/换号。
+		// 不受 maxRetryElapsed 约束：长上下文首发本身常超过 10s。
+		if resp.StatusCode == http.StatusTooManyRequests {
+			if filteredBody := FilterThinkingBlocksForRetry(body, reqModel); !bytes.Equal(filteredBody, body) {
+				respBody, readErr := s.readUpstreamErrorBody(resp)
+				if readErr == nil {
+					_ = resp.Body.Close()
+				}
+				if readErr == nil && s.shouldRectifyMaskedSignature429(ctx, account, respBody, reqModel) {
+					markMaskedSignature429(ctx, account)
+					appendOpsUpstreamError(c, OpsUpstreamErrorEvent{
+						ProxyID:            opsUpstreamProxyID(account),
+						ProxyName:          opsUpstreamProxyName(account),
+						Platform:           account.Platform,
+						AccountID:          account.ID,
+						AccountName:        account.Name,
+						UpstreamStatusCode: resp.StatusCode,
+						UpstreamRequestID:  resp.Header.Get("x-request-id"),
+						UpstreamURL:        safeUpstreamURL(upstreamReq.URL.String()),
+						Kind:               "masked_signature_429",
+						Message:            extractUpstreamErrorMessage(respBody),
+					})
+					logger.LegacyPrintf("service.gateway", "[warn] Account %d: 429 Service Unavailable with thinking history, retrying with thinking blocks downgraded", account.ID)
+					retryCtx, releaseRetryCtx := detachStreamUpstreamContext(ctx, reqStream)
+					retryReq, retryWireBody, buildErr := s.buildUpstreamRequest(retryCtx, c, account, filteredBody, token, tokenType, reqModel, reqStream, shouldMimicClaudeCode)
+					releaseRetryCtx()
+					if buildErr == nil {
+						retryResp, retryErr := s.httpUpstream.DoWithTLS(retryReq, proxyURL, account.ID, account.Concurrency, tlsProfile)
+						if retryErr == nil && retryResp.StatusCode < 400 {
+							lastWireBody = retryWireBody
+							if err := replaceBody(retryWireBody); err != nil {
+								_ = retryResp.Body.Close()
+								return nil, err
+							}
+							logger.LegacyPrintf("service.gateway", "Account %d: masked signature 429 retry succeeded (thinking downgraded)", account.ID)
+							resp = retryResp
+							break
+						}
+						if retryResp != nil && retryResp.Body != nil {
+							_ = retryResp.Body.Close()
+						}
+					}
+				}
+				if readErr == nil {
+					resp.Body = io.NopCloser(bytes.NewReader(respBody))
+				}
 			}
 		}
 

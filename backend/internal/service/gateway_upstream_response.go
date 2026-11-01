@@ -142,6 +142,27 @@ func (s *GatewayService) isSignatureErrorPattern(ctx context.Context, account *A
 	return false
 }
 
+// shouldRectifyMaskedSignature429 识别「签名错误被中转站改写成 429」的形态。
+//
+// 实测部分中转站：历史 thinking 块的签名在官方上游验签失败时，
+// 不透传 400 invalid signature，而是回 `429 {"error":{"message":"Service Unavailable"}}`。
+// 同一请求体去掉 thinking 块即 200，不带历史的保活也恒 200，所以它不是限流；
+// 当 429 处理时会被同号重发 7 次（每次 5-30s）再换号，真实任务因此卡住。
+// 这里只做形态判定，是否真是签名问题由 thinking 降级后的重发结果决定。
+func (s *GatewayService) shouldRectifyMaskedSignature429(ctx context.Context, account *Account, respBody []byte, mappedModel string) bool {
+	if account == nil || account.Type != AccountTypeAPIKey || !ShouldRectifyThinkingSignatureError(mappedModel) {
+		return false
+	}
+	if !strings.EqualFold(strings.TrimSpace(extractUpstreamErrorMessage(respBody)), "Service Unavailable") {
+		return false
+	}
+	if s.settingService == nil {
+		return false
+	}
+	settings, err := s.settingService.GetRectifierSettings(ctx)
+	return err == nil && settings.Enabled && settings.ThinkingSignatureEnabled
+}
+
 // matchSignaturePatterns 检查响应体是否匹配自定义关键词列表（不区分大小写）。
 func matchSignaturePatterns(respBody []byte, patterns []string) bool {
 	if len(patterns) == 0 {

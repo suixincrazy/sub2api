@@ -25,6 +25,26 @@ type upstream429RetryState struct {
 	retries   int
 	headers   http.Header
 	apply     func(context.Context)
+	// maskedSignature 记录本轮已认出「签名错误伪装成 429」，后续同号重发直接降级 thinking。
+	maskedSignature bool
+}
+
+func markMaskedSignature429(ctx context.Context, account *Account) {
+	if state := upstream429State(ctx, account); state != nil {
+		state.mu.Lock()
+		state.maskedSignature = true
+		state.mu.Unlock()
+	}
+}
+
+func maskedSignature429Detected(ctx context.Context, account *Account) bool {
+	state := upstream429State(ctx, account)
+	if state == nil {
+		return false
+	}
+	state.mu.Lock()
+	defer state.mu.Unlock()
+	return state.maskedSignature
 }
 
 func upstream429State(ctx context.Context, account *Account) *upstream429RetryState {
@@ -100,7 +120,7 @@ func (state *upstream429RetryState) reset() {
 	state.mu.Lock()
 	defer state.mu.Unlock()
 	state.retries, state.exhausted, state.applying = 0, false, false
-	state.headers, state.apply = nil, nil
+	state.headers, state.apply, state.maskedSignature = nil, nil, false
 }
 
 func (state *upstream429RetryState) retry(ctx context.Context, c *gin.Context, account *Account, err error) (bool, error) {
