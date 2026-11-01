@@ -39,8 +39,25 @@ describe('AccountPriorityCell', () => {
     expect(wrapper.emitted('updated')?.[0]?.[0]).toMatchObject({ id: 7, priority: 4 })
   })
 
-  it('does not go below 1', async () => {
+  it('steps down to 0 like the edit dialog allows', async () => {
     const wrapper = mountCell(account({ priority: 1 }))
+    await wrapper.get('[data-testid="account-priority-decrement"]').trigger('click')
+    await vi.runAllTimersAsync()
+    expect(update).toHaveBeenCalledWith(7, { priority: 0 })
+  })
+
+  it('saves a typed 0', async () => {
+    const wrapper = mountCell(account({ priority: 3 }))
+    await wrapper.get('[data-testid="account-priority-value"]').trigger('click')
+    const input = wrapper.get('[data-testid="account-priority-input"]')
+    await input.setValue('0')
+    await input.trigger('keydown', { key: 'Enter' })
+    await vi.runAllTimersAsync()
+    expect(update).toHaveBeenCalledWith(7, { priority: 0 })
+  })
+
+  it('does not go below 0', async () => {
+    const wrapper = mountCell(account({ priority: 0 }))
     const dec = wrapper.get('[data-testid="account-priority-decrement"]')
     expect(dec.attributes('disabled')).toBeDefined()
     // 到达下限时按钮仍应随悬停显隐，而不是常驻半透明

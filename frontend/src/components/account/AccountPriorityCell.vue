@@ -80,7 +80,7 @@ import { update as updateAccount } from '@/api/admin/accounts'
 import { extractApiErrorMessage } from '@/utils/apiError'
 import type { Account } from '@/types'
 
-const MIN_PRIORITY = 1
+const MIN_PRIORITY = 0
 const MAX_PRIORITY = 9999
 // 连续点击时合并为一次保存，避免每次 +/- 都打一次接口
 const SAVE_DEBOUNCE_MS = 450
