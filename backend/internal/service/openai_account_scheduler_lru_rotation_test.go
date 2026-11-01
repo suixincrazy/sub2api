@@ -97,10 +97,14 @@ func TestOpenAILastUsedRotationBucket(t *testing.T) {
 
 // 同一个 LRU 桶内由每请求随机名次决定，避免并发请求读到同一份快照时全部挤向同一个账号。
 // tieBreak 为 0（未赋值）时退回按 ID，保证管理端分数快照一类非调度路径行为不变。
+//
+// 容差和时间都要钉死：邻居用例经 NewGatewayService 把容差刷成 0 后桶退化为 Unix 秒，
+// time.Now() 落在某秒最后 100ms 时两者跨桶，全包跑约一成概率红、单独跑却绿。
 func TestOpenAICandidateComparatorUsesTieBreakWithinSameBucket(t *testing.T) {
-	now := time.Now()
-	low := lruCandidate(1, lruTimePtr(now))
-	high := lruCandidate(6, lruTimePtr(now.Add(100*time.Millisecond)))
+	withLastUsedGroupTolerance(t, time.Minute)
+	base := time.Date(2026, 9, 2, 20, 0, 0, 0, time.UTC) // 恰在桶边界上，+100ms 不可能跨桶
+	low := lruCandidate(1, lruTimePtr(base))
+	high := lruCandidate(6, lruTimePtr(base.Add(100*time.Millisecond)))
 	require.Equal(t, openAILastUsedRotationBucket(low.account), openAILastUsedRotationBucket(high.account),
 		"前置条件：两者必须落在同一个 LRU 桶")
 
