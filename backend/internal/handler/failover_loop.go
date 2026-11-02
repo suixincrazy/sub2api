@@ -57,6 +57,14 @@ const (
 	// 取值与 maxAccountSwitches / maxProfitVetoAttempts 一致，最坏客户端多等
 	// maxSelectionExhaustedRetries × singleAccountBackoffDelay。
 	maxSelectionExhaustedRetries = 10
+	// stickyAccountRetryMax / stickyAccountRetryBudget 粘性绑定号上瞬时 5xx 的原地退避上限。
+	// 上游提示缓存按账号隔离：换号等于把整段前缀在新号上重写一遍（实测 10~14 万 token、
+	// 约 $1/次，且备用中转号首字更慢），而绑定号的 "No available accounts" 这类 503
+	// 实测多在数秒到数十秒内自愈。所以先在绑定号上退避重试，预算用完才换号。
+	stickyAccountRetryMax      = 6
+	stickyAccountRetryBudget   = 45 * time.Second
+	stickyAccountRetryBaseWait = 1 * time.Second
+	stickyAccountRetryMaxWait  = 8 * time.Second
 )
 
 // profitVetoExhaustedMessage 是利润否决次数耗尽时返回给客户端的文案。
@@ -154,6 +162,59 @@ type FailoverState struct {
 	// 存在这个字段只为了让测试把退避压到纳秒级——否则钉活锁上限的测试要跑
 	// maxSelectionExhaustedRetries × 2s。生产路径不设置它。
 	backoffDelay time.Duration
+
+	// stickyAccountID 本请求粘性会话绑定的账号（0 = 无绑定），见 stickyAccountRetryMax。
+	stickyAccountID    int64
+	stickyRetryCount   int
+	stickyRetryStarted time.Time
+	// stickyRetryBaseWait 仅供测试压缩退避时长；零值使用 stickyAccountRetryBaseWait。
+	stickyRetryBaseWait time.Duration
+}
+
+// SetStickyAccount 登记本请求粘性会话绑定的账号，使其瞬时 5xx 先原地退避重试再换号。
+func (s *FailoverState) SetStickyAccount(accountID int64) {
+	s.stickyAccountID = accountID
+}
+
+// stickyAccountRetryEligible 只放行与账号凭证无关、可能自愈的上游 5xx。
+// 429 不在内：服务层已有同号 429 重发（retryUpstream429），再叠一层只会成倍拖长。
+func stickyAccountRetryEligible(failoverErr *service.UpstreamFailoverError) bool {
+	if failoverErr == nil || failoverErr.IsCredentialFailure() || failoverErr.BoundUpstreamPassthrough {
+		return false
+	}
+	switch failoverErr.StatusCode {
+	case http.StatusInternalServerError, http.StatusBadGateway, http.StatusServiceUnavailable, http.StatusGatewayTimeout:
+		return true
+	}
+	return false
+}
+
+func (s *FailoverState) stickyAccountRetryAllowed(accountID int64, failoverErr *service.UpstreamFailoverError) bool {
+	if s.stickyAccountID == 0 || accountID != s.stickyAccountID || !stickyAccountRetryEligible(failoverErr) {
+		return false
+	}
+	if s.stickyRetryCount >= stickyAccountRetryMax {
+		return false
+	}
+	return s.stickyRetryCount == 0 || time.Since(s.stickyRetryStarted) < stickyAccountRetryBudget
+}
+
+// stickyRetryDelay 返回第 n 次（从 1 起）粘性原地重试前的等待：1s,2s,4s,8s,8s...
+func (s *FailoverState) stickyRetryDelay(n int) time.Duration {
+	base := s.stickyRetryBaseWait
+	if base <= 0 {
+		base = stickyAccountRetryBaseWait
+	}
+	// 上限与基数成比例，测试压缩基数时上限同比缩小。
+	maxWait := base * (stickyAccountRetryMaxWait / stickyAccountRetryBaseWait)
+	delay := base
+	for i := 1; i < n && delay < maxWait; i++ {
+		delay *= 2
+	}
+	if delay > maxWait {
+		delay = maxWait
+	}
+	return delay
 }
 
 // selectionBackoff 返回整档重选前的退避时长。
@@ -234,8 +295,29 @@ func (s *FailoverState) HandleFailoverError(
 	// 同账号重试不算切换账号，粘性会话仅在实际切换时强制缓存计费。
 	retryCount := s.SameAccountRetryCount[accountID]
 	sameAccountRetry := sameAccountRetryAllowed(failoverErr, retryCount, retryLimit)
-	if needForceCacheBilling(s.hasBoundSession, failoverErr, sameAccountRetry) {
+	stickyRetry := !sameAccountRetry && s.stickyAccountRetryAllowed(accountID, failoverErr)
+	if needForceCacheBilling(s.hasBoundSession, failoverErr, sameAccountRetry || stickyRetry) {
 		s.ForceCacheBilling = true
+	}
+
+	// 粘性绑定号的瞬时 5xx：原地退避重试，保住该号上的提示缓存（不进失败列表、不计切换）。
+	if stickyRetry {
+		if s.stickyRetryCount == 0 {
+			s.stickyRetryStarted = time.Now()
+		}
+		s.stickyRetryCount++
+		retryDelay := s.stickyRetryDelay(s.stickyRetryCount)
+		logger.FromContext(ctx).Warn("gateway.failover_sticky_account_retry",
+			zap.Int64("account_id", accountID),
+			zap.Int("upstream_status", failoverErr.StatusCode),
+			zap.Int("sticky_retry_count", s.stickyRetryCount),
+			zap.Int("sticky_retry_max", stickyAccountRetryMax),
+			zap.Duration("retry_delay", retryDelay),
+		)
+		if !sleepWithContext(ctx, retryDelay) {
+			return FailoverCanceled
+		}
+		return FailoverContinue
 	}
 
 	// 同账号重试：对 RetryableOnSameAccount 的临时性错误，先在同一账号上重试。

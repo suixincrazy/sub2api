@@ -663,6 +663,9 @@ func (h *GatewayHandler) Messages(c *gin.Context) {
 
 	for {
 		fs := NewFailoverState(h.maxAccountSwitches, hasBoundSession)
+		if hasBoundSession {
+			fs.SetStickyAccount(sessionBoundAccountID)
+		}
 		retryWithFallback := false
 
 		for {
