@@ -347,7 +347,7 @@ func TestCodexHistoryFilterPortableHistoryAndMetrics(t *testing.T) {
 	}
 	status, err := svc.GetCodexHistoryFilterStatus(context.Background())
 	require.NoError(t, err)
-	require.Equal(t, 4, status.FilterVersion)
+	require.Equal(t, 5, status.FilterVersion)
 	require.EqualValues(t, 6, status.Stats.RemovedItemIDs)
 	require.EqualValues(t, 3, status.Stats.NormalizedAgentTextParts)
 	require.Zero(t, status.Stats.RemovedReasoningItems)

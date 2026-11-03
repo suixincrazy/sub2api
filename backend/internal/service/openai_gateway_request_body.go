@@ -89,7 +89,9 @@ func filterOpenAIResponsesNoneReasoningEffortForAccount(account *Account, body [
 	}
 
 	out := body
-	for _, path := range []string{"reasoning.effort", "reasoning_effort"} {
+	// Some compatible relays reject reasoning.summary="none" (400 invalid_value)
+	// although omitting it means the same thing; the Codex catalog advertises it.
+	for _, path := range []string{"reasoning.effort", "reasoning_effort", "reasoning.summary"} {
 		effort := gjson.GetBytes(out, path)
 		if effort.Type != gjson.String || !strings.EqualFold(strings.TrimSpace(effort.String()), "none") {
 			continue
@@ -123,6 +125,9 @@ func deleteOpenAIResponsesNoneReasoningEffortFromObject(account *Account, body m
 	}
 	if effort, ok := reasoning["effort"].(string); ok && strings.EqualFold(strings.TrimSpace(effort), "none") {
 		delete(reasoning, "effort")
+	}
+	if summary, ok := reasoning["summary"].(string); ok && strings.EqualFold(strings.TrimSpace(summary), "none") {
+		delete(reasoning, "summary")
 	}
 	if len(reasoning) == 0 {
 		delete(body, "reasoning")

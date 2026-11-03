@@ -9,7 +9,7 @@ import (
 	"strings"
 )
 
-const Version = 4
+const Version = 5
 const MaxBodySize int64 = 64 << 20
 
 type enabledKey struct{}
@@ -100,7 +100,10 @@ func Filter(body []byte) (Result, error) {
 			portable := !hasType && isString(item["role"]) && hasContent
 			switch kind {
 			case "message", "function_call", "function_call_output", "custom_tool_call", "custom_tool_call_output",
-				"web_search_call", "agent_message", "tool_search_call", "tool_search_output":
+				"web_search_call", "agent_message", "tool_search_call", "tool_search_output",
+				// Codex Desktop replays its dynamic tool list as an input item with an id.
+				// Hosted/computer call items keep their schema-required ids.
+				"additional_tools":
 				portable = true
 			}
 			changed := false
