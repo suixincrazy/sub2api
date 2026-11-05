@@ -1638,9 +1638,12 @@ const loadApiKeys = async () => {
   }
 }
 
+let groupsRequest = 0
 const loadGroups = async () => {
+  const request = ++groupsRequest
   try {
-    groups.value = await userGroupsAPI.getAvailable()
+    const available = await userGroupsAPI.getAvailable()
+    if (request === groupsRequest) groups.value = available
   } catch (error) {
     console.error('Failed to load groups:', error)
   }
@@ -1653,6 +1656,13 @@ const loadUserGroupRates = async () => {
     console.error('Failed to load user group rates:', error)
   }
 }
+
+watch(showCreateModal, (isOpen) => {
+  if (isOpen) {
+    void loadGroups()
+    void loadUserGroupRates()
+  }
+})
 
 const loadPublicSettings = async () => {
   try {

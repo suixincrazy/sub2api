@@ -638,6 +638,47 @@ describe('user KeysView column settings', () => {
       expect(vi.mocked(keysAPI.create).mock.calls[0].slice(0, 2)).toEqual(['Mixed key', 10])
     })
 
+    it('refreshes newly authorized subscription groups whenever create opens', async () => {
+      getAvailableGroups.mockResolvedValueOnce([availableGroups[0]])
+      const wrapper = await mountView()
+      const subscriptionGroup = { ...availableGroups[9], subscription_type: 'subscription' }
+      getAvailableGroups.mockResolvedValue([availableGroups[0], subscriptionGroup])
+
+      await wrapper.get('[data-tour="keys-create-btn"]').trigger('click')
+      await flushPromises()
+      expect(optionIds(wrapper)).toEqual([1, 10])
+      await chooseProvider(wrapper, 'openai')
+      expect(optionIds(wrapper)).toEqual([10])
+      await wrapper.get('[data-tour="key-form-name"]').setValue('New subscription key')
+      await groupSelect(wrapper).vm.$emit('update:modelValue', 10)
+      vi.mocked(keysAPI.create).mockResolvedValue({ ...createApiKey(), group_id: 10 })
+      await wrapper.get('#key-form').trigger('submit')
+      await flushPromises()
+      expect(vi.mocked(keysAPI.create).mock.calls[0].slice(0, 2)).toEqual(['New subscription key', 10])
+
+      getAvailableGroups.mockResolvedValue([availableGroups[0]])
+      await wrapper.get('[data-tour="keys-create-btn"]').trigger('click')
+      await flushPromises()
+      expect(optionIds(wrapper)).toEqual([1])
+      expect(groupSelect(wrapper).props('modelValue')).toBeNull()
+      wrapper.unmount()
+    })
+
+    it('does not let a delayed page load hide freshly authorized groups', async () => {
+      let resolveInitial!: (value: typeof availableGroups) => void
+      getAvailableGroups.mockReturnValueOnce(new Promise((resolve) => { resolveInitial = resolve }))
+      const wrapper = await mountView()
+      getAvailableGroups.mockResolvedValue([availableGroups[9]])
+      await wrapper.get('[data-tour="keys-create-btn"]').trigger('click')
+      await flushPromises()
+      expect(optionIds(wrapper)).toEqual([10])
+
+      resolveInitial([])
+      await flushPromises()
+      expect(optionIds(wrapper)).toEqual([10])
+      wrapper.unmount()
+    })
+
     it('shows the empty state when no groups are available', async () => {
       getAvailableGroups.mockResolvedValue([])
       const wrapper = await openCreate()
