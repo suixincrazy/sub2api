@@ -6,8 +6,10 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"testing"
 	"time"
 
@@ -37,6 +39,96 @@ func newOpenAITransportErrTestContext() (*gin.Context, *httptest.ResponseRecorde
 	c, _ := gin.CreateTestContext(rec)
 	c.Request = httptest.NewRequest(http.MethodPost, "/v1/responses", nil)
 	return c, rec
+}
+
+func TestHandleOpenAIUpstreamTransportError_DNSDoesNotEvictWithAnyConfig(t *testing.T) {
+	transportErr := &url.Error{
+		Op:  "Post",
+		URL: "https://chatgpt.com/backend-api/codex/responses",
+		Err: &net.OpError{Op: "dial", Net: "tcp", Err: &net.DNSError{
+			Err: "no such host", Name: "chatgpt.com", Server: "127.0.0.11:53", IsNotFound: true,
+		}},
+	}
+	require.True(t, classifyUpstreamTransportError(transportErr).Persistent)
+	for _, testCase := range []struct {
+		name string
+		cfg  *config.Config
+	}{
+		{name: "nil"},
+		{name: "zero", cfg: &config.Config{}},
+		{name: "enabled", cfg: &config.Config{Gateway: config.GatewayConfig{DisableOpenAITransportErrorCooldown: false}}},
+		{name: "disabled", cfg: &config.Config{Gateway: config.GatewayConfig{DisableOpenAITransportErrorCooldown: true}}},
+	} {
+		for _, withRepo := range []bool{false, true} {
+			for _, passthrough := range []bool{false, true} {
+				t.Run(fmt.Sprintf("%s/repo=%t/passthrough=%t", testCase.name, withRepo, passthrough), func(t *testing.T) {
+					repo := &openaiTransportAccountRepoStub{}
+					svc := &OpenAIGatewayService{cfg: testCase.cfg}
+					if withRepo {
+						svc.accountRepo = repo
+					}
+					account := &Account{ID: 8541, Name: "shared-egress", Platform: PlatformOpenAI}
+					c, rec := newOpenAITransportErrTestContext()
+					retErr := svc.handleOpenAIUpstreamTransportError(context.Background(), c, account, transportErr, passthrough)
+
+					var failover *UpstreamFailoverError
+					require.ErrorAs(t, retErr, &failover)
+					require.Equal(t, http.StatusBadGateway, failover.StatusCode)
+					require.JSONEq(t, `{"error":{"type":"upstream_error","message":"Upstream request failed"}}`, string(failover.ResponseBody))
+					require.False(t, rec.Flushed)
+					require.False(t, c.Writer.Written())
+					require.Empty(t, rec.Body.String())
+					rawEvents, exists := c.Get(OpsUpstreamErrorsKey)
+					require.True(t, exists)
+					var events []*OpsUpstreamErrorEvent
+					require.IsType(t, events, rawEvents)
+					events = rawEvents.([]*OpsUpstreamErrorEvent)
+					require.Len(t, events, 1)
+					require.Equal(t, account.ID, events[0].AccountID)
+					require.Equal(t, account.Name, events[0].AccountName)
+					require.Equal(t, PlatformOpenAI, events[0].Platform)
+					require.Equal(t, "request_error", events[0].Kind)
+					require.Zero(t, events[0].UpstreamStatusCode)
+					require.Equal(t, passthrough, events[0].Passthrough)
+					require.Contains(t, events[0].Message, "no such host")
+					require.Equal(t, 0, c.GetInt(OpsUpstreamStatusCodeKey))
+					require.Equal(t, events[0].Message, c.GetString(OpsUpstreamErrorMessageKey))
+
+					require.False(t, svc.isOpenAIAccountRuntimeBlocked(account))
+					_, blocked := svc.openaiAccountRuntimeBlockUntil.Load(account.ID)
+					require.False(t, blocked)
+					require.Empty(t, repo.tempUnschedCalls)
+				})
+			}
+		}
+	}
+}
+
+func TestHandleOpenAIUpstreamTransportError_PreservesExistingState(t *testing.T) {
+	for _, paused := range []bool{false, true} {
+		t.Run(fmt.Sprintf("paused=%t", paused), func(t *testing.T) {
+			repo := &openaiTransportAccountRepoStub{}
+			svc := &OpenAIGatewayService{accountRepo: repo, cfg: &config.Config{}}
+			until := time.Now().Add(time.Minute)
+			account := &Account{ID: 8541, Platform: PlatformOpenAI, Status: StatusActive, Schedulable: !paused,
+				TempUnschedulableUntil: &until, TempUnschedulableReason: "existing cooldown"}
+			svc.BlockAccountScheduling(account, until, "existing cooldown")
+			previousAccount := *account
+			previousBlock, _ := svc.openaiAccountRuntimeBlockUntil.Load(account.ID)
+			previousGeneration, _ := svc.openaiAccountRuntimeBlockGeneration.Load(account.ID)
+			svc.cfg.Gateway.DisableOpenAITransportErrorCooldown = true
+			c, _ := newOpenAITransportErrTestContext()
+			err := svc.handleOpenAIUpstreamTransportError(context.Background(), c, account, errors.New("no such host"), false)
+			require.Error(t, err)
+			require.Empty(t, repo.tempUnschedCalls)
+			require.Equal(t, previousAccount, *account)
+			currentBlock, exists := svc.openaiAccountRuntimeBlockUntil.Load(account.ID)
+			require.True(t, exists)
+			require.Equal(t, previousBlock, currentBlock)
+			currentGeneration, _ := svc.openaiAccountRuntimeBlockGeneration.Load(account.ID)
+			require.Equal(t, previousGeneration, currentGeneration)
+		})
+	}
 }
 
 type failingOpenAIHTTPUpstream struct {

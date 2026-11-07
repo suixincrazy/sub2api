@@ -10,6 +10,7 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"strconv"
 	"strings"
 	"testing"
@@ -25,6 +26,76 @@ import (
 )
 
 const historyFilterSample = `{"model":"mock-model","store":true,"reasoning":{"effort":"xhigh"},"include":["reasoning.encrypted_content"],"input":[{"type":"reasoning","encrypted_content":"HISTORY_CANARY"},{"type":"function_call","id":"old","call_id":"pair","name":"tool","arguments":"{}"},{"type":"function_call_output","id":"old-result","call_id":"pair","output":"ok"}]}`
+
+type historyFilterReadFunc func([]byte) (int, error)
+
+func (read historyFilterReadFunc) Read(p []byte) (int, error) { return read(p) }
+
+func TestCodexHistoryFilterPreservesIngressFailureStatus(t *testing.T) {
+	for _, stage := range []string{"prepare", "apply"} {
+		for _, tc := range []struct {
+			name   string
+			status int
+		}{
+			{name: "capacity", status: http.StatusServiceUnavailable},
+			{name: "read_timeout", status: http.StatusRequestTimeout},
+			{name: "cancelled", status: httputil.StatusClientClosedRequest},
+		} {
+			t.Run(stage+"/"+tc.name, func(t *testing.T) {
+				gin.SetMode(gin.TestMode)
+				svc := service.NewSettingService(&panelRateLimitStubRepo{}, nil)
+				require.NoError(t, svc.SetCodexHistoryFilterEnabled(context.Background(), true))
+				filter := NewCodexHistoryFilter(svc)
+				router := gin.New()
+				budget := int64(4096)
+				if tc.name == "capacity" {
+					budget = 1
+				}
+				router.Use(RequestBodyLimit(4096, httputil.NewBodyMemoryBudget(budget)))
+				if stage == "prepare" {
+					router.Use(filter.Prepare)
+				} else {
+					router.Use(func(c *gin.Context) {
+						c.Request = c.Request.WithContext(codexhistory.WithEnabled(c.Request.Context()))
+					}, filter.Apply)
+				}
+				forwarded := false
+				router.POST("/v1/responses", func(c *gin.Context) {
+					forwarded = true
+					c.Status(http.StatusOK)
+				})
+				ctx, cancel := context.WithCancel(context.Background())
+				defer cancel()
+				req := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(historyFilterSample)).WithContext(ctx)
+				if tc.name != "capacity" {
+					req.Body = io.NopCloser(historyFilterReadFunc(func([]byte) (int, error) {
+						cancel()
+						if tc.name == "read_timeout" {
+							return 0, os.ErrDeadlineExceeded
+						}
+						return 0, context.Canceled
+					}))
+				}
+				recorder := httptest.NewRecorder()
+				router.ServeHTTP(recorder, req)
+				require.Equal(t, tc.status, recorder.Code)
+				require.False(t, forwarded)
+				switch tc.name {
+				case "capacity":
+					require.Equal(t, "1", recorder.Header().Get("Retry-After"))
+					require.Contains(t, recorder.Body.String(), "buffering capacity")
+				case "read_timeout":
+					require.Contains(t, recorder.Body.String(), "Timed out")
+				default:
+					require.Empty(t, recorder.Body.String())
+				}
+				status, err := svc.GetCodexHistoryFilterStatus(context.Background())
+				require.NoError(t, err)
+				require.Zero(t, status.Stats.BlockedRequests, "ingress failure is not a history-policy rejection")
+			})
+		}
+	}
+}
 
 func historyFilterRouter(t *testing.T, enabled bool, handler gin.HandlerFunc) (*gin.Engine, *service.SettingService) {
 	t.Helper()

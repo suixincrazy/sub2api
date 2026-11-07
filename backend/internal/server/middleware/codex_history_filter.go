@@ -78,6 +78,13 @@ func (f *CodexHistoryFilter) prepareEnabledRequest(c *gin.Context, compact bool)
 	}
 	body, err := httputil.ReadRequestBodyWithPrealloc(c.Request)
 	if err != nil {
+		if RejectRequestBodyReadError(c, "middleware.codex_history_filter", err) {
+			return false
+		}
+		if httputil.IsRequestBodyReadTimeout(err) {
+			AbortWithRequestBodyReadFailure(c, "middleware.codex_history_filter", err)
+			return false
+		}
 		var tooLarge *http.MaxBytesError
 		if errors.As(err, &tooLarge) {
 			f.reject(c, &codexhistory.Error{Code: "request_too_large", Message: "Request exceeds filter size limit.", Status: http.StatusRequestEntityTooLarge})
@@ -134,6 +141,13 @@ func (f *CodexHistoryFilter) Apply(c *gin.Context) {
 	}
 	body, err := httputil.ReadRequestBodyWithPrealloc(c.Request)
 	if err != nil {
+		if RejectRequestBodyReadError(c, "middleware.codex_history_filter", err) {
+			return
+		}
+		if httputil.IsRequestBodyReadTimeout(err) {
+			AbortWithRequestBodyReadFailure(c, "middleware.codex_history_filter", err)
+			return
+		}
 		f.reject(c, codexhistory.Invalid("invalid_request_json", "Cannot read Responses request."))
 		return
 	}
