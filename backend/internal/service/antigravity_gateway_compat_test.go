@@ -132,6 +132,61 @@ func antigravityCompatSuccessResponse() *http.Response {
 	}
 }
 
+func TestAntigravityCompatGeminiReasoningEffortSelectsVariant(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	for _, protocol := range []string{"responses", "chat"} {
+		for _, tc := range []struct {
+			name, model, effort, alias, want string
+		}{
+			{"low", "gemini-4-argon", "low", "", "gemini-4-argon-low"},
+			{"medium", "gemini-4-argon", "medium", "", "gemini-4-argon-medium"},
+			{"high", "gemini-4-argon", "high", "", "gemini-4-argon-high"},
+			{"default", "gemini-4-argon", "", "", "gemini-4-argon-high"},
+			{"suffixed", "gemini-4-argon-high", "low", "", "gemini-4-argon-high"},
+			{"explicit alias", "gemini-4-argon", "low", "gemini-4-argon-high", "gemini-4-argon-high"},
+		} {
+			t.Run(protocol+"/"+tc.name, func(t *testing.T) {
+				account := newAntigravityCompatAccount(AccountTypeOAuth)
+				mapping := map[string]any{"gemini-4-argon": "gemini-4-argon"}
+				for _, level := range []string{"low", "medium", "high"} {
+					model := "gemini-4-argon-" + level
+					mapping[model] = model
+				}
+				if tc.alias != "" {
+					mapping["gemini-4-argon"] = tc.alias
+				}
+				account.Credentials["model_mapping"] = mapping
+				upstream := &queuedHTTPUpstreamStub{responses: []*http.Response{antigravityCompatSuccessResponse()}}
+				svc := newAntigravityCompatService(config.GatewayConfig{MaxLineSize: defaultMaxLineSize}, upstream)
+				request := map[string]any{"model": tc.model}
+				if protocol == "responses" {
+					request["input"] = "hello"
+					if tc.effort != "" {
+						request["reasoning"] = map[string]string{"effort": tc.effort}
+					}
+				} else {
+					request["messages"] = []map[string]string{{"role": "user", "content": "hello"}}
+					if tc.effort != "" {
+						request["reasoning_effort"] = tc.effort
+					}
+				}
+				body, err := json.Marshal(request)
+				require.NoError(t, err)
+				c, recorder := newAntigravityCompatContext(http.MethodPost, "/", body)
+				if protocol == "responses" {
+					_, err = svc.ForwardAsResponses(context.Background(), c, account, body, nil)
+				} else {
+					_, err = svc.ForwardAsChatCompletions(context.Background(), c, account, body, nil)
+				}
+				require.NoError(t, err)
+				require.Equal(t, http.StatusOK, recorder.Code)
+				require.Len(t, upstream.requestBodies, 1)
+				require.Equal(t, tc.want, gjson.GetBytes(upstream.requestBodies[0], "model").String())
+			})
+		}
+	}
+}
+
 func TestAntigravitySystemIdentityAcrossProtocols(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	const task = "\nKeep GPT-5.6, gpt-6 and Claude model ids unchanged."

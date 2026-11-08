@@ -256,10 +256,19 @@ func (s *AntigravityGatewayService) prepareAntigravityCompatCall(
 		return nil, s.writeAntigravityCompatError(c, http.StatusBadRequest, "invalid_request_error", "Invalid request body")
 	}
 
+	thinkingLevel := geminiThinkingLevelFromClaudeThinking(claudeRequest.Thinking)
+	// Responses low effort omits Claude thinking; preserve the explicit level
+	// when choosing a Gemini variant instead of falling back to high.
+	if request.reasoningEffort != nil {
+		switch effort := strings.ToLower(strings.TrimSpace(*request.reasoningEffort)); effort {
+		case "low", "medium", "high":
+			thinkingLevel = effort
+		}
+	}
 	mappedModel := s.getMappedModelForThinkingLevel(
 		account,
 		request.originalModel,
-		geminiThinkingLevelFromClaudeThinking(claudeRequest.Thinking),
+		thinkingLevel,
 	)
 	if mappedModel == "" {
 		MarkOpsClientBusinessLimited(c, OpsClientBusinessLimitedReasonLocalFeatureGate)
