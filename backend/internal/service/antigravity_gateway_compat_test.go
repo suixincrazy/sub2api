@@ -1231,7 +1231,7 @@ func TestAntigravityCompatHandlerPreContentDeadlineWithCommentOnlyStream(t *test
 	_ = pipeWriter.Close()
 }
 
-func TestAntigravityCompatExpiredPreContentDeadlineDoesNotCommit(t *testing.T) {
+func TestAntigravityCompatPreContentDeadlineBeforeKeepaliveDoesNotCommit(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	svc := newAntigravityCompatService(config.GatewayConfig{MaxLineSize: defaultMaxLineSize}, nil)
 	c, recorder := newAntigravityCompatContext(http.MethodPost, "/v1/responses", nil)
@@ -1241,12 +1241,41 @@ func TestAntigravityCompatExpiredPreContentDeadlineDoesNotCommit(t *testing.T) {
 	resp := &http.Response{StatusCode: http.StatusOK, Body: reader}
 	result, err := svc.handleAntigravityCompatStreamWithKeepaliveInterval(c, resp,
 		time.Now().Add(-time.Minute), "gemini-3.1-pro",
-		newAntigravityResponsesStreamAdapter("gemini-3.1-pro"), "test", 10*time.Millisecond, 20*time.Millisecond)
+		newAntigravityResponsesStreamAdapter("gemini-3.1-pro"), "test", 2*time.Minute, 20*time.Millisecond)
 	require.Nil(t, result)
 	var failoverErr *UpstreamFailoverError
 	require.ErrorAs(t, err, &failoverErr)
 	require.Empty(t, recorder.Body.String())
 	require.False(t, IsResponseCommitted(c))
+}
+
+func TestAntigravityCompatAcceptsContentAfterSlowResponseHeaders(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	for _, tc := range []struct {
+		name    string
+		adapter antigravityCompatStreamAdapter
+		want    string
+	}{
+		{"responses", newAntigravityResponsesStreamAdapter("gemini-4-argon"), "response.completed"},
+		{"chat", newAntigravityChatStreamAdapter("gemini-4-argon", false), "[DONE]"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			svc := newAntigravityCompatService(config.GatewayConfig{MaxLineSize: defaultMaxLineSize}, nil)
+			c, recorder := newAntigravityCompatContext(http.MethodPost, "/", nil)
+			// Google can return headers and the first content together after queuing.
+			// The response body is already valid when the stream handler starts.
+			result, err := svc.handleAntigravityCompatStreamWithKeepaliveInterval(c,
+				antigravityCompatSuccessResponse(), time.Now().Add(-3*time.Minute), "gemini-4-argon",
+				tc.adapter, "slow-headers-test", 15*time.Second, 2*time.Minute)
+			require.NoError(t, err)
+			require.NotNil(t, result)
+			require.Contains(t, recorder.Body.String(), tc.want)
+			require.Contains(t, recorder.Body.String(), "ok")
+			require.Equal(t, 3, result.usage.OutputTokens)
+			require.NotNil(t, result.firstTokenMs)
+			require.GreaterOrEqual(t, *result.firstTokenMs, 180000)
+		})
+	}
 }
 
 func TestAntigravityCompatHandlerErrorsAfterPreContentPing(t *testing.T) {
