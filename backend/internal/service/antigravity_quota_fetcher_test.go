@@ -4,9 +4,11 @@ package service
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -423,6 +425,113 @@ func TestFetchQuotaUsesConfiguredModelsListBodyLimit(t *testing.T) {
 		},
 	}, "")
 	require.ErrorContains(t, err, "响应超过 8 字节")
+}
+
+func TestFetchQuota_UsesForwardEndpointForModelsAndWindows(t *testing.T) {
+	// Account 17's prod quota was unused while daily reported 32.3412% used with
+	// an earlier weekly reset. Both successful responses are valid for their endpoint.
+	for _, tt := range []struct {
+		name          string
+		plan          string
+		mode          string
+		wantDaily     bool
+		modelsStatus  int
+		summaryStatus int
+	}{
+		{name: "pro", plan: "Pro", wantDaily: true},
+		{name: "ultra", plan: "g1-ultra-tier", wantDaily: true},
+		{name: "free", plan: "Free"},
+		{name: "explicit prod", plan: "Pro", mode: "prod"},
+		{name: "explicit daily", plan: "Free", mode: "daily", wantDaily: true},
+		{name: "model failure does not read unused prod quota", plan: "Pro", wantDaily: true, modelsStatus: http.StatusServiceUnavailable},
+		{name: "summary failure does not mix prod windows", plan: "Pro", wantDaily: true, summaryStatus: http.StatusServiceUnavailable},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Setenv(antigravityForwardBaseURLEnv, tt.mode)
+			var modelCalls, summaryCalls [2]atomic.Int32
+			resets := [2]string{"2026-11-15T13:38:30Z", "2026-11-15T04:53:24Z"}
+			fractions := [2]float64{1, 0.676588}
+			selected := 0
+			if tt.wantDaily {
+				selected = 1
+			}
+			newEndpoint := func(index int) *httptest.Server {
+				return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+					w.Header().Set("Content-Type", "application/json")
+					switch r.URL.Path {
+					case "/v1internal:fetchAvailableModels":
+						modelCalls[index].Add(1)
+						if index == selected && tt.modelsStatus != 0 {
+							w.WriteHeader(tt.modelsStatus)
+							_, _ = w.Write([]byte(`{"error":{"status":"UNAVAILABLE"}}`))
+							return
+						}
+						_ = json.NewEncoder(w).Encode(antigravity.FetchAvailableModelsResponse{
+							Models: map[string]antigravity.ModelInfo{"gemini-4-argon-high": {
+								QuotaInfo: &antigravity.ModelQuotaInfo{RemainingFraction: fractions[index], ResetTime: resets[index]},
+							}},
+						})
+					case "/v1internal:retrieveUserQuotaSummary":
+						summaryCalls[index].Add(1)
+						if index == selected && tt.summaryStatus != 0 {
+							w.WriteHeader(tt.summaryStatus)
+							_, _ = w.Write([]byte(`{"error":{"status":"UNAVAILABLE"}}`))
+							return
+						}
+						_ = json.NewEncoder(w).Encode(antigravity.QuotaSummaryResponse{
+							Groups: []antigravity.QuotaSummaryGroup{{DisplayName: "Gemini 4 Argon", Buckets: []antigravity.QuotaSummaryBucket{
+								{BucketID: "gemini-argon-wtu-weekly", Window: "weekly", RemainingFraction: fractions[index], ResetTime: resets[index]},
+							}}},
+						})
+					case "/v1internal:loadCodeAssist":
+						_, _ = w.Write([]byte(`{"currentTier":{"id":"free-tier"},"paidTier":{"id":"g1-pro-tier"}}`))
+					default:
+						w.WriteHeader(http.StatusNotFound)
+					}
+				}))
+			}
+			prod, daily := newEndpoint(0), newEndpoint(1)
+			defer prod.Close()
+			defer daily.Close()
+			oldURLs, oldAvailability := antigravity.BaseURLs, antigravity.DefaultURLAvailability
+			t.Cleanup(func() {
+				antigravity.BaseURLs = oldURLs
+				antigravity.DefaultURLAvailability = oldAvailability
+			})
+			antigravity.BaseURLs = []string{prod.URL, daily.URL}
+			antigravity.DefaultURLAvailability = antigravity.NewURLAvailability(time.Minute)
+			result, err := NewAntigravityQuotaFetcher(nil, nil).FetchQuota(context.Background(), &Account{
+				ID: 17, Platform: PlatformAntigravity, Type: AccountTypeOAuth,
+				Credentials: map[string]any{"access_token": "test-token", "project_id": "test-project", "plan_type": tt.plan},
+			}, "")
+			if tt.modelsStatus != 0 {
+				require.ErrorContains(t, err, "HTTP 503")
+				require.Nil(t, result)
+				require.Zero(t, modelCalls[1-selected].Load(), "do not replace failed quota with another endpoint's balance")
+				return
+			}
+			require.NoError(t, err)
+			model := result.UsageInfo.AntigravityQuota["gemini-4-argon-high"]
+			require.NotNil(t, model)
+			require.Equal(t, int((1-fractions[selected])*100), model.Utilization)
+			require.Equal(t, resets[selected], model.ResetTime)
+			require.Equal(t, int32(1), modelCalls[selected].Load())
+			require.Zero(t, modelCalls[1-selected].Load())
+			require.Equal(t, int32(1), summaryCalls[selected].Load())
+			require.Zero(t, summaryCalls[1-selected].Load())
+			if tt.summaryStatus != 0 {
+				require.Empty(t, result.UsageInfo.AntigravityQuotaGroups)
+				return
+			}
+			require.Len(t, result.UsageInfo.AntigravityQuotaGroups, 1)
+			group := result.UsageInfo.AntigravityQuotaGroups[0]
+			require.Equal(t, "gemini-argon-wtu", group.Key)
+			require.Len(t, group.Windows, 1)
+			require.Equal(t, "weekly", group.Windows[0].Window)
+			require.InDelta(t, (1-fractions[selected])*100, group.Windows[0].Utilization, 0.0001)
+			require.Equal(t, resets[selected], group.Windows[0].ResetsAt.UTC().Format(time.RFC3339))
+		})
+	}
 }
 
 func TestFetchQuota_ForbiddenReturnsIsForbidden(t *testing.T) {
