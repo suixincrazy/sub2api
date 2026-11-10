@@ -501,6 +501,13 @@ func (h *OpenAIGatewayHandler) Responses(c *gin.Context) {
 			zap.String("normalization", "call_output_to_user_message"),
 		)
 	}
+	if normalizedBody, paired := pairCodexContextCallOutputs(body); paired > 0 {
+		body = normalizedBody
+		reqLog.Info("openai.codex_context_call_output_paired",
+			zap.String("normalization", "context_output_to_tool_call_pair"),
+			zap.Int("paired", paired),
+		)
+	}
 
 	reqStream, ok := parseOpenAICompatibleStream(body)
 	if !ok {
@@ -1777,6 +1784,11 @@ func normalizeCodexCallOutputBootstrap(body []byte, isCandidate func(map[string]
 			continue
 		}
 		typ := stringField(item, "type")
+		// Desktop context snapshots ride along on every turn and are paired
+		// separately by pairCodexContextCallOutputs; they are not tool history.
+		if isCodexContextCallOutput(item) {
+			continue
+		}
 		if isCandidate(item) {
 			callIDValue, exists := item["call_id"]
 			callID, isString := callIDValue.(string)
