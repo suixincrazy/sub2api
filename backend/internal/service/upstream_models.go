@@ -47,16 +47,9 @@ type UpstreamModelMetadata struct {
 }
 
 type UpstreamModelMetadataSnapshot struct {
-	Source            string                           `json:"source"`
-	SyncedAt          string                           `json:"synced_at"`
-	Models            map[string]UpstreamModelMetadata `json:"models"`
-	UnavailableModels []UpstreamUnavailableModel       `json:"unavailable_models,omitempty"`
-}
-
-type UpstreamUnavailableModel struct {
-	ID          string `json:"id"`
-	DisplayName string `json:"display_name,omitempty"`
-	Reason      string `json:"reason,omitempty"`
+	Source   string                           `json:"source"`
+	SyncedAt string                           `json:"synced_at"`
+	Models   map[string]UpstreamModelMetadata `json:"models"`
 }
 
 type UpstreamModelCatalog struct {
@@ -65,7 +58,6 @@ type UpstreamModelCatalog struct {
 	Warnings             []UpstreamModelSyncWarning       `json:"warnings,omitempty"`
 	DiscoverySource      string                           `json:"discovery_source,omitempty"`
 	GrokModelDiagnostics *GrokModelDiagnostics            `json:"grok_model_diagnostics,omitempty"`
-	UnavailableModels    []UpstreamUnavailableModel       `json:"unavailable_models,omitempty"`
 }
 
 // upstreamModelListFetchResult is the live model list plus an optional Grok
@@ -136,7 +128,7 @@ func (a *Account) GetUpstreamModelMetadataSnapshot() *UpstreamModelMetadataSnaps
 		return nil
 	}
 	var snapshot UpstreamModelMetadataSnapshot
-	if err := json.Unmarshal(body, &snapshot); err != nil || (len(snapshot.Models) == 0 && len(snapshot.UnavailableModels) == 0) {
+	if err := json.Unmarshal(body, &snapshot); err != nil || len(snapshot.Models) == 0 {
 		return nil
 	}
 	return &snapshot
@@ -286,43 +278,11 @@ func (s *AccountTestService) SyncUpstreamModelCatalog(ctx context.Context, accou
 			catalog.Metadata = directMetadata
 		}
 	}
-	if liveListAvailable && account != nil && account.Platform == PlatformAntigravity && account.Type != AccountTypeAPIKey {
-		var upstream antigravity.FetchAvailableModelsResponse
-		if err := json.Unmarshal(body, &upstream); err != nil {
-			return nil, newUpstreamModelSyncUpstreamError("Failed to read Antigravity model availability", err)
-		}
-		for id, model := range upstream.Models {
-			if !model.Disabled {
-				continue
-			}
-			reason := strings.TrimSpace(model.TagDescription)
-			if reason == "" {
-				reason = strings.TrimSpace(model.TagTitle)
-			}
-			catalog.UnavailableModels = append(catalog.UnavailableModels, UpstreamUnavailableModel{
-				ID: strings.TrimSpace(id), DisplayName: strings.TrimSpace(model.DisplayName), Reason: reason,
-			})
-		}
-		sort.Slice(catalog.UnavailableModels, func(i, j int) bool { return catalog.UnavailableModels[i].ID < catalog.UnavailableModels[j].ID })
-	}
 
 	// Capability enrichment also covers concrete model_mapping targets. Admins may
 	// whitelist models that the live /models list omitted; those still need registry
 	// metadata so Codex catalogs can advertise reasoning and modalities.
 	enrichIDs := dedupeAndSortModelIDs(append(append([]string{}, models...), configuredUpstreamModelsForCapabilitySync(account)...))
-	// Explicitly disabled targets must not return through saved aliases or registry enrichment.
-	unavailable := make(map[string]bool, len(catalog.UnavailableModels))
-	for _, model := range catalog.UnavailableModels {
-		unavailable[model.ID] = true
-		delete(catalog.Metadata, model.ID)
-	}
-	availableIDs := enrichIDs[:0]
-	for _, id := range enrichIDs {
-		if !unavailable[id] {
-			availableIDs = append(availableIDs, id)
-		}
-	}
-	enrichIDs = availableIDs
 	// Dedicated image/video generators are not Codex agent catalog entries and often
 	// omit context windows in public registries. Keep them out of completeness checks
 	// so they do not mask successful agent-model capability sync.
@@ -350,14 +310,9 @@ func (s *AccountTestService) SyncUpstreamModelCatalog(ctx context.Context, accou
 
 	completeMetadata := completeUpstreamModelMetadataSubset(capabilityIDs, catalog.Metadata)
 	persistedCapabilities := false
-	previous := account.GetUpstreamModelMetadataSnapshot()
-	availabilityChanged := len(catalog.UnavailableModels) > 0 || (liveListAvailable && previous != nil && len(previous.UnavailableModels) > 0)
-	if (len(completeMetadata) > 0 || availabilityChanged) && account != nil && account.ID > 0 && s.accountRepo != nil {
-		if completeMetadata == nil {
-			completeMetadata = make(map[string]UpstreamModelMetadata)
-		}
+	if len(completeMetadata) > 0 && account != nil && account.ID > 0 && s.accountRepo != nil {
 		// Retain known metadata only for models still listed or explicitly mapped.
-		if previous != nil {
+		if previous := account.GetUpstreamModelMetadataSnapshot(); previous != nil {
 			retainedModels := capabilityIDs
 			if !liveListAvailable {
 				retainedModels = append([]string(nil), capabilityIDs...)
@@ -382,16 +337,15 @@ func (s *AccountTestService) SyncUpstreamModelCatalog(ctx context.Context, accou
 			}
 		}
 		snapshot := UpstreamModelMetadataSnapshot{
-			Source:            source,
-			SyncedAt:          time.Now().UTC().Format(time.RFC3339),
-			Models:            completeMetadata,
-			UnavailableModels: catalog.UnavailableModels,
+			Source:   source,
+			SyncedAt: time.Now().UTC().Format(time.RFC3339),
+			Models:   completeMetadata,
 		}
 		if err := s.accountRepo.UpdateExtra(ctx, account.ID, map[string]any{UpstreamModelMetadataExtraKey: snapshot}); err != nil {
 			return nil, newUpstreamModelSyncInternalError("Failed to save upstream model metadata", err)
 		}
 		account.SetUpstreamModelMetadataSnapshot(snapshot)
-		persistedCapabilities = len(completeMetadata) > 0
+		persistedCapabilities = true
 	}
 
 	if upstreamCatalogNeedsRegistry(capabilityIDs, catalog.Metadata) {
@@ -1432,10 +1386,7 @@ func (s *AccountTestService) fetchAntigravityOAuthUpstreamModels(ctx context.Con
 	}
 
 	models := make([]string, 0, len(modelsResp.Models))
-	for modelID, model := range modelsResp.Models {
-		if model.Disabled {
-			continue
-		}
+	for modelID := range modelsResp.Models {
 		models = append(models, strings.TrimSpace(modelID))
 	}
 	body, err := json.Marshal(raw)

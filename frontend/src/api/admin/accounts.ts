@@ -7,7 +7,6 @@ import { apiClient } from '../client'
 import type { OpenAIReferralRefreshResult, OpenAIReferralSendResult } from '@/types/openaiReferrals'
 import type {
   Account,
-  UpstreamUnavailableModel,
   AccountCredentialsReveal,
   AccountListItem,
   CreateAccountRequest,
@@ -626,7 +625,6 @@ export async function getAvailableModels(id: number): Promise<ClaudeModel[]> {
 
 export interface SyncUpstreamModelsResult {
   models: string[]
-  unavailable_models?: UpstreamUnavailableModel[]
   metadata?: Record<string, UpstreamModelMetadata>
   warnings?: UpstreamModelSyncWarning[]
   discovery_source?: 'upstream' | 'configured_fallback'
