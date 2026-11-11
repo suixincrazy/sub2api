@@ -176,7 +176,12 @@ func (s *GatewayService) forwardAsChatCompletionsOnce(
 		upstreamMsg := strings.TrimSpace(extractUpstreamErrorMessage(respBody))
 		upstreamMsg = sanitizeUpstreamErrorMessage(upstreamMsg)
 
-		if s.shouldFailoverUpstreamError(resp.StatusCode) {
+		// Apply account policies even for statuses outside the default failover list.
+		shouldDisable := false
+		if s.rateLimitService != nil {
+			shouldDisable = s.rateLimitService.HandleUpstreamError(ctx, account, resp.StatusCode, resp.Header, respBody, mappedModel)
+		}
+		if shouldDisable || s.shouldFailoverUpstreamError(resp.StatusCode) {
 			appendOpsUpstreamError(c, OpsUpstreamErrorEvent{
 				ProxyID:            opsUpstreamProxyID(account),
 				ProxyName:          opsUpstreamProxyName(account),
@@ -188,10 +193,6 @@ func (s *GatewayService) forwardAsChatCompletionsOnce(
 				Kind:               "failover",
 				Message:            upstreamMsg,
 			})
-			shouldDisable := false
-			if s.rateLimitService != nil {
-				shouldDisable = s.rateLimitService.HandleUpstreamError(ctx, account, resp.StatusCode, resp.Header, respBody, mappedModel)
-			}
 			return nil, &UpstreamFailoverError{
 				StatusCode:             resp.StatusCode,
 				ResponseBody:           respBody,

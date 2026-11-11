@@ -133,6 +133,26 @@ func TestPairCodexContextCallOutputsKeepsPreviousResponseID(t *testing.T) {
 	require.Equal(t, "resp_1", gjson.GetBytes(got, "previous_response_id").String())
 }
 
+func TestPairCodexContextCallOutputsMultipartPreservesToolRole(t *testing.T) {
+	first := `{"type":"function_call_output","name":"codex_apps_selected_page_part_1_of_2","namespace":"agent","output":"Companion Page snapshot part 1 of 2:\n{\"page_id\":\"page1\",\"document_view\":\"hello"}`
+	second := `{"type":"function_call_output","name":"codex_apps_selected_page_part_2_of_2","namespace":"agent","output":"Companion Page snapshot part 2 of 2:\n world\"}"}`
+	body := []byte(`{"model":"gpt-6-astra","metadata":{"large":9007199254740993},"input":[` + first + `,` + second + `]}`)
+	got, paired := pairCodexContextCallOutputs(body)
+	require.Equal(t, 2, paired)
+	require.Equal(t, "9007199254740993", gjson.GetBytes(got, "metadata.large").Raw)
+	items := gjson.GetBytes(got, "input").Array()
+	require.Len(t, items, 4)
+	for i, original := range []string{first, second} {
+		output := items[i*2+1]
+		require.Equal(t, "function_call_output", output.Get("type").String())
+		require.False(t, output.Get("role").Exists())
+		require.Equal(t, gjson.Get(original, "output").String(), output.Get("output").String())
+	}
+	again, paired := pairCodexContextCallOutputs(got)
+	require.Zero(t, paired)
+	require.Equal(t, got, again)
+}
+
 func TestCodexBootstrapNormalizersCoexistWithContextOutputs(t *testing.T) {
 	automation := `{"type":"function_call_output","namespace":"codex_app","name":"automation_update","output":` +
 		mustJSON(t, `<heartbeat><automation_id>wiki</automation_id></heartbeat>`) + `}`

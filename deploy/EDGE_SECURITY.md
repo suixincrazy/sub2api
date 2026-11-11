@@ -15,8 +15,12 @@ response. Healthy generations can remain open while an upstream is thinking.
   image, video, and batch-image endpoints.
 - `gateway.text_max_body_size: 33554432` limits the known pure-text
   `/embeddings` and `/alpha/search` endpoints to 32 MiB.
-- `gateway.request_body_memory_budget_bytes: 1073741824` shares a 1 GiB
-  buffering budget across gateway routes and aliases. Chunk allocations, the
+- `gateway.request_body_memory_budget_bytes` shares one buffering budget
+  across gateway routes and aliases. When it is set in neither the config file
+  nor `GATEWAY_REQUEST_BODY_MEMORY_BUDGET_BYTES`, startup sizes it to a quarter
+  of the process memory limit (the smallest of physical memory, the cgroup
+  limit and `GOMEMLIMIT`), never below 1 GiB, and logs the chosen value. Any
+  explicit value is used as-is (`0` disables the budget). Chunk allocations, the
   contiguous body copy, decompressed output, JSON normalization, and a Zstd
   decoder reservation are charged before allocation. Each phase releases the
   intermediate allocations it no longer references: chunks after assembly,
@@ -106,12 +110,21 @@ to reclaim that unreachable memory immediately.
 
 For example, 200 long-lived streams retaining 4 MiB each account for about
 800 MiB before new uploads and decoding. Another 32 concurrent Zstd decoders
-with 8 MiB windows reserve 512 MiB including decoder workspace, exceeding the default 1 GiB budget
-before their input/output buffers are counted. Increase the budget for such a
-workload only with sufficient instance memory, or reduce concurrency/request
-sizes. Leave separate memory headroom for SSE frames (which may be larger than
+with 8 MiB windows reserve 512 MiB including decoder workspace, exceeding a 1 GiB budget (the
+auto-sized value on instances with 4 GiB or less) before their input/output
+buffers are counted. Increase the budget for such a workload only with
+sufficient instance memory, or reduce concurrency/request sizes. Deployments
+that copied the old example config pin `request_body_memory_budget_bytes:
+1073741824`; remove that line to use auto-sizing. Leave separate memory headroom for SSE frames (which may be larger than
 the queue budget), conversion state, caches, connections and GC. Setting the
 budget to `0` disables ingress memory admission rather than limiting RSS.
+
+Native WebSocket connections retain at most 32 MiB of complete response output
+for search activation and account failover, including per-item overhead. Once
+this allowance is exhausted, ordinary turns keep their existing tool replay;
+search activation or account failover that needs missing history requires the
+client to reconnect with complete input. Incomplete history is never truncated
+and then treated as a complete request.
 
 Legacy Read tool-call completion still validates the growing JSON argument
 prefix. Incremental storage removes repeated prefix allocations, but validation

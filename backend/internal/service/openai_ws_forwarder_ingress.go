@@ -970,7 +970,10 @@ func (s *OpenAIGatewayService) ProxyResponsesWebSocketFromClient(
 	}
 
 	var rejectedFieldRetryState *openAIResponsesRejectedFieldRetryState
+	var replayOutputBudget openAIWSReplayOutputBudget
+	lastOutputComplete := false
 	sendAndRelay := func(turn int, lease *openAIWSConnLease, payload []byte, payloadBytes int, originalModel string, imageBillingModel string, imageSizeTier string, imageInputSize string, requestedReasoningEffort *string) (*OpenAIForwardResult, error) {
+		lastOutputComplete = false
 		responseModelObserver := &upstreamResponseModelObserver{}
 		if lease == nil {
 			return nil, errors.New("upstream websocket lease is nil")
@@ -1273,7 +1276,15 @@ func (s *OpenAIGatewayService) ProxyResponsesWebSocketFromClient(
 					Duration:                      time.Since(turnStart),
 					FirstTokenMs:                  firstTokenMs,
 				}
-				if replayInput := replayCollector.Items(); len(replayInput) > 0 {
+				replayInput := replayCollector.Items()
+				// Full output is required both for search activation and current-turn
+				// account failover; tool coverage alone cannot prove complete history.
+				lastOutputComplete = gjson.GetBytes(upstreamMessage, "response.output").IsArray() &&
+					replayOutputBudget.admit(replayCollector.allItems)
+				if lastOutputComplete {
+					result.wsAccountFailoverReplayInput = replayCollector.AllItems()
+				}
+				if len(replayInput) > 0 {
 					result.wsReplayInput = replayInput
 					result.wsReplayInputExists = true
 				}
@@ -1293,6 +1304,7 @@ func (s *OpenAIGatewayService) ProxyResponsesWebSocketFromClient(
 	currentContextWindowID := firstPayload.contextWindowID
 	// Admission hooks must see client model candidates before upstream mapping.
 	currentClientPayload := firstPayload.rawForHash
+	currentAccountIdentitySourceRaw := firstPayload.accountIdentitySourceRaw
 	currentOriginalModel := firstPayload.originalModel
 	currentImageBillingModel := firstPayload.imageBillingModel
 	currentImageSizeTier := firstPayload.imageSizeTier
@@ -1356,6 +1368,15 @@ func (s *OpenAIGatewayService) ProxyResponsesWebSocketFromClient(
 	defer releaseSessionLease()
 
 	turn := 1
+	defer func() {
+		var failoverErr *UpstreamFailoverError
+		var currentTurnErr *openAIWSCurrentTurnFailoverError
+		if turn > 1 && errors.As(returnErr, &failoverErr) && !errors.As(returnErr, &currentTurnErr) {
+			// Preserve proven current-turn payloads. Other later-turn failures
+			// must close instead of replaying the original connection message.
+			returnErr = newOpenAIWSCurrentTurnFailoverError(returnErr, nil)
+		}
+	}()
 	rejectedFieldRetryState = newOpenAIResponsesRejectedFieldRetryState(currentPayload)
 	turnRetry := 0
 	turnPrevRecoveryTried := false
@@ -1366,6 +1387,13 @@ func (s *OpenAIGatewayService) ProxyResponsesWebSocketFromClient(
 	var lastTurnStrictState *openAIWSIngressPreviousTurnStrictState
 	lastTurnReplayInput := []json.RawMessage(nil)
 	lastTurnReplayInputExists := false
+	var lastFullReplayInput []json.RawMessage
+	lastFullReplayInputExists := false
+	lastTurnReplayInputComplete := false
+	var currentFullReplayInput []json.RawMessage
+	currentFullReplayInputExists := false
+	currentTurnReplayInputComplete := false
+	preparedReplayTurn := 0
 	currentTurnReplayInput := []json.RawMessage(nil)
 	currentTurnReplayInputExists := false
 	skipBeforeTurn := false
@@ -1505,6 +1533,8 @@ func (s *OpenAIGatewayService) ProxyResponsesWebSocketFromClient(
 			if lastTurnReplayInputExists {
 				lastTurnReplayInput, _ = stripOpenAIInvalidEncryptedContentFromReplayItems(lastTurnReplayInput, invalidDigests)
 			}
+			lastFullReplayInput, _ = stripOpenAIInvalidEncryptedContentFromReplayItems(lastFullReplayInput, invalidDigests)
+			currentFullReplayInput, _ = stripOpenAIInvalidEncryptedContentFromReplayItems(currentFullReplayInput, invalidDigests)
 		}
 		boundaryPayload, contextWindowBoundary, boundaryErr := normalizeOpenAIWSContextWindowBoundary(
 			currentPayload,
@@ -1582,6 +1612,22 @@ func (s *OpenAIGatewayService) ProxyResponsesWebSocketFromClient(
 			currentPayload,
 			currentPreviousResponseID != "",
 		)
+		if preparedReplayTurn != turn {
+			// Only client turns establish completeness. Internal retries may remove
+			// previous_response_id without making an incomplete history portable.
+			currentItems, currentItemsExist, fullReplayErr := openAIWSExtractNormalizedInputSequence(currentPayload)
+			// A full client transcript may omit server IDs/status fields. Do not
+			// append it to a nonidentical transcript and duplicate earlier turns.
+			ambiguousFullInput := currentPreviousResponseID != "" && len(currentItems) > 1 && len(lastFullReplayInput) > 0 &&
+				openAIWSRawItemsHasPrefix(currentItems, lastFullReplayInput[:1]) &&
+				!openAIWSRawItemsHasPrefix(currentItems, lastFullReplayInput)
+			currentFullReplayInput, currentFullReplayInputExists = buildOpenAIWSReplayInputSequenceFromItems(
+				lastFullReplayInput, lastFullReplayInputExists, currentItems, currentItemsExist, currentPreviousResponseID != "",
+			)
+			currentTurnReplayInputComplete = fullReplayErr == nil && !ambiguousFullInput && (currentPreviousResponseID == "" ||
+				(lastTurnReplayInputComplete && currentPreviousResponseID == lastTurnResponseID))
+			preparedReplayTurn = turn
+		}
 		if replayInputErr != nil {
 			logOpenAIWSModeInfo(
 				"ingress_ws_replay_input_skip account_id=%d turn=%d conn_id=%s reason=build_error cause=%s",
@@ -1697,6 +1743,31 @@ func (s *OpenAIGatewayService) ProxyResponsesWebSocketFromClient(
 			} else {
 				unpinSessionConn(sessionConnID)
 			}
+		}
+		if account.IsOpenAIOAuthLike() && sessionLease.initializedWithoutWebSearch() && openAIWSWebSearchDeclared(currentPayload) {
+			if !currentTurnReplayInputComplete {
+				return NewOpenAIWSClientCloseError(coderws.StatusPolicyViolation, "web search activation requires complete input history; please reconnect with full input", nil)
+			}
+			fullPayload, safe, err := buildOpenAIWSCurrentTurnRetryPayload(currentPayload, currentFullReplayInput, currentFullReplayInputExists, "")
+			if err != nil {
+				return fmt.Errorf("rebuild websocket input for web search activation: %w", err)
+			}
+			if !safe {
+				return NewOpenAIWSClientCloseError(coderws.StatusPolicyViolation, "web search activation requires complete input history; please reconnect with full input", nil)
+			}
+			logOpenAIWSModeInfo("ingress_ws_web_search_activation account_id=%d turn=%d action=reconnect", account.ID, turn)
+			resetSessionLease(true)
+			acquiredLease, acquireErr := acquireTurnLease(turn, "", false, true)
+			if acquireErr != nil {
+				return fmt.Errorf("acquire upstream websocket for web search activation: %w", acquireErr)
+			}
+			sessionLease = acquiredLease
+			sessionConnID = strings.TrimSpace(sessionLease.ConnID())
+			pinSessionConn(sessionConnID)
+			currentPayload = fullPayload
+			currentPayloadBytes = len(fullPayload)
+			currentPreviousResponseID = ""
+			forcePreferredConn = false
 		}
 		shouldPreflightPing := turn > 1 && sessionLease != nil && sessionLease.SupportsIdlePingWithoutReader() && turnRetry == 0
 		if shouldPreflightPing && openAIWSIngressPreflightPingIdle > 0 && !lastTurnFinishedAt.IsZero() {
@@ -1868,7 +1939,7 @@ func (s *OpenAIGatewayService) ProxyResponsesWebSocketFromClient(
 			if turn > 1 {
 				var failure *UpstreamFailoverError
 				if errors.As(finalErr, &failure) && failure.StatusCode == http.StatusTooManyRequests {
-					payload, safe, buildErr := buildOpenAIWSCurrentTurnRetryPayload(currentPayload, currentTurnReplayInput, currentTurnReplayInputExists, currentOriginalModel)
+					payload, safe, buildErr := buildOpenAIWSCurrentTurnRetryPayload(currentAccountIdentitySourceRaw, currentFullReplayInput, currentFullReplayInputExists && currentTurnReplayInputComplete, currentOriginalModel)
 					if buildErr != nil || !safe {
 						payload = nil
 					}
@@ -1897,6 +1968,13 @@ func (s *OpenAIGatewayService) ProxyResponsesWebSocketFromClient(
 		// collector 增量经 combine 合并（新头数组）。
 		lastTurnReplayInput = currentTurnReplayInput
 		lastTurnReplayInputExists = currentTurnReplayInputExists
+		lastTurnReplayInputComplete = currentTurnReplayInputComplete && lastOutputComplete
+		lastFullReplayInput = nil
+		lastFullReplayInputExists = false
+		if lastTurnReplayInputComplete {
+			lastFullReplayInput = combineOpenAIWSReplayItems(currentFullReplayInput, result.wsAccountFailoverReplayInput)
+			lastFullReplayInputExists = currentFullReplayInputExists || len(result.wsAccountFailoverReplayInput) > 0
+		}
 		if result.wsReplayInputExists {
 			lastTurnReplayInput = combineOpenAIWSReplayItems(lastTurnReplayInput, result.wsReplayInput)
 			lastTurnReplayInputExists = true
@@ -2014,6 +2092,7 @@ func (s *OpenAIGatewayService) ProxyResponsesWebSocketFromClient(
 		currentPayload = nextPayload.payloadRaw
 		currentContextWindowID = nextPayload.contextWindowID
 		currentClientPayload = nextPayload.rawForHash
+		currentAccountIdentitySourceRaw = nextPayload.accountIdentitySourceRaw
 		currentOriginalModel = nextPayload.originalModel
 		currentImageBillingModel = nextPayload.imageBillingModel
 		currentImageSizeTier = nextPayload.imageSizeTier
