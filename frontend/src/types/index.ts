@@ -1296,6 +1296,12 @@ export interface GrokModelDiagnostics {
   mappings: GrokModelDiagnosticItem[]
 }
 
+export interface UpstreamUnavailableModel {
+  id: string
+  display_name?: string
+  reason?: string
+}
+
 export interface Account {
   id: number
   name: string
@@ -1313,6 +1319,12 @@ export interface Account {
   opencode_go_usage?: OpenCodeGoUsageState
   // Extra fields including Codex usage, OpenAI compact capability, and model-level rate limits.
   extra?: (CodexUsageSnapshot & OpenAICompactState & {
+    upstream_model_metadata?: {
+      source: string
+      synced_at?: string
+      models: Record<string, unknown>
+      unavailable_models?: UpstreamUnavailableModel[]
+    }
     model_rate_limits?: Record<string, { rate_limited_at: string; rate_limit_reset_at: string }>
     antigravity_credits_overages?: Record<string, { activated_at: string; active_until: string }>
     upstream_billing_probe_enabled?: boolean

@@ -851,6 +851,9 @@ export default {
       syncUpstreamModelsSuccess: 'Synced {count} new model(s) from upstream ({total} upstream total)',
       syncUpstreamModelsNoChanges: 'All {count} upstream model(s) are already in the whitelist',
       syncUpstreamModelsEmpty: 'Upstream returned no models to sync',
+      syncUpstreamUnavailableModels: 'Unavailable upstream models',
+      syncUpstreamUnavailableModelsHint: 'These models are excluded from sync. Mappings targeting them are removed from this form and take effect when saved.',
+      syncUpstreamUnavailableReason: 'The upstream disabled this model without providing a reason',
       syncUpstreamModelsFailed: 'Failed to sync upstream models',
       syncUpstreamModelsError: 'Failed to sync upstream models: {message}',
       syncUpstreamModelsMetadataIncomplete:

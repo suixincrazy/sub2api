@@ -1,15 +1,16 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { defineComponent } from 'vue'
-import { mount } from '@vue/test-utils'
+import { flushPromises, mount } from '@vue/test-utils'
 import {
   BUILTIN_PLATFORM_CATALOG,
   resetPlatformCatalog,
   setPlatformCatalog
 } from '@/constants/platformCatalog'
 
-const { updateAccountMock, checkMixedChannelRiskMock, authIsSimpleMode } = vi.hoisted(() => ({
+const { updateAccountMock, checkMixedChannelRiskMock, syncUpstreamModelsMock, authIsSimpleMode } = vi.hoisted(() => ({
   updateAccountMock: vi.fn(),
   checkMixedChannelRiskMock: vi.fn(),
+  syncUpstreamModelsMock: vi.fn(),
   authIsSimpleMode: { value: true }
 }))
 
@@ -17,7 +18,8 @@ vi.mock('@/stores/app', () => ({
   useAppStore: () => ({
     showError: vi.fn(),
     showSuccess: vi.fn(),
-    showInfo: vi.fn()
+    showInfo: vi.fn(),
+    showWarning: vi.fn()
   })
 }))
 
@@ -33,6 +35,7 @@ vi.mock('@/api/admin', () => ({
   adminAPI: {
     accounts: {
       update: updateAccountMock,
+      syncUpstreamModels: syncUpstreamModelsMock,
       checkMixedChannelRisk: checkMixedChannelRiskMock
     },
     settings: {
@@ -2078,6 +2081,93 @@ describe('EditAccountModal gemini explicit cache upstream switch', () => {
     const credentials = updateAccountMock.mock.calls[0]?.[1]?.credentials
     expect(credentials).not.toHaveProperty('explicit_cache_upstream')
     expect(credentials).not.toHaveProperty('explicit_cache_upstream_max_ttl_seconds')
+  })
+})
+
+describe('EditAccountModal unavailable Antigravity models', () => {
+  const unavailable = [{
+    id: 'gemini-4-carbon-disabled',
+    display_name: 'Gemini 4 Carbon',
+    reason: 'Carbon requires the Ultra plan.'
+  }]
+
+  const syncButton = (wrapper: ReturnType<typeof mountModal>) =>
+    wrapper.findAll('button').find(button => button.text() === 'admin.accounts.syncUpstreamModels')!
+
+  beforeEach(() => {
+    updateAccountMock.mockReset().mockResolvedValue(buildAntigravityAccount())
+    checkMixedChannelRiskMock.mockReset().mockResolvedValue({ has_risk: false })
+    syncUpstreamModelsMock.mockReset()
+  })
+
+  it('removes disabled targets, keeps custom aliases and saves the displayed reason', async () => {
+    const account = buildAntigravityAccount()
+    account.credentials.model_mapping = {
+      'gemini-4-carbon-disabled': 'gemini-4-carbon-disabled',
+      'carbon-alias': 'gemini-4-carbon-disabled',
+      'gemini-2.5-flash': 'gemini-2.5-flash',
+      'argon-alias': 'gemini-4-argon-low',
+      'custom-model': 'custom-target'
+    }
+    syncUpstreamModelsMock.mockResolvedValue({ models: ['gemini-4-argon-low'], unavailable_models: unavailable })
+    const wrapper = mountModal(account)
+    await syncButton(wrapper).trigger('click')
+    await flushPromises()
+
+    expect(wrapper.text()).toContain('Gemini 4 Carbon')
+    expect(wrapper.text()).toContain('Carbon requires the Ultra plan.')
+    await wrapper.get('form#edit-account-form').trigger('submit.prevent')
+    await flushPromises()
+    expect(updateAccountMock.mock.calls[0]?.[1]?.credentials?.model_mapping).toEqual({
+      'gemini-2.5-flash': 'gemini-2.5-flash',
+      'argon-alias': 'gemini-4-argon-low',
+      'custom-model': 'custom-target',
+      'gemini-4-argon-low': 'gemini-4-argon-low'
+    })
+    wrapper.unmount()
+  })
+
+  it('shows restrictions even when every discovered model is disabled, then restores enabled models', async () => {
+    const account = buildAntigravityAccount()
+    account.credentials.model_mapping = { 'gemini-4-carbon-disabled': 'gemini-4-carbon-disabled' }
+    syncUpstreamModelsMock.mockResolvedValueOnce({ models: [], unavailable_models: unavailable })
+    const wrapper = mountModal(account)
+    await syncButton(wrapper).trigger('click')
+    await flushPromises()
+    expect(wrapper.text()).toContain('Carbon requires the Ultra plan.')
+    expect(wrapper.findAll<HTMLInputElement>('input').some(input => input.element.value === 'gemini-4-carbon-disabled')).toBe(false)
+
+    syncUpstreamModelsMock.mockResolvedValueOnce({ models: ['gemini-4-carbon-disabled'] })
+    await syncButton(wrapper).trigger('click')
+    await flushPromises()
+    expect(wrapper.text()).not.toContain('Carbon requires the Ultra plan.')
+    expect(wrapper.findAll<HTMLInputElement>('input').filter(input => input.element.value === 'gemini-4-carbon-disabled')).toHaveLength(2)
+    wrapper.unmount()
+  })
+
+  it('loads stored reasons when reopening an account', () => {
+    const account = buildAntigravityAccount()
+    account.extra = { upstream_model_metadata: { source: 'upstream', models: {}, unavailable_models: unavailable } }
+    const wrapper = mountModal(account)
+    expect(wrapper.text()).toContain('Carbon requires the Ultra plan.')
+    wrapper.unmount()
+  })
+
+  it('ignores a sync that finishes after switching accounts', async () => {
+    let finish!: (value: { models: string[]; unavailable_models: typeof unavailable }) => void
+    syncUpstreamModelsMock.mockReturnValue(new Promise(resolve => { finish = resolve }))
+    const wrapper = mountModal(buildAntigravityAccount())
+    await syncButton(wrapper).trigger('click')
+    const next = { ...buildAntigravityAccount(), id: 19 }
+    await wrapper.setProps({ account: next })
+    finish({ models: ['gemini-4-argon-low'], unavailable_models: unavailable })
+    await flushPromises()
+    expect(wrapper.text()).not.toContain('Carbon requires the Ultra plan.')
+    await wrapper.get('form#edit-account-form').trigger('submit.prevent')
+    await flushPromises()
+    expect(updateAccountMock.mock.calls[0]?.[0]).toBe(19)
+    expect(updateAccountMock.mock.calls[0]?.[1]?.credentials?.model_mapping).toEqual(next.credentials.model_mapping)
+    wrapper.unmount()
   })
 })
 

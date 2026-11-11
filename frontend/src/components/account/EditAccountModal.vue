@@ -1607,6 +1607,23 @@
             </button>
           </div>
 
+          <div
+            v-if="antigravityUnavailableModels.length > 0"
+            data-testid="antigravity-unavailable-models"
+            class="mb-3 rounded-lg bg-amber-50 p-3 text-xs text-amber-800 dark:bg-amber-900/20 dark:text-amber-300"
+            role="status"
+          >
+            <p class="font-medium">{{ t('admin.accounts.syncUpstreamUnavailableModels') }}</p>
+            <p class="mt-1">{{ t('admin.accounts.syncUpstreamUnavailableModelsHint') }}</p>
+            <ul class="mt-2 space-y-2">
+              <li v-for="model in antigravityUnavailableModels" :key="model.id">
+                <span class="font-medium">{{ model.display_name || model.id }}</span>
+                <span v-if="model.display_name" class="ml-1 font-mono">({{ model.id }})</span>
+                <p>{{ model.reason || t('admin.accounts.syncUpstreamUnavailableReason') }}</p>
+              </li>
+            </ul>
+          </div>
+
           <div v-if="antigravityModelMappings.length > 0" class="mb-3 space-y-2">
             <div
               v-for="(mapping, index) in antigravityModelMappings"
@@ -3420,6 +3437,7 @@ import { adminAPI } from '@/api/admin'
 import { useQuotaNotifyState } from '@/composables/useQuotaNotifyState'
 import type {
   Account,
+  UpstreamUnavailableModel,
   Proxy,
   AdminGroup,
   Group,
@@ -4073,6 +4091,7 @@ watch(
 
 onBeforeUnmount(() => {
   resetGrokDiagnostics()
+  antigravitySyncVersion += 1
 })
 
 // Grok Free OAuth accounts use client-tool prompt caching by default. Keep an
@@ -4142,7 +4161,9 @@ const antigravityProjectId = ref('')
 const antigravityModelRestrictionMode = ref<'whitelist' | 'mapping'>('whitelist')
 const antigravityWhitelistModels = ref<string[]>([])
 const antigravityModelMappings = ref<ModelMapping[]>([])
+const antigravityUnavailableModels = ref<UpstreamUnavailableModel[]>([])
 const isSyncingAntigravityUpstream = ref(false)
+let antigravitySyncVersion = 0
 const tempUnschedEnabled = ref(false)
 const accountSchedulingThresholdOverrideEnabled = ref(false)
 const accountSchedulingThresholdOverrideValue = ref(100)
@@ -4825,6 +4846,9 @@ const syncFormFromAccount = (newAccount: Account | null) => {
   }
 
   // Load antigravity model mapping (Antigravity 只支持映射模式)
+  antigravityUnavailableModels.value = newAccount.platform === 'antigravity'
+    ? (newAccount.extra?.upstream_model_metadata?.unavailable_models ?? [])
+    : []
   if (newAccount.platform === 'antigravity') {
     const credentials = newAccount.credentials as Record<string, unknown> | undefined
 
@@ -4850,6 +4874,8 @@ const syncFormFromAccount = (newAccount: Account | null) => {
         antigravityModelMappings.value = []
       }
     }
+    const unavailable = new Set(antigravityUnavailableModels.value.map(model => model.id))
+    antigravityModelMappings.value = antigravityModelMappings.value.filter(mapping => !unavailable.has(mapping.to.trim()))
   } else {
     antigravityModelRestrictionMode.value = 'mapping'
     antigravityWhitelistModels.value = []
@@ -5133,6 +5159,8 @@ async function loadTLSProfiles() {
 watch(
   [() => props.show, () => props.account],
   ([show, newAccount], [wasShow, previousAccount]) => {
+    antigravitySyncVersion += 1
+    isSyncingAntigravityUpstream.value = false
     if (!show || !newAccount) {
       return
     }
@@ -5191,9 +5219,16 @@ const addAntigravityPresetMapping = (from: string, to: string) => {
 const syncAntigravityUpstreamModels = async () => {
   if (!props.account?.id || isSyncingAntigravityUpstream.value) return
 
+  const accountId = props.account.id
+  const syncVersion = antigravitySyncVersion
+  const isCurrentSync = () => syncVersion === antigravitySyncVersion && props.show && props.account?.id === accountId
   isSyncingAntigravityUpstream.value = true
   try {
-    const result = await adminAPI.accounts.syncUpstreamModels(props.account.id)
+    const result = await adminAPI.accounts.syncUpstreamModels(accountId)
+    if (!isCurrentSync()) return
+    antigravityUnavailableModels.value = result.unavailable_models ?? []
+    const unavailable = new Set(antigravityUnavailableModels.value.map(model => model.id))
+    antigravityModelMappings.value = antigravityModelMappings.value.filter(mapping => !unavailable.has(mapping.to.trim()))
     const upstreamModels = result.models.map((model) => model.trim()).filter(Boolean)
     if (upstreamModels.length === 0) {
       appStore.showInfo(t('admin.accounts.syncUpstreamModelsEmpty'))
@@ -5229,10 +5264,11 @@ const syncAntigravityUpstreamModels = async () => {
       appStore.showWarning(t('admin.accounts.syncUpstreamModelsMetadataPartial'))
     }
   } catch (error) {
+    if (!isCurrentSync()) return
     const message = extractApiErrorMessage(error, t('admin.accounts.syncUpstreamModelsFailed'))
     appStore.showError(t('admin.accounts.syncUpstreamModelsError', { message }))
   } finally {
-    isSyncingAntigravityUpstream.value = false
+    if (isCurrentSync()) isSyncingAntigravityUpstream.value = false
   }
 }
 

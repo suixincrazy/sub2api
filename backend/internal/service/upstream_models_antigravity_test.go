@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -242,4 +243,110 @@ func TestConfiguredUpstreamModelsForCapabilitySyncSkipsInjectedAntigravityPassth
 	// 空映射走默认目录，其中的同名条目不是运行时补齐。
 	empty := &Account{Platform: PlatformAntigravity, Credentials: map[string]any{}}
 	require.Contains(t, configuredUpstreamModelsForCapabilitySync(empty), "gemini-3.8-flash-low")
+}
+
+func TestFetchUpstreamSupportedModelsAntigravityExcludesDisabledModels(t *testing.T) {
+	t.Setenv(antigravityForwardBaseURLEnv, "")
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.WriteString(w, `{"models":{
+			"gemini-4-carbon-disabled":{"disabled":true},
+			"restricted-model":{"disabled":true},
+			"available-model-disabled":{"disabled":false},
+			"gemini-4-argon-low":{}
+		}}`)
+	}))
+	defer server.Close()
+	withAntigravityModelSyncEndpoints(t, server.URL, server.URL)
+
+	models, err := antigravityModelSyncService().FetchUpstreamSupportedModels(context.Background(), antigravityModelSyncAccount("Pro"))
+	require.NoError(t, err)
+	require.Equal(t, []string{"available-model-disabled", "gemini-4-argon-low"}, models)
+}
+
+func TestSyncUpstreamModelCatalogAntigravityDisabledModelsAndRecovery(t *testing.T) {
+	t.Setenv(antigravityForwardBaseURLEnv, "")
+	var disabled atomic.Bool
+	disabled.Store(true)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = fmt.Fprintf(w, `{"models":{
+			"gemini-4-carbon-disabled":{"displayName":"Gemini 4 Carbon","disabled":%t,
+				"tagTitle":"Unavailable","tagDescription":"Carbon requires the Ultra plan.",
+				"supportsImages":true,"supportsThinking":true,"maxTokens":1048576,"maxOutputTokens":262144},
+			"gemini-4-argon-low":{"supportsImages":true,"supportsThinking":true,"maxTokens":1048576,"maxOutputTokens":65536}
+		}}`, disabled.Load())
+	}))
+	defer server.Close()
+	withAntigravityModelSyncEndpoints(t, server.URL, server.URL)
+	account := antigravityModelSyncAccount("Pro")
+	account.Credentials["model_mapping"] = map[string]any{
+		"gemini-4-carbon-disabled": "gemini-4-carbon-disabled",
+		"carbon-alias":             "gemini-4-carbon-disabled",
+		"gemini-4-argon-low":       "gemini-4-argon-low",
+	}
+	account.SetUpstreamModelMetadataSnapshot(UpstreamModelMetadataSnapshot{
+		Source: "upstream", Models: map[string]UpstreamModelMetadata{
+			"gemini-4-carbon-disabled": {ID: "gemini-4-carbon-disabled", DisplayName: "stale Carbon"},
+		},
+	})
+	svc := antigravityModelSyncService()
+	svc.accountRepo = &upstreamModelMetadataRepoStub{}
+	registry := &httpUpstreamRecorder{resp: &http.Response{StatusCode: http.StatusBadGateway, Body: io.NopCloser(strings.NewReader(`{}`))}}
+	svc.httpUpstream = registry
+
+	catalog, err := svc.SyncUpstreamModelCatalog(context.Background(), account)
+	require.NoError(t, err)
+	require.Equal(t, []string{"gemini-4-argon-low"}, catalog.Models)
+	require.NotContains(t, catalog.Metadata, "gemini-4-carbon-disabled")
+	require.NotContains(t, account.GetUpstreamModelMetadataSnapshot().Models, "gemini-4-carbon-disabled", "configured aliases must not revive disabled metadata")
+	encoded, err := json.Marshal(catalog)
+	require.NoError(t, err)
+	var response map[string]json.RawMessage
+	require.NoError(t, json.Unmarshal(encoded, &response))
+	require.JSONEq(t, `[{"id":"gemini-4-carbon-disabled","display_name":"Gemini 4 Carbon","reason":"Carbon requires the Ultra plan."}]`, string(response["unavailable_models"]))
+	snapshotJSON, err := json.Marshal(account.GetUpstreamModelMetadataSnapshot())
+	require.NoError(t, err)
+	require.Contains(t, string(snapshotJSON), `"reason":"Carbon requires the Ultra plan."`)
+	require.Empty(t, registry.requests, "disabled configured targets must not trigger capability enrichment")
+	require.Empty(t, catalog.Warnings)
+
+	disabled.Store(false)
+	catalog, err = svc.SyncUpstreamModelCatalog(context.Background(), account)
+	require.NoError(t, err)
+	require.Contains(t, catalog.Models, "gemini-4-carbon-disabled", "the upstream flag, not the ID suffix, controls availability")
+	require.Contains(t, catalog.Metadata, "gemini-4-carbon-disabled")
+	require.Contains(t, account.GetUpstreamModelMetadataSnapshot().Models, "gemini-4-carbon-disabled")
+	snapshotJSON, err = json.Marshal(account.GetUpstreamModelMetadataSnapshot())
+	require.NoError(t, err)
+	require.NotContains(t, string(snapshotJSON), `"unavailable_models"`, "re-enabled models must clear stale restrictions")
+}
+
+func TestSyncUpstreamModelCatalogAntigravityAllModelsDisabled(t *testing.T) {
+	t.Setenv(antigravityForwardBaseURLEnv, "")
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.WriteString(w, `{"models":{"restricted-model":{"disabled":true,"tagTitle":"Plan upgrade required"}}}`)
+	}))
+	defer server.Close()
+	withAntigravityModelSyncEndpoints(t, server.URL, server.URL)
+	account := antigravityModelSyncAccount("Pro")
+	account.Credentials["model_mapping"] = map[string]any{"restricted-model": "restricted-model"}
+	account.SetUpstreamModelMetadataSnapshot(UpstreamModelMetadataSnapshot{
+		Source: "upstream", Models: map[string]UpstreamModelMetadata{"restricted-model": {ID: "restricted-model"}},
+	})
+	svc := antigravityModelSyncService()
+	svc.accountRepo = &upstreamModelMetadataRepoStub{}
+	registry := &httpUpstreamRecorder{resp: &http.Response{StatusCode: http.StatusBadGateway, Body: io.NopCloser(strings.NewReader(`{}`))}}
+	svc.httpUpstream = registry
+
+	catalog, err := svc.SyncUpstreamModelCatalog(context.Background(), account)
+	require.NoError(t, err)
+	require.Empty(t, catalog.Models)
+	require.Empty(t, catalog.Metadata)
+	snapshot := account.GetUpstreamModelMetadataSnapshot()
+	require.NotNil(t, snapshot, "restriction-only snapshots must remain readable")
+	require.Empty(t, snapshot.Models)
+	encoded, err := json.Marshal(snapshot)
+	require.NoError(t, err)
+	require.Contains(t, string(encoded), `"reason":"Plan upgrade required"`)
+	require.Empty(t, registry.requests)
+	require.Empty(t, catalog.Warnings)
 }
