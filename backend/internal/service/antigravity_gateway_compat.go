@@ -256,7 +256,7 @@ func (s *AntigravityGatewayService) prepareAntigravityCompatCall(
 		return nil, s.writeAntigravityCompatError(c, http.StatusBadRequest, "invalid_request_error", "Invalid request body")
 	}
 
-	thinkingLevel := geminiThinkingLevelFromClaudeThinking(claudeRequest.Thinking)
+	thinkingLevel := geminiThinkingLevelFromClaudeBody(request.claudeBody, claudeRequest.Thinking)
 	// Responses low effort omits Claude thinking; preserve the explicit level
 	// when choosing a Gemini variant instead of falling back to high.
 	if request.reasoningEffort != nil {
@@ -331,6 +331,7 @@ func (s *AntigravityGatewayService) buildAntigravityCompatGeminiBody(
 			return nil, err
 		}
 		body = ensureGeminiFunctionCallThoughtSignatures(body)
+		body = applyGeminiCompatThinkingConfig(body, claudeBody, mappedModel, claudeRequest != nil && claudeRequest.Stream)
 		body, err = injectIdentityPatchToGeminiRequest(body)
 		if err != nil {
 			return nil, err

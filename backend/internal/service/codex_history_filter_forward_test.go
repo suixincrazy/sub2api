@@ -42,11 +42,14 @@ func TestCodexHistoryFilterSurvivesAccountTransformsAndRetries(t *testing.T) {
 						require.Equal(t, "xhigh", gjson.GetBytes(body, "reasoning.effort").String())
 						require.Contains(t, gjson.GetBytes(body, "include").String(), "reasoning.encrypted_content")
 						require.NotContains(t, string(body), "foreign-ciphertext")
-						var sawWebSearch, sawAgent bool
+						var sawWebSearch, sawAgent, sawDeclaration bool
 						for _, item := range gjson.GetBytes(body, "input").Array() {
 							require.NotEqual(t, "reasoning", item.Get("type").String())
 							require.False(t, item.Get("id").Exists())
 							switch item.Get("type").String() {
+							case "additional_tools":
+								sawDeclaration = true
+								require.Equal(t, "lookup", item.Get("tools.0.name").String())
 							case "web_search_call":
 								sawWebSearch = true
 								require.Equal(t, "release notes", item.Get("action.query").String())
@@ -59,6 +62,7 @@ func TestCodexHistoryFilterSurvivesAccountTransformsAndRetries(t *testing.T) {
 								require.False(t, item.Get("content.1.encrypted_content").Exists())
 							}
 						}
+						require.True(t, sawDeclaration, "tool declarations survive with portable IDs stripped")
 						require.True(t, sawWebSearch, "search history must survive account transforms")
 						require.True(t, sawAgent, "agent task/result history must survive account transforms")
 						require.EqualValues(t, len(body), request.ContentLength)
@@ -78,7 +82,7 @@ func TestCodexHistoryFilterSurvivesAccountTransformsAndRetries(t *testing.T) {
 					c, _ := newTransportFailoverTestContext(t)
 					ctx := codexhistory.WithEnabled(context.Background())
 					c.Request = c.Request.WithContext(ctx)
-					body := []byte(`{"model":"gpt-5.4","instructions":"test","store":true,"stream":false,"reasoning":{"effort":"xhigh"},"include":["reasoning.encrypted_content"],"input":[{"type":"message","id":"old-message","role":"user","content":[{"type":"input_text","text":"hello"}]},{"type":"reasoning","encrypted_content":"foreign-ciphertext"},{"type":"web_search_call","id":"ws_foreign","status":"completed","action":{"type":"search","query":"release notes"}},{"type":"agent_message","id":"amsg_foreign","author":"/root/review","recipient":"/root","content":[{"type":"input_text","text":"Result: "},{"type":"encrypted_content","encrypted_content":"Portable agent result."}]}]}`)
+					body := []byte(`{"model":"gpt-5.4","instructions":"test","store":true,"stream":false,"reasoning":{"effort":"xhigh"},"include":["reasoning.encrypted_content"],"input":[{"type":"additional_tools","id":"at_00112233-4455-4677-8899-aabbccddeeff","role":"developer","tools":[{"type":"function","name":"lookup","parameters":{"type":"object","properties":{}}}]},{"type":"message","id":"old-message","role":"user","content":[{"type":"input_text","text":"hello"}]},{"type":"reasoning","encrypted_content":"foreign-ciphertext"},{"type":"web_search_call","id":"ws_foreign","status":"completed","action":{"type":"search","query":"release notes"}},{"type":"agent_message","id":"amsg_foreign","author":"/root/review","recipient":"/root","content":[{"type":"input_text","text":"Result: "},{"type":"encrypted_content","encrypted_content":"Portable agent result."}]}]}`)
 					_, err := svc.Forward(ctx, c, account, body)
 					require.NoError(t, err)
 					require.Equal(t, 2, upstream.calls, "retain the gateway's existing 429 retry policy")

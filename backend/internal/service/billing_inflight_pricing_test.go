@@ -156,11 +156,17 @@ func TestInflightEstimate_OpenAIFastPolicies(t *testing.T) {
 	for _, tc := range []struct {
 		name        string
 		force, free bool
+		ultrafast   bool
 		tier        string
 		rules       []OpenAIFastPolicyRule
 		wantTier    string
 	}{
 		{name: "forced fast", force: true, wantTier: "priority"},
+		{name: "forced ultrafast", ultrafast: true, wantTier: "ultrafast"},
+		{name: "ultrafast wins over fast", force: true, ultrafast: true, wantTier: "ultrafast"},
+		{name: "free fast does not waive ultrafast", ultrafast: true, free: true, wantTier: "ultrafast"},
+		{name: "policy filters forced ultrafast", ultrafast: true, rules: []OpenAIFastPolicyRule{{ServiceTier: "ultrafast", Scope: "all", Action: "filter"}}},
+		{name: "policy downgrades forced ultrafast", ultrafast: true, rules: []OpenAIFastPolicyRule{{ServiceTier: "ultrafast", Scope: "all", Action: "force_priority"}}, wantTier: "priority"},
 		{name: "free forced fast", force: true, free: true},
 		{name: "free priority", free: true, tier: "priority"},
 		{name: "ultrafast remains billable", free: true, tier: "ultrafast", wantTier: "ultrafast"},
@@ -175,7 +181,7 @@ func TestInflightEstimate_OpenAIFastPolicies(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			base := newInflightEstimateGateway(t, nil)
 			svc := &OpenAIGatewayService{cfg: base.cfg, billingService: base.billingService, resolver: base.resolver}
-			group := &Group{ID: 76, Hydrated: true, Status: StatusActive, Platform: PlatformOpenAI, RateMultiplier: 1, ForceOpenAIFast: tc.force, FreeOpenAIFast: tc.free}
+			group := &Group{ID: 76, Hydrated: true, Status: StatusActive, Platform: PlatformOpenAI, RateMultiplier: 1, ForceOpenAIFast: tc.force, FreeOpenAIFast: tc.free, ForceOpenAIUltrafast: tc.ultrafast}
 			key := &APIKey{User: &User{ID: 1}, GroupID: &group.ID, Group: group}
 			ctx := withOpenAIFastPolicyContext(context.Background(), &OpenAIFastPolicySettings{Rules: tc.rules})
 			estimate, priced := svc.EstimateInflightReservation(ctx, key, InflightEstimateRequest{Model: "gpt-6-astra", BodyBytes: 4000, MaxTokens: 1000, ServiceTier: tc.tier})
@@ -207,7 +213,7 @@ func TestInflightEstimate_FastPolicyUsesUpstreamModelWithRequestedPricing(t *tes
 				base := newInflightEstimateGateway(t, cs)
 				if accountMapping {
 					attachInflightSnapshot(base, &inflightSnapshotCacheStub{byBucket: map[string][]Account{inflightBucketKey(groupID, platform): {
-						{ID: 1, Platform: platform, Credentials: map[string]any{"model_mapping": map[string]any{"priced-alias": upstreamModel}}},
+						{ID: 1, Platform: platform, Status: StatusActive, Schedulable: true, Credentials: map[string]any{"model_mapping": map[string]any{"priced-alias": upstreamModel}}},
 					}}})
 				}
 				group := &Group{ID: groupID, Platform: platform, RateMultiplier: 1, ModelPricing: []ChannelModelPricing{{

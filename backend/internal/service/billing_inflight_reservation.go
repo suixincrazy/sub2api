@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/Wei-Shaw/sub2api/internal/config"
+	"github.com/Wei-Shaw/sub2api/internal/pkg/ctxkey"
 	"github.com/Wei-Shaw/sub2api/internal/pkg/logger"
 	"github.com/Wei-Shaw/sub2api/internal/pkg/timezone"
 	"github.com/google/uuid"
@@ -370,13 +371,14 @@ const (
 
 // InflightEstimateRequest 单请求估算输入。
 type InflightEstimateRequest struct {
-	Model           string
-	BodyBytes       int
-	MaxTokens       int
-	Kind            InflightEstimateKind
-	ServiceTier     string
-	ReasoningEffort string
-	Speed           string
+	Model                 string
+	BodyBytes             int
+	MaxTokens             int
+	Kind                  InflightEstimateKind
+	ServiceTier           string
+	ReasoningEffort       string
+	Speed                 string
+	CachedContentLocation string
 	// Units 按次/按张数量（<=0 视为 1）。
 	Units int
 	// SearchCalls 叠加的搜索次数（按分组 search_price_per_1k 计）。
@@ -391,13 +393,14 @@ type InflightEstimateRequest struct {
 
 // inflightEstimateDeps 两种网关 service 共用的估算依赖。
 type inflightEstimateDeps struct {
-	cfg            *config.Config
-	billing        *BillingService
-	resolver       *ModelPricingResolver
-	resolveMapping func(ctx context.Context, groupID int64, model string) ChannelMappingResult
-	userGroupRate  func(ctx context.Context, userID, groupID int64, groupDefault float64) float64
-	serviceTiers   func(model, requestedTier string) []string
-	mapPolicyModel bool
+	cfg                   *config.Config
+	billing               *BillingService
+	resolver              *ModelPricingResolver
+	resolveMapping        func(ctx context.Context, groupID int64, model string) ChannelMappingResult
+	userGroupRate         func(ctx context.Context, userID, groupID int64, groupDefault float64) float64
+	serviceTiers          func(model, requestedTier string) []string
+	mapPolicyModel        bool
+	vertexPriceMultiplier func(ctx context.Context, apiKey *APIKey, model, cachedContentLocation string) float64
 	// accountMappedModels 返回调度器可选账号对 model 的账号级映射结果（去重，不含 model 本身）。
 	// 准入时账号尚未选定，计费侧 billableModelWithFallback 会回退到实际转发模型（UpstreamModel，
 	// 即账号映射后的模型），因此这里取所有候选映射模型的最高估算。
@@ -545,7 +548,7 @@ func maxPerRequestPrice(resolved *ResolvedPricing) float64 {
 func validCost(v float64) bool { return v > 0 && !math.IsNaN(v) && !math.IsInf(v, 0) }
 
 // estimateOne 估算单个候选计费模型（未乘倍率的 token 部分与按次部分分开返回，便于套用不同倍率）。
-func (d inflightEstimateDeps) estimateOne(ctx context.Context, apiKey *APIKey, model string, req InflightEstimateRequest, serviceTiers []string, textRate, imageRate float64) float64 {
+func (d inflightEstimateDeps) estimateOne(ctx context.Context, apiKey *APIKey, model string, req InflightEstimateRequest, serviceTiers []string, textRate, imageRate, upstreamFactor float64) float64 {
 	cfg := inflightReservationCfg(d.cfg)
 	units := req.Units
 	if units <= 0 {
@@ -591,6 +594,9 @@ func (d inflightEstimateDeps) estimateOne(ctx context.Context, apiKey *APIKey, m
 			if err == nil && cost != nil && cost.ActualCost > best {
 				best = cost.ActualCost
 			}
+		}
+		if resolved == nil || (resolved.Source != PricingSourceGroup && resolved.Source != PricingSourceChannel) {
+			best *= upstreamFactor
 		}
 		return best
 	}
@@ -691,6 +697,10 @@ func (d inflightEstimateDeps) estimate(ctx context.Context, apiKey *APIKey, req 
 		return 0, true
 	}
 	primary, fallbacks, upstreamInput := inflightBillingModelCandidates(ctx, d, apiKey, req.Model)
+	upstreamFactor := 1.0
+	if d.vertexPriceMultiplier != nil {
+		upstreamFactor = d.vertexPriceMultiplier(ctx, apiKey, upstreamInput, req.CachedContentLocation)
+	}
 	var accountModels []string
 	loadedAccountModels := false
 	loadAccountModels := func() []string {
@@ -725,7 +735,7 @@ func (d inflightEstimateDeps) estimate(ctx context.Context, apiKey *APIKey, req 
 	bestOf := func(models []string) float64 {
 		best := 0.0
 		for _, m := range models {
-			if c := d.estimateOne(ctx, apiKey, m, req, serviceTiers, textRate, imageRate); c > best {
+			if c := d.estimateOne(ctx, apiKey, m, req, serviceTiers, textRate, imageRate, upstreamFactor); c > best {
 				best = c
 			}
 		}
@@ -792,6 +802,7 @@ func (s *GatewayService) inflightEstimateDeps() inflightEstimateDeps {
 	d.userGroupRate = s.getUserGroupRateMultiplier
 	if s.schedulerSnapshot != nil {
 		snap := s.schedulerSnapshot
+		d.vertexPriceMultiplier = inflightVertexPriceMultiplier(snap)
 		d.accountMappedModels = inflightAccountMappedModelsFromSnapshot(
 			func(ctx context.Context, groupID *int64, platform string, forced bool) ([]Account, error) {
 				accounts, _, err := snap.ListSchedulableAccounts(ctx, groupID, platform, forced)
@@ -823,6 +834,7 @@ func (s *OpenAIGatewayService) inflightEstimateDeps() inflightEstimateDeps {
 	d.userGroupRate = s.ResolveUserGroupRateMultiplier
 	if s.schedulerSnapshot != nil {
 		snap := s.schedulerSnapshot
+		d.vertexPriceMultiplier = inflightVertexPriceMultiplier(snap)
 		d.accountMappedModels = inflightAccountMappedModelsFromSnapshot(
 			func(ctx context.Context, groupID *int64, platform string, forced bool) ([]Account, error) {
 				accounts, _, err := snap.ListSchedulableAccounts(ctx, groupID, platform, forced)
@@ -848,6 +860,8 @@ func (s *OpenAIGatewayService) EstimateInflightReservation(ctx context.Context, 
 	deps := s.inflightEstimateDeps()
 	platform := QuotaPlatform(ctx, apiKey)
 	if apiKey != nil && apiKey.User != nil && (platform == PlatformOpenAI || platform == "") {
+		group := apiKey.Group
+		deps.mapPolicyModel = IsGroupContextValid(group) && groupSupportsOpenAIFast(group.Platform) && group.ForceOpenAIUltrafast
 		settings := openAIFastPolicySettingsFromContext(ctx)
 		if settings == nil && s.settingService != nil {
 			settings, _ = s.settingService.GetOpenAIFastPolicySettings(ctx)
@@ -874,13 +888,13 @@ func (s *OpenAIGatewayService) EstimateInflightReservation(ctx context.Context, 
 
 func inflightOpenAIServiceTiers(settings *OpenAIFastPolicySettings, apiKey *APIKey, model, requestedTier string) []string {
 	var tiers []string
+	groupCtx := context.WithValue(context.Background(), ctxkey.Group, apiKey.Group)
 	// Account selection happens later; reserve the higher actual price across credential scopes.
 	for _, accountType := range []string{AccountTypeAPIKey, AccountTypeOAuth} {
 		account := &Account{Platform: PlatformOpenAI, Type: accountType}
 		tier := requestedTier
-		group := apiKey.Group
-		if IsGroupContextValid(group) && groupSupportsOpenAIFast(group.Platform) && group.ForceOpenAIFast {
-			tier = OpenAIFastTierPriority
+		if forced := openAIGroupForcedServiceTier(groupCtx, account, model); forced != "" {
+			tier = forced
 		}
 		policyTier := normalizedOpenAIServiceTierValue(tier)
 		if tier == "" {
@@ -912,4 +926,24 @@ func inflightOpenAIServiceTiers(settings *OpenAIFastPolicySettings, apiKey *APIK
 		}
 	}
 	return tiers
+}
+
+func inflightVertexPriceMultiplier(snapshot *SchedulerSnapshotService) func(context.Context, *APIKey, string, string) float64 {
+	return func(ctx context.Context, apiKey *APIKey, model, cachedContentLocation string) float64 {
+		platform := QuotaPlatform(ctx, apiKey)
+		if platform != PlatformGemini && platform != "" {
+			return 1
+		}
+		// Account selection follows admission; cover the most expensive eligible endpoint.
+		accounts, _, err := snapshot.ListSchedulableAccounts(ctx, apiKey.GroupID, PlatformGemini, true)
+		if err != nil {
+			return 1
+		}
+		factor := 1.0
+		for i := range accounts {
+			account := &accounts[i]
+			factor = math.Max(factor, VertexUpstreamPriceMultiplier(account, account.GetMappedModel(model), cachedContentLocation))
+		}
+		return factor
+	}
 }

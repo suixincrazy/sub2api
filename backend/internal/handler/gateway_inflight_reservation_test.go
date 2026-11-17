@@ -25,6 +25,13 @@ func TestRequestMaxOutputTokens(t *testing.T) {
 	require.Equal(t, 0, requestMaxOutputTokens([]byte(`{}`)))
 }
 
+func TestTokenInflightEstimateVertexCacheLocation(t *testing.T) {
+	body := []byte(`{"cachedContent":"projects/p/locations/us/cachedContents/c","generationConfig":{"maxOutputTokens":32}}`)
+	estimate := tokenInflightEstimate("gemini-3.7-flash", body)
+	require.Equal(t, "us", estimate.CachedContentLocation)
+	require.Equal(t, 32, estimate.MaxTokens)
+}
+
 type countingEstimator struct {
 	calls  int
 	cost   float64

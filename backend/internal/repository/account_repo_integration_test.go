@@ -1098,6 +1098,28 @@ func (s *AccountRepoSuite) TestClearModelRateLimits_SyncsSchedulerSnapshot() {
 	s.Require().NotContains(cacheRecorder.setAccounts[0].Extra, "model_rate_limits")
 }
 
+func (s *AccountRepoSuite) TestClearModelRateLimit_PreservesNewerSnapshot() {
+	old := map[string]any{"reason": "anthropic_7d_oi_window_exhausted", "rate_limit_reset_at": "2026-12-01T00:00:00Z"}
+	newer := map[string]any{"reason": "credits_required", "rate_limit_reset_at": "2026-12-02T00:00:00Z"}
+	account := mustCreateAccount(s.T(), s.client, &service.Account{
+		Name:  "clear-model-rate-cas",
+		Extra: map[string]any{"model_rate_limits": map[string]any{"claude-fable-5": newer, "other-model": old}},
+	})
+	cacheRecorder := &schedulerCacheRecorder{}
+	s.repo.schedulerCache = cacheRecorder
+	s.Require().ErrorIs(s.repo.ClearModelRateLimit(s.ctx, account.ID, "claude-fable-5", old), service.ErrModelRateLimitChanged)
+	got, err := s.repo.GetByID(s.ctx, account.ID)
+	s.Require().NoError(err)
+	s.Require().Equal(newer, got.Extra["model_rate_limits"].(map[string]any)["claude-fable-5"])
+	s.Require().Empty(cacheRecorder.setAccounts)
+	s.Require().NoError(s.repo.ClearModelRateLimit(s.ctx, account.ID, "claude-fable-5", newer))
+	got, err = s.repo.GetByID(s.ctx, account.ID)
+	s.Require().NoError(err)
+	s.Require().NotContains(got.Extra["model_rate_limits"], "claude-fable-5")
+	s.Require().Contains(got.Extra["model_rate_limits"], "other-model")
+	s.Require().Len(cacheRecorder.setAccounts, 1)
+}
+
 // --- UpdateLastUsed ---
 
 func (s *AccountRepoSuite) TestUpdateLastUsed() {

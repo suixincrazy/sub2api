@@ -30,13 +30,14 @@ func tokenInflightEstimate(model string, body []byte) service.InflightEstimateRe
 		effort = *requested
 	}
 	return service.InflightEstimateRequest{
-		Model:           model,
-		BodyBytes:       len(body),
-		MaxTokens:       requestMaxOutputTokens(body),
-		Kind:            service.InflightEstimateToken,
-		ServiceTier:     gjson.GetBytes(body, "service_tier").String(),
-		ReasoningEffort: effort,
-		Speed:           gjson.GetBytes(body, "speed").String(),
+		Model:                 model,
+		BodyBytes:             len(body),
+		MaxTokens:             requestMaxOutputTokens(body),
+		Kind:                  service.InflightEstimateToken,
+		ServiceTier:           gjson.GetBytes(body, "service_tier").String(),
+		ReasoningEffort:       effort,
+		Speed:                 gjson.GetBytes(body, "speed").String(),
+		CachedContentLocation: service.GeminiCachedContentLocationInBody(body),
 	}
 }
 

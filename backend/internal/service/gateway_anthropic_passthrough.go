@@ -524,6 +524,7 @@ func (s *GatewayService) handleStreamingResponseAnthropicAPIKeyPassthrough(
 	// 但仍必须留痕 + 罚账号，否则客户端紧接着的重试会被粘性送回同一个坏账号，
 	// 表现为「一直报 safeguards 却从不主副切换」。只报一次，避免打乱阈值窗口。
 	refusalReported := false
+	clientModel := compositeClientModel(ctx, "")
 
 	for {
 		select {
@@ -592,8 +593,14 @@ func (s *GatewayService) handleStreamingResponseAnthropicAPIKeyPassthrough(
 				}
 			}
 
+			if data, ok := extractAnthropicSSEDataLine(line); ok && clientModel != "" && gjson.Get(data, "type").String() == "message_start" && gjson.Get(data, "message.model").Exists() {
+				if rewritten, err := sjson.Set(data, "message.model", clientModel); err == nil {
+					line = "data: " + rewritten
+				}
+			}
+
 			if !clientDisconnected {
-				restored := string(reverseToolNamesIfPresent(c, []byte(line)))
+				restored := reverseToolNamesIfPresentString(c, line)
 				if _, err := io.WriteString(w, restored); err != nil {
 					clientDisconnected = true
 					logger.LegacyPrintf("service.gateway", "[Anthropic passthrough] Client disconnected during streaming, continue draining upstream for usage: account=%d", account.ID)
@@ -929,6 +936,7 @@ func (s *GatewayService) handleNonStreamingResponseAnthropicAPIKeyPassthrough(
 
 	writeAnthropicPassthroughResponseHeaders(c.Writer.Header(), resp.Header, s.responseHeaderFilter)
 	contentType := normalizeJSONBodyContentType(c.Writer.Header(), resp.Header.Get("Content-Type"), body)
+	body = restoreCompositeClientModel(ctx, body)
 	body = reverseToolNamesIfPresent(c, body)
 	c.Data(resp.StatusCode, contentType, body)
 	return usage, nil
