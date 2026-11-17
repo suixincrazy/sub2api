@@ -1049,7 +1049,7 @@ func TestApplyAccountStatsCost_UsesUsageLogServiceTier(t *testing.T) {
 
 	applyAccountStatsCost(
 		context.Background(), usageLog, cs, bs,
-		1, 10, "gpt-5.6-sol", "gpt-5.6-sol",
+		1, 10, PlatformOpenAI, "gpt-5.6-sol", "gpt-5.6-sol",
 		UsageTokens{InputTokens: 100, OutputTokens: 50}, 999, time.Time{}, true, 1,
 	)
 
@@ -1098,7 +1098,7 @@ func TestApplyAccountStatsCost_LongContextFollowsAccountGate(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			usageLog := &UsageLog{ServiceTier: &tt.tier}
 			applyAccountStatsCost(context.Background(), usageLog, cs, bs,
-				1, 10, "gpt-5.6-sol", "gpt-5.6-sol", tokens, 999, time.Time{},
+				1, 10, PlatformOpenAI, "gpt-5.6-sol", "gpt-5.6-sol", tokens, 999, time.Time{},
 				accountStatsLongContextPricingEnabled(tt.gate), 1)
 			require.NotNil(t, usageLog.AccountStatsCost)
 			require.InDelta(t, tt.wantCost, *usageLog.AccountStatsCost, 1e-12)

@@ -52,6 +52,11 @@ func resolveAccountStatsCost(
 	}
 
 	platform := channelService.GetGroupPlatform(ctx, groupID)
+	if platform == PlatformComposite {
+		if resolved, ok := ResolvedTargetPlatformFromContext(ctx); ok {
+			platform = resolved
+		}
+	}
 
 	// 优先级 1：自定义规则（始终尝试）
 	if cost := tryCustomRules(channel, accountID, groupID, platform, upstreamModel, tokens, requestCount, reasoningEffort); cost != nil {
@@ -278,6 +283,7 @@ func applyAccountStatsCost(
 	usageLog *UsageLog,
 	cs *ChannelService, bs *BillingService,
 	accountID int64, groupID int64,
+	accountPlatform string,
 	upstreamModel, requestedModel string,
 	tokens UsageTokens,
 	totalCost float64,
@@ -285,6 +291,8 @@ func applyAccountStatsCost(
 	longContextPricingEnabled bool,
 	upstreamPriceFactor float64,
 ) {
+	// Billing workers may have no request context; cost follows the selected account.
+	ctx = WithResolvedTargetPlatform(ctx, accountPlatform)
 	model := upstreamModel
 	if model == "" {
 		model = requestedModel

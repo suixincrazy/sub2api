@@ -849,15 +849,17 @@ func (s *GatewayService) recordUsageCore(ctx context.Context, input *recordUsage
 	// 账号统计成本回落 total_cost（官方存储价）。
 	if apiKey.GroupID != nil && !isCacheStorageOnlyResult(result) {
 		applyAccountStatsCost(ctx, usageLog, s.channelService, s.billingService,
-			account.ID, *apiKey.GroupID, result.UpstreamModel, result.Model,
+			account.ID, *apiKey.GroupID, account.Platform, result.UpstreamModel, result.Model,
 			// Anthropic's input_tokens excludes cache_read and cache_creation (billed separately);
 			// OpenAI gateway uses actualInputTokens which also excludes cache_read for the same reason.
 			UsageTokens{
-				InputTokens:         result.Usage.InputTokens,
-				OutputTokens:        result.Usage.OutputTokens,
-				CacheCreationTokens: result.Usage.CacheCreationInputTokens,
-				CacheReadTokens:     result.Usage.CacheReadInputTokens,
-				ImageOutputTokens:   result.Usage.ImageOutputTokens,
+				InputTokens:           result.Usage.InputTokens,
+				OutputTokens:          result.Usage.OutputTokens,
+				CacheCreationTokens:   result.Usage.CacheCreationInputTokens,
+				CacheCreation5mTokens: result.Usage.CacheCreation5mTokens,
+				CacheCreation1hTokens: result.Usage.CacheCreation1hTokens,
+				CacheReadTokens:       result.Usage.CacheReadInputTokens,
+				ImageOutputTokens:     result.Usage.ImageOutputTokens,
 			},
 			cost.TotalCost-cacheStorageCost, pricingAt,
 			accountStatsLongContextPricingEnabled(nil), result.upstreamPriceFactor(),
