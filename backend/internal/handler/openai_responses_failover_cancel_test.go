@@ -8,8 +8,10 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"sync"
 	"testing"
+	"testing/synctest"
 
 	"github.com/Wei-Shaw/sub2api/internal/config"
 	middleware2 "github.com/Wei-Shaw/sub2api/internal/server/middleware"
@@ -75,8 +77,11 @@ func newOpenAIResponsesFailoverTestHandler(t *testing.T, upstream service.HTTPUp
 			Credentials: map[string]any{"access_token": "token-2"},
 		},
 	}
-	accountRepo := openAIImagesFailoverAccountRepo{accounts: accounts}
-	cfg := &config.Config{RunMode: config.RunModeSimple}
+	return newOpenAIResponsesFailoverHandler(t, openAIImagesFailoverAccountRepo{accounts: accounts}, upstream, &config.Config{RunMode: config.RunModeSimple})
+}
+
+func newOpenAIResponsesFailoverHandler(t *testing.T, accountRepo service.AccountRepository, upstream service.HTTPUpstream, cfg *config.Config) *OpenAIGatewayHandler {
+	t.Helper()
 	gatewayService := service.NewOpenAIGatewayService(
 		accountRepo,
 		nil,
@@ -191,4 +196,62 @@ func TestOpenAIGatewayHandlerResponses_FailoverContinuesForConnectedClient(t *te
 	require.Equal(t, []int64{1, 2}, upstream.calls(), "在线客户端应正常切换账号")
 	require.Equal(t, http.StatusBadGateway, rec.Code)
 	require.Equal(t, "upstream_error", gjson.GetBytes(rec.Body.Bytes(), "error.type").String())
+}
+
+func TestOpenAIGatewayHandlerResponses_IdleTimeoutPoolRetrySwitchBudget(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	const a, b = int64(9201), int64(9202)
+	for _, tc := range []struct {
+		name         string
+		idleAttempts int
+		disableFirst bool
+		maxSwitches  int
+		wantAccounts []int64
+		wantStatus   int
+	}{
+		{"same_account_retry_then_success_on_second", 2, false, 10, []int64{a, a, b}, http.StatusOK},
+		{"second_account_can_retry_but_cannot_switch_again", 4, false, 10, []int64{a, a, b, b}, http.StatusBadGateway},
+		{"rescheduled_retry_uses_the_one_switch", 3, true, 10, []int64{a, b, b}, http.StatusBadGateway},
+		{"no_switch_budget_still_allows_same_account_recovery", 1, false, 0, []int64{a, a}, http.StatusOK},
+		{"rescheduled_retry_obeys_global_switch_limit", 1, true, 0, []int64{a}, http.StatusBadGateway},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			accounts := preContentAccounts(3)
+			for i := range accounts {
+				accounts[i].Concurrency = 0
+				delete(accounts[i].Credentials, "base_url")
+				accounts[i].Credentials["pool_mode"] = true
+				accounts[i].Credentials["pool_mode_retry_count"] = 1
+				accounts[i].Credentials["pool_mode_retry_status_codes"] = []any{http.StatusBadGateway}
+			}
+			repo := &grokCredentialHandlerRepo{accounts: accounts}
+			upstream := &preContentFailoverUpstream{respond: func(call int) (*http.Response, error) {
+				if tc.disableFirst && call == 1 {
+					if err := repo.SetError(t.Context(), a, "unavailable for retry"); err != nil {
+						return nil, err
+					}
+				}
+				if call > tc.idleAttempts {
+					return preContentSSEResponse(io.NopCloser(strings.NewReader(preContentHandlerSuccess))), nil
+				}
+				r, w := io.Pipe()
+				t.Cleanup(func() { _ = w.Close() })
+				return preContentSSEResponse(r), nil
+			}}
+			cfg := &config.Config{RunMode: config.RunModeSimple, Gateway: config.GatewayConfig{StreamDataIntervalTimeout: 1}}
+			h := newOpenAIResponsesFailoverHandler(t, repo, upstream, cfg)
+			h.maxAccountSwitches = tc.maxSwitches
+			c, rec := newAstraProFailoverContext(t, `{"model":"gpt-5.4","input":"hello","stream":true}`)
+
+			synctest.Test(t, func(_ *testing.T) { h.Responses(c) })
+
+			require.Equal(t, tc.wantAccounts, upstream.hits, "response: %s", rec.Body.String())
+			require.Equal(t, tc.wantStatus, rec.Code)
+			if tc.wantStatus == http.StatusOK {
+				require.Contains(t, rec.Body.String(), `"type":"response.completed"`)
+			} else {
+				require.Equal(t, "upstream_error", gjson.GetBytes(rec.Body.Bytes(), "error.type").String())
+			}
+		})
+	}
 }

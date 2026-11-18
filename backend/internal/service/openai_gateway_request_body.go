@@ -82,6 +82,11 @@ func shouldPreserveOpenAIResponsesNoneReasoningEffort(account *Account) bool {
 	return baseURL == "" || isOfficialOpenAIModelsBaseURL(baseURL)
 }
 
+// An explicit none effort is invalid on GPT-6.2, including when selected through an alias.
+func mappedOpenAIModelRejectsNoneEffort(account *Account, model string) bool {
+	return account != nil && openai.GPT62ModelID(account.GetMappedModel(model)) != ""
+}
+
 // Codex 0.149.0 needs a single advertised effort to directly select a visible
 // non-reasoning model. Treat that catalog-only "none" value as omission for
 // compatible upstreams, while preserving official OpenAI request semantics.
@@ -96,6 +101,9 @@ func filterOpenAIResponsesNoneReasoningEffortForAccount(account *Account, body [
 	for _, path := range []string{"reasoning.effort", "reasoning_effort", "reasoning.summary"} {
 		effort := gjson.GetBytes(out, path)
 		if effort.Type != gjson.String || !strings.EqualFold(strings.TrimSpace(effort.String()), "none") {
+			continue
+		}
+		if path != "reasoning.summary" && mappedOpenAIModelRejectsNoneEffort(account, gjson.GetBytes(body, "model").String()) {
 			continue
 		}
 		next, err := sjson.DeleteBytes(out, path)
@@ -118,14 +126,16 @@ func deleteOpenAIResponsesNoneReasoningEffortFromObject(account *Account, body m
 	if body == nil || shouldPreserveOpenAIResponsesNoneReasoningEffort(account) {
 		return
 	}
-	if effort, ok := body["reasoning_effort"].(string); ok && strings.EqualFold(strings.TrimSpace(effort), "none") {
+	model, _ := body["model"].(string)
+	preserveEffort := mappedOpenAIModelRejectsNoneEffort(account, model)
+	if effort, ok := body["reasoning_effort"].(string); !preserveEffort && ok && strings.EqualFold(strings.TrimSpace(effort), "none") {
 		delete(body, "reasoning_effort")
 	}
 	reasoning, ok := body["reasoning"].(map[string]any)
 	if !ok {
 		return
 	}
-	if effort, ok := reasoning["effort"].(string); ok && strings.EqualFold(strings.TrimSpace(effort), "none") {
+	if effort, ok := reasoning["effort"].(string); !preserveEffort && ok && strings.EqualFold(strings.TrimSpace(effort), "none") {
 		delete(reasoning, "effort")
 	}
 	if summary, ok := reasoning["summary"].(string); ok && strings.EqualFold(strings.TrimSpace(summary), "none") {

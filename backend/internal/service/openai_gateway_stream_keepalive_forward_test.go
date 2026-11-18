@@ -102,6 +102,20 @@ func TestOpenAINativeStreamForwardsUpstreamKeepaliveBeforeFirstOutput(t *testing
 	}
 }
 
+func TestOpenAINativeStreamDiscardsPartialKeepaliveBeforeIdleFailover(t *testing.T) {
+	for _, partial := range []string{upstreamKeepaliveData + "\n", "event: keepalive\n", "event: keepalive\n" + upstreamKeepaliveData + "\n"} {
+		svc := newKeepaliveForwardService(0)
+		svc.cfg.Gateway.StreamDataIntervalTimeout = 1
+		c, rec := newKeepaliveForwardContext()
+		_, err := svc.handleStreamingResponse(c.Request.Context(), stalledKeepaliveResponse(upstreamKeepaliveEvent, partial), c,
+			&Account{ID: 1, Platform: PlatformOpenAI}, time.Now(), "model", "model")
+		var failover *UpstreamFailoverError
+		require.ErrorAs(t, err, &failover)
+		require.True(t, failover.SafeToFailoverAfterWrite)
+		require.Equal(t, upstreamKeepaliveEvent, rec.Body.String(), "only complete frames may precede the next account's stream")
+	}
+}
+
 // After a pre-output failover the next account's stream continues the same response: the client
 // sees the first account's keepalive, then the second account's complete stream from its start.
 func TestOpenAINativeStreamKeepaliveThenFailoverContinuesWithNextAccount(t *testing.T) {

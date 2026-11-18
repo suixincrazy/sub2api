@@ -266,6 +266,13 @@ func usageRecordContext(parent context.Context, base context.Context) context.Co
 	if requestID, _ := parent.Value(ctxkey.RequestID).(string); strings.TrimSpace(requestID) != "" {
 		base = context.WithValue(base, ctxkey.RequestID, strings.TrimSpace(requestID))
 	}
+	// Channel pricing needs the same route after the request leaves its handler.
+	if platform, ok := service.ResolvedTargetPlatformFromContext(parent); ok {
+		base = service.WithResolvedTargetPlatform(base, platform)
+	}
+	if platform, _ := parent.Value(ctxkey.ForcePlatform).(string); strings.TrimSpace(platform) != "" {
+		base = context.WithValue(base, ctxkey.ForcePlatform, strings.TrimSpace(platform))
+	}
 	return base
 }
 
@@ -671,12 +678,24 @@ func (h *OpenAIGatewayHandler) Responses(c *gin.Context) {
 	maxAccountSwitches := h.maxAccountSwitches
 	switchCount := 0
 	firstOutputTimeoutSwitchCount := 0
+	var firstOutputRetryAccount *service.Account
+	var firstOutputRetryErr *service.UpstreamFailoverError
 	profitVetoCount := 0
 	failedAccountIDs := make(map[int64]struct{})
 	sameAccountRetryCount := make(map[int64]int)
 	var lastFailoverErr *service.UpstreamFailoverError
 	var oauth429FailoverState service.OpenAIOAuth429FailoverState
 	var passthroughFailoverState openAIPassthroughFailoverState
+	trySwitchAccount := func(from *service.Account, failoverErr *service.UpstreamFailoverError) bool {
+		if switchCount >= maxAccountSwitches || openAIFirstOutputFailoverExhausted(failoverErr, &firstOutputTimeoutSwitchCount) {
+			return false
+		}
+		switchCount++
+		failedAccountIDs[from.ID] = struct{}{}
+		lastFailoverErr = failoverErr
+		h.gatewayService.RecordOpenAIAccountSwitch()
+		return !h.gatewayService.ShouldStopOpenAIOAuth429Failover(from, failoverErr.StatusCode, switchCount, &oauth429FailoverState)
+	}
 
 	// 生图意图的 /v1/responses 请求必须调度到确实支持 Responses API 的账号，否则
 	// 会在 forward 阶段被静默降级为无法生图的 Chat Completions 直转（#4417）。
@@ -813,6 +832,19 @@ func (h *OpenAIGatewayHandler) Responses(c *gin.Context) {
 		if slotResult != openAISlotAcquireOK {
 			return
 		}
+
+		// A pool retry goes through the scheduler again. If the original account became
+		// unavailable, forwarding to its replacement uses the same switch budgets.
+		if firstOutputRetryAccount != nil && account.ID != firstOutputRetryAccount.ID {
+			if !trySwitchAccount(firstOutputRetryAccount, firstOutputRetryErr) {
+				if accountReleaseFunc != nil {
+					accountReleaseFunc()
+				}
+				h.handleFailoverExhausted(c, firstOutputRetryErr, streamStarted)
+				return
+			}
+		}
+		firstOutputRetryAccount, firstOutputRetryErr = nil, nil
 
 		// Forward request
 		service.SetOpsLatencyMs(c, service.OpsRoutingLatencyMsKey, time.Since(routingStart).Milliseconds())
@@ -955,10 +987,6 @@ func (h *OpenAIGatewayHandler) Responses(c *gin.Context) {
 						h.handleFailoverExhausted(c, failoverErr, streamStarted)
 						return
 					}
-					if openAIFirstOutputFailoverExhausted(failoverErr, &firstOutputTimeoutSwitchCount) {
-						h.handleFailoverExhausted(c, failoverErr, streamStarted)
-						return
-					}
 					// 池模式：同账号重试
 					if failoverErr.RetryableOnSameAccount {
 						retryLimit := effectiveSameAccountRetryLimit(failoverErr, account)
@@ -977,18 +1005,13 @@ func (h *OpenAIGatewayHandler) Responses(c *gin.Context) {
 								return
 							case <-time.After(retryDelay):
 							}
+							if failoverErr.SafeToFailoverAfterWrite {
+								firstOutputRetryAccount, firstOutputRetryErr = account, failoverErr
+							}
 							continue
 						}
 					}
-					h.gatewayService.RecordOpenAIAccountSwitch()
-					failedAccountIDs[account.ID] = struct{}{}
-					lastFailoverErr = failoverErr
-					if switchCount >= maxAccountSwitches {
-						h.handleFailoverExhausted(c, failoverErr, streamStarted)
-						return
-					}
-					switchCount++
-					if h.gatewayService.ShouldStopOpenAIOAuth429Failover(account, failoverErr.StatusCode, switchCount, &oauth429FailoverState) {
+					if !trySwitchAccount(account, failoverErr) {
 						h.handleFailoverExhausted(c, failoverErr, streamStarted)
 						return
 					}

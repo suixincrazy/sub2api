@@ -780,7 +780,6 @@ func (s *GatewayService) recordUsageCore(ctx context.Context, input *recordUsage
 	account := input.Account
 	subscription := input.Subscription
 	ApplyForwardImageBillingResolution(result)
-	logServiceTierBillingDowngrade("service.gateway", account, result.RequestID, ApplyForwardServiceTierBillingResolution(result))
 
 	// 强制缓存计费：将 input_tokens 转为 cache_read_input_tokens
 	// 用于粘性会话切换时的特殊计费处理
@@ -810,7 +809,20 @@ func (s *GatewayService) recordUsageCore(ctx context.Context, input *recordUsage
 	}
 
 	// 计算费用
-	cost := s.calculateRecordUsageCost(ctx, result, apiKey, billingModel, multiplier, imageMultiplier, pricingAt)
+	resolution := ResolveBillingServiceTier(optionalStringValue(result.ServiceTier), result.UpstreamResponseServiceTier)
+	quoteModel := func(model string) (*CostBreakdown, bool) {
+		requested := s.calculateRecordUsageCost(ctx, result, apiKey, model, multiplier, imageMultiplier, pricingAt)
+		if resolution.Downgraded {
+			observed := *result
+			observed.ServiceTier = &resolution.Billing
+			observedCost := s.calculateRecordUsageCost(ctx, &observed, apiKey, model, multiplier, imageMultiplier, pricingAt)
+			if resolution.canBillObserved(requested, observedCost) {
+				return observedCost, true
+			}
+		}
+		return requested, false
+	}
+	cost, downgraded := quoteModel(billingModel)
 	// response_model：按上游成功响应自报的模型计费（渠道显式开启才生效）。
 	// 采纳条件见 responseModelBillingDeclaration + hasIdentifiedResponseModelPricing
 	// + responseModelBillingAdoptable。任一条件不满足都静默回落基线，即开启本模式前的
@@ -822,15 +834,18 @@ func (s *GatewayService) recordUsageCore(ctx context.Context, input *recordUsage
 		result.ImageCount > 0 || result.AudioUsage != nil || result.SearchCount > 0 || result.CacheStorageTokenHours > 0,
 	); responseModel != "" && !strings.EqualFold(responseModel, strings.TrimSpace(billingModel)) {
 		if identified, responseChannelPriced := s.hasIdentifiedResponseModelPricing(ctx, responseModel, apiKey); identified {
-			responseCost := s.calculateRecordUsageCost(ctx, result, apiKey, responseModel, multiplier, imageMultiplier, pricingAt)
+			responseCost, responseDowngraded := quoteModel(responseModel)
 			baselineChannelPriced := s.resolveChannelPricing(ctx, billingModel, apiKey) != nil
 			if responseModelBillingAdoptable(cost, responseCost, baselineChannelPriced, responseChannelPriced) {
-				// billingModel 到此为止只是定价查表的入参，后续流程只消费 cost，
-				// 因此这里不改写它，改由日志记录实际生效的计费基准。
 				logResponseModelBillingApplied("service.gateway", account, result.RequestID, billingModel, responseModel, cost, responseCost)
-				cost = responseCost
+				cost, downgraded = responseCost, responseDowngraded
 			}
 		}
+	}
+
+	if downgraded {
+		result.ServiceTier = &resolution.Billing
+		logServiceTierBillingDowngrade("service.gateway", account, result.RequestID, resolution)
 	}
 
 	// 判断计费方式：订阅模式 vs 余额模式

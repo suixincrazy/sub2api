@@ -229,6 +229,27 @@ func TestGPT62RecordUsageUsesRequestPricingAt(t *testing.T) {
 	}
 }
 
+func TestGPT62MappedChatFallbackRejectsRawNoneEffort(t *testing.T) {
+	account := passthroughArgsFallbackAccount()
+	account.Credentials["model_mapping"] = map[string]any{"public": "gpt-6.2-astra"}
+	account.Extra = map[string]any{"openai_responses_supported": false}
+	captured := &httpUpstreamRecorder{err: errors.New("unexpected upstream call")}
+	svc := &OpenAIGatewayService{cfg: passthroughArgsTestConfig(), httpUpstream: captured}
+	body := []byte(`{"model":"public","input":"hi","reasoning":{"effort":"none","summary":"none"}}`)
+	c := adaptiveProtocolTestContext("/v1/responses", body)
+	_, err := svc.Forward(context.Background(), c, account, body)
+	require.Error(t, err)
+	require.Equal(t, http.StatusBadRequest, c.Writer.Status())
+	require.Contains(t, err.Error(), "none")
+	require.Empty(t, captured.lastBody)
+
+	bridge, err := prepareOpenAIWSHTTPBridgeBody(account, body)
+	require.NoError(t, err)
+	var bridged map[string]any
+	require.NoError(t, json.Unmarshal(bridge, &bridged))
+	require.Equal(t, map[string]any{"effort": "none"}, bridged["reasoning"])
+}
+
 func TestGPT62ResponsesToChatDropsSamplingAfterMapping(t *testing.T) {
 	account := passthroughArgsFallbackAccount()
 	account.Credentials["model_mapping"] = map[string]any{"public": "gpt-6.2-astra"}

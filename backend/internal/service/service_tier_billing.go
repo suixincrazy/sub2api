@@ -12,16 +12,11 @@ type ServiceTierBillingResolution struct {
 	Requested  string // tier carried by the request sent upstream ("" when none)
 	Observed   string // tier declared by the upstream response ("" when none)
 	Billing    string // tier used for billing and the usage log
-	Downgraded bool   // Billing is cheaper than Requested
+	Downgraded bool   // Billing is a lower nominal tier than Requested
 }
 
-// ResolveBillingServiceTier picks the tier to bill. The upstream declaration is
-// trusted only to lower the bill: a request served below the tier it asked for
-// (OpenAI "priority" answered with service_tier "default", Anthropic speed=fast
-// answered with usage.speed "standard") is billed at the cheaper tier. A response
-// that claims a more expensive tier, an unknown one, or none at all leaves the
-// requested tier in place, which is also the behaviour for upstreams that never
-// declare a tier.
+// ResolveBillingServiceTier identifies a nominal downgrade reported by upstream.
+// Settlement also checks the actual customer charge under the selected price card.
 func ResolveBillingServiceTier(requested, observed string) ServiceTierBillingResolution {
 	requested = normalizeBillingServiceTier(requested)
 	observed = normalizeBillingServiceTier(observed)
@@ -42,9 +37,12 @@ func ResolveBillingServiceTier(requested, observed string) ServiceTierBillingRes
 	return resolution
 }
 
-// serviceTierCostRank orders tiers by their cost relative to the base rate, so a
-// lower rank is always cheaper. Unknown tiers rank as the base rate and report
-// known=false so callers can refuse to act on them.
+// canBillObserved compares the two customer charges for the same billing model.
+func (r ServiceTierBillingResolution) canBillObserved(requested, observed *CostBreakdown) bool {
+	return r.Downgraded && requested != nil && observed != nil && observed.ActualCost <= requested.ActualCost
+}
+
+// serviceTierCostRank orders the upstream service levels, independent of custom prices.
 func serviceTierCostRank(tier string) (rank int, known bool) {
 	switch normalizeBillingServiceTier(tier) {
 	case "flex":
