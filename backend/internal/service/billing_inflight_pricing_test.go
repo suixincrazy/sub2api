@@ -193,6 +193,31 @@ func TestInflightEstimate_OpenAIFastPolicies(t *testing.T) {
 	}
 }
 
+// GPT-6.2 OAuth accounts can have a plan or workspace grant unknown at admission.
+func TestInflightEstimate_GPT62UltrafastWithCredentialScopedPolicies(t *testing.T) {
+	base := newInflightEstimateGateway(t, nil)
+	svc := &OpenAIGatewayService{cfg: base.cfg, billingService: base.billingService, resolver: base.resolver}
+	group := &Group{ID: 76, Hydrated: true, Status: StatusActive, Platform: PlatformOpenAI, RateMultiplier: 1, ForceOpenAIUltrafast: true}
+	key := &APIKey{User: &User{ID: 1}, GroupID: &group.ID, Group: group}
+	for _, tc := range []struct{ scope, billedTier string }{
+		{BetaPolicyScopeAPIKey, OpenAIFastTierUltrafast},
+		{BetaPolicyScopeOAuth, OpenAIFastTierUltrafast},
+		{"all", ""},
+	} {
+		t.Run(tc.scope, func(t *testing.T) {
+			ctx := withOpenAIFastPolicyContext(context.Background(), &OpenAIFastPolicySettings{Rules: []OpenAIFastPolicyRule{{
+				ServiceTier: OpenAIFastTierUltrafast, Scope: tc.scope, Action: BetaPolicyActionFilter,
+			}}})
+			req := InflightEstimateRequest{Model: "gpt-6.2-astra", BodyBytes: 4000, MaxTokens: 1000}
+			estimate, priced := svc.EstimateInflightReservation(ctx, key, req)
+			require.True(t, priced)
+			cost, err := base.billingService.CalculateCostWithServiceTier(req.Model, UsageTokens{InputTokens: 1000, OutputTokens: 1000}, 1, tc.billedTier)
+			require.NoError(t, err)
+			require.InDelta(t, cost.ActualCost, estimate, 1e-12)
+		})
+	}
+}
+
 func TestInflightEstimate_FastPolicyUsesUpstreamModelWithRequestedPricing(t *testing.T) {
 	for _, accountMapping := range []bool{false, true} {
 		for _, platform := range []string{PlatformOpenAI, PlatformAnthropic} {

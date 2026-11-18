@@ -13,6 +13,7 @@ import (
 	"github.com/Wei-Shaw/sub2api/internal/config"
 	"github.com/Wei-Shaw/sub2api/internal/pkg/ctxkey"
 	"github.com/Wei-Shaw/sub2api/internal/pkg/logger"
+	"github.com/Wei-Shaw/sub2api/internal/pkg/openai"
 	"github.com/Wei-Shaw/sub2api/internal/pkg/timezone"
 	"github.com/google/uuid"
 )
@@ -890,8 +891,13 @@ func inflightOpenAIServiceTiers(settings *OpenAIFastPolicySettings, apiKey *APIK
 	var tiers []string
 	groupCtx := context.WithValue(context.Background(), ctxkey.Group, apiKey.Group)
 	// Account selection happens later; reserve the higher actual price across credential scopes.
-	for _, accountType := range []string{AccountTypeAPIKey, AccountTypeOAuth} {
-		account := &Account{Platform: PlatformOpenAI, Type: accountType}
+	accounts := []Account{{Platform: PlatformOpenAI, Type: AccountTypeAPIKey}, {Platform: PlatformOpenAI, Type: AccountTypeOAuth}}
+	if apiKey.Group != nil && apiKey.Group.ForceOpenAIUltrafast && openai.GPT62ModelID(model) != "" {
+		// An OAuth account may also be entitled to Ultrafast. Its policy scope differs from an API key's.
+		accounts = append(accounts, Account{Platform: PlatformOpenAI, Type: AccountTypeOAuth, Credentials: map[string]any{"plan_type": "pro_max"}})
+	}
+	for i := range accounts {
+		account := &accounts[i]
 		tier := requestedTier
 		if forced := openAIGroupForcedServiceTier(groupCtx, account, model); forced != "" {
 			tier = forced
@@ -921,7 +927,7 @@ func inflightOpenAIServiceTiers(settings *OpenAIFastPolicySettings, apiKey *APIK
 		if groupBillsOpenAIFastAtStandard(apiKey, account, tier) {
 			tier = ""
 		}
-		if len(tiers) == 0 || tiers[0] != tier {
+		if !slices.Contains(tiers, tier) {
 			tiers = append(tiers, tier)
 		}
 	}
