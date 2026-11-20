@@ -52,6 +52,19 @@ type GrokOAuthRefreshMutationRepository interface {
 	SetGrokOAuthRefreshTempUnschedulableIfCredentialsUnchanged(ctx context.Context, id int64, expectedCredentials map[string]any, expectedProxyID *int64, until time.Time, reason string) (bool, error)
 }
 
+type openAIRefreshCooldownRepository interface {
+	ClearOpenAIRefreshCooldownIfObserved(ctx context.Context, id int64, until time.Time, reason string) (bool, error)
+}
+
+type openAIRefreshCooldownCache interface {
+	DeleteOpenAIRefreshCooldownIfObserved(ctx context.Context, id int64, until time.Time, reason string) error
+}
+
+type openAIRefreshRuntimeBlocker interface {
+	peekOpenAIAccountRuntimeBlock(*Account) openAIAccountRuntimeBlockSnapshot
+	clearOpenAIAccountRuntimeBlockIfUnchanged(int64, openAIAccountRuntimeBlockSnapshot)
+}
+
 // TokenRefreshService OAuth token自动刷新服务
 // 定期检查并刷新即将过期的token
 type TokenRefreshService struct {
@@ -838,6 +851,10 @@ func (s *TokenRefreshService) refreshWithRetryWithRateGate(
 ) error {
 	var lastErr error
 	maxRetries := s.maxRetries()
+	var originalBlock openAIAccountRuntimeBlockSnapshot
+	if blocker, ok := s.runtimeBlocker.(openAIRefreshRuntimeBlocker); ok && account.IsOpenAIOAuth() {
+		originalBlock = blocker.peekOpenAIAccountRuntimeBlock(account)
+	}
 
 	for attempt := 1; attempt <= maxRetries; attempt++ {
 		if err := ctx.Err(); err != nil {
@@ -864,6 +881,7 @@ func (s *TokenRefreshService) refreshWithRetryWithRateGate(
 		var err error
 		shortCircuit := false
 		credentialsPersisted := false
+		var attemptedCooldown refreshCredentialCooldown
 
 		// 优先使用统一 API（带分布式锁 + DB 重读保护）
 		if s.refreshAPI != nil && executor != nil {
@@ -890,11 +908,13 @@ func (s *TokenRefreshService) refreshWithRetryWithRateGate(
 				shortCircuit = true
 			} else {
 				credentialsPersisted = result.NewCredentials != nil
+				attemptedCooldown = result.attemptedCooldown
 				_ = result.NewCredentials // 统一 API 已设置 _token_version 并更新 DB，无需重复操作
 			}
 		} else {
 			// 降级：直接调用 refresher（兼容旧路径）
 			attemptedAccount := snapshotOAuthRefreshAccount(account)
+			attemptedCooldown = credentialCooldownBeforeRefresh(attemptedAccount)
 			releaseRate := func() {}
 			if acquireRate != nil {
 				releaseRate, err = acquireRate(attemptCtx)
@@ -959,7 +979,7 @@ func (s *TokenRefreshService) refreshWithRetryWithRateGate(
 				s.postRefreshStateSyncWithCleanup(ctx, account)
 				return nil
 			}
-			s.postRefreshActions(ctx, account)
+			s.postRefreshActions(ctx, account, attemptedCooldown, originalBlock)
 			return nil
 		}
 		if ctxErr := ctx.Err(); ctxErr != nil {
@@ -1168,7 +1188,7 @@ func (s *TokenRefreshService) retryBackoff(accountID int64, attempt int) time.Du
 }
 
 // postRefreshActions 刷新成功后的后续动作（清除错误状态、缓存失效、调度器同步等）
-func (s *TokenRefreshService) postRefreshActions(ctx context.Context, account *Account) {
+func (s *TokenRefreshService) postRefreshActions(ctx context.Context, account *Account, attemptedCooldown refreshCredentialCooldown, originalBlock openAIAccountRuntimeBlockSnapshot) {
 	s.clearAntigravityForceTokenRefresh(ctx, account, "success")
 
 	// Antigravity 账户：如果之前是因为缺少 project_id 而标记为 error，现在成功获取到了，清除错误状态
@@ -1186,7 +1206,9 @@ func (s *TokenRefreshService) postRefreshActions(ctx context.Context, account *A
 		}
 	}
 	// 刷新成功后清除临时不可调度状态（处理 OAuth 401 恢复场景）
-	if account.TempUnschedulableUntil != nil && time.Now().Before(*account.TempUnschedulableUntil) {
+	if account.IsOpenAIOAuth() {
+		s.clearOpenAIRefreshCooldown(ctx, account, attemptedCooldown, originalBlock)
+	} else if account.TempUnschedulableUntil != nil && time.Now().Before(*account.TempUnschedulableUntil) {
 		if clearErr := s.accountRepo.ClearTempUnschedulable(ctx, account.ID); clearErr != nil {
 			slog.Warn("token_refresh.clear_temp_unschedulable_failed",
 				"account_id", account.ID,
@@ -1217,6 +1239,30 @@ func (s *TokenRefreshService) postRefreshActions(ctx context.Context, account *A
 	}
 }
 
+func (s *TokenRefreshService) clearOpenAIRefreshCooldown(ctx context.Context, account *Account, observed refreshCredentialCooldown, originalBlock openAIAccountRuntimeBlockSnapshot) {
+	repo, ok := s.accountRepo.(openAIRefreshCooldownRepository)
+	if !ok || !observed.matches(account) || !time.Now().Before(observed.until) {
+		return
+	}
+	cleared, err := repo.ClearOpenAIRefreshCooldownIfObserved(ctx, account.ID, observed.until, observed.reason)
+	if err != nil {
+		slog.Warn("token_refresh.clear_temp_unschedulable_failed", "account_id", account.ID, "error", err)
+		return
+	}
+	if !cleared {
+		return
+	}
+	// PostgreSQL stores microseconds. The runtime CAS also checks the original generation and exact deadline.
+	if blocker, ok := s.runtimeBlocker.(openAIRefreshRuntimeBlocker); ok && originalBlock.blocked && originalBlock.until.Sub(observed.until).Abs() < time.Microsecond {
+		blocker.clearOpenAIAccountRuntimeBlockIfUnchanged(account.ID, originalBlock)
+	}
+	if cache, ok := s.tempUnschedCache.(openAIRefreshCooldownCache); ok {
+		if err := cache.DeleteOpenAIRefreshCooldownIfObserved(ctx, account.ID, observed.until, observed.reason); err != nil {
+			slog.Warn("token_refresh.clear_temp_unsched_cache_failed", "account_id", account.ID, "error", err)
+		}
+	}
+}
+
 func (s *TokenRefreshService) postRefreshStateSyncWithCleanup(parent context.Context, account *Account) {
 	cleanupParent := context.Background()
 	if parent != nil {
@@ -1240,7 +1286,9 @@ func (s *TokenRefreshService) postRefreshStateSync(ctx context.Context, account 
 		}
 	}
 	// 同步更新调度器缓存，确保调度获取的 Account 对象包含最新的 credentials
-	if s.schedulerCache != nil {
+	// OpenAI credential writes and cooldown clears already publish the durable row.
+	// Replaying our snapshot here can overwrite a later cooldown from another worker.
+	if s.schedulerCache != nil && !account.IsOpenAIOAuth() {
 		if err := s.schedulerCache.SetAccount(ctx, account); err != nil {
 			slog.Warn("token_refresh.sync_scheduler_cache_failed",
 				"account_id", account.ID,

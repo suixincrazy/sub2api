@@ -36,6 +36,7 @@ type GrokOAuthRefreshSuccessRepository interface {
 }
 
 type OpenAIOAuthRefreshSuccessRepository interface {
+	// A successful write publishes the durable account to the scheduler.
 	UpdateOpenAIOAuthCredentialsIfUnchanged(ctx context.Context, id int64, expectedCredentials map[string]any, expectedProxyID *int64, credentials map[string]any) (bool, error)
 }
 
@@ -115,6 +116,32 @@ type OAuthRefreshResult struct {
 	NewCredentials map[string]any // 刷新后的 credentials（nil 表示未刷新）
 	Account        *Account       // 成功时为最新 account；刷新错误时为实际尝试的凭据快照
 	LockHeld       bool           // 锁被其他 worker 持有（未执行刷新）
+
+	attemptedCooldown refreshCredentialCooldown
+}
+
+// Only cooldowns caused by the old credentials can be resolved by rotating them.
+type refreshCredentialCooldown struct {
+	until  time.Time
+	reason string
+}
+
+func credentialCooldownBeforeRefresh(account *Account) refreshCredentialCooldown {
+	if account == nil || !account.IsOpenAIOAuth() || account.TempUnschedulableUntil == nil {
+		return refreshCredentialCooldown{}
+	}
+	reason := account.TempUnschedulableReason
+	switch {
+	case reason == "Authentication failed (401): invalid or expired credentials", strings.HasPrefix(reason, "OAuth 401: "),
+		reason == "token refresh retry exhausted", strings.HasPrefix(reason, "token refresh retry exhausted: "):
+		return refreshCredentialCooldown{until: *account.TempUnschedulableUntil, reason: reason}
+	}
+	return refreshCredentialCooldown{}
+}
+
+func (c refreshCredentialCooldown) matches(account *Account) bool {
+	return !c.until.IsZero() && account != nil && account.TempUnschedulableUntil != nil &&
+		c.until.Equal(*account.TempUnschedulableUntil) && c.reason == account.TempUnschedulableReason
 }
 
 func snapshotOAuthRefreshAccount(account *Account) *Account {
@@ -274,6 +301,7 @@ func (api *OAuthRefreshAPI) RefreshIfNeeded(
 
 	// 4. 执行平台特定刷新逻辑
 	attemptedAccount := snapshotOAuthRefreshAccount(freshAccount)
+	attemptedCooldown := credentialCooldownBeforeRefresh(attemptedAccount)
 	newCredentials, refreshErr := executor.Refresh(ctx, freshAccount)
 	if refreshErr == nil && hasOpenAIRefreshCredentials(attemptedAccount, newCredentials) {
 		// The upstream rotation is irreversible. Cancellation of optional
@@ -289,7 +317,7 @@ func (api *OAuthRefreshAPI) RefreshIfNeeded(
 		if persistErr != nil {
 			return nil, persistErr
 		}
-		result := &OAuthRefreshResult{Refreshed: applied, Account: durableAccount}
+		result := &OAuthRefreshResult{Refreshed: applied, Account: durableAccount, attemptedCooldown: attemptedCooldown}
 		if applied {
 			result.NewCredentials = newCredentials
 		}

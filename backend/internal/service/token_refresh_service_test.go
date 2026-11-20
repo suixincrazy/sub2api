@@ -48,6 +48,9 @@ type tokenRefreshAccountRepo struct {
 	setTempUnschedErr            error
 	beforeConditionalState       func()
 	openAISuccessCASCalls        int
+	onOpenAIStateWrite           func(*Account)
+	beforeOpenAICooldownClear    func()
+	clearCooldownErr             error
 	openAIPersistCtxErr          error
 	openAIPersistDeadline        time.Time
 }
@@ -112,6 +115,13 @@ func (r *tokenRefreshAccountRepo) SetError(ctx context.Context, id int64, errorM
 
 func (r *tokenRefreshAccountRepo) ClearTempUnschedulable(ctx context.Context, id int64) error {
 	r.clearTempCalls++
+	if account := r.accountsByID[id]; account != nil {
+		account.TempUnschedulableUntil = nil
+		account.TempUnschedulableReason = ""
+		if r.onOpenAIStateWrite != nil {
+			r.onOpenAIStateWrite(account)
+		}
+	}
 	return nil
 }
 
@@ -119,6 +129,20 @@ func (r *tokenRefreshAccountRepo) SetTempUnschedulable(ctx context.Context, id i
 	r.setTempUnschedCalls++
 	r.lastTempUnschedReason = reason
 	return r.setTempUnschedErr
+}
+
+func (r *tokenRefreshAccountRepo) ClearOpenAIRefreshCooldownIfObserved(ctx context.Context, id int64, until time.Time, reason string) (bool, error) {
+	if r.beforeOpenAICooldownClear != nil {
+		r.beforeOpenAICooldownClear()
+	}
+	if r.clearCooldownErr != nil {
+		return false, r.clearCooldownErr
+	}
+	account := r.accountsByID[id]
+	if account.TempUnschedulableUntil == nil || !account.TempUnschedulableUntil.Equal(until) || account.TempUnschedulableReason != reason {
+		return false, nil
+	}
+	return true, r.ClearTempUnschedulable(ctx, id)
 }
 
 func (r *tokenRefreshAccountRepo) SetGrokCredentialErrorIfMatch(
@@ -282,6 +306,9 @@ func (r *tokenRefreshAccountRepo) UpdateOpenAIOAuthCredentialsIfUnchanged(
 	r.updateCredentialsCalls++
 	account.Credentials = shallowCopyMap(credentials)
 	r.lastAccount = account
+	if r.onOpenAIStateWrite != nil {
+		r.onOpenAIStateWrite(account)
+	}
 	return true, nil
 }
 
@@ -344,10 +371,11 @@ func (r *tokenRefreshAccountRepo) UpdateExtra(ctx context.Context, id int64, upd
 }
 
 type tokenCacheInvalidatorStub struct {
-	calls       int
-	err         error
-	ctxErr      error
-	lastAccount *Account
+	calls        int
+	err          error
+	ctxErr       error
+	lastAccount  *Account
+	onInvalidate func()
 }
 
 type tokenRefreshRuntimeBlocker struct {
@@ -367,6 +395,9 @@ func (s *tokenCacheInvalidatorStub) InvalidateToken(ctx context.Context, account
 	s.calls++
 	s.ctxErr = ctx.Err()
 	s.lastAccount = snapshotOAuthRefreshAccount(account)
+	if s.onInvalidate != nil {
+		s.onInvalidate()
+	}
 	return s.err
 }
 
@@ -385,9 +416,10 @@ func (s *tokenRefreshSchedulerCache) SetAccount(ctx context.Context, account *Ac
 }
 
 type tempUnschedCacheStub struct {
-	deleteCalls int
-	setCalls    int
-	lastState   *TempUnschedState
+	deleteCalls      int
+	conditionalCalls int
+	setCalls         int
+	lastState        *TempUnschedState
 }
 
 func (s *tempUnschedCacheStub) SetTempUnsched(ctx context.Context, accountID int64, state *TempUnschedState) error {
@@ -402,6 +434,15 @@ func (s *tempUnschedCacheStub) GetTempUnsched(ctx context.Context, accountID int
 
 func (s *tempUnschedCacheStub) DeleteTempUnsched(ctx context.Context, accountID int64) error {
 	s.deleteCalls++
+	s.lastState = nil
+	return nil
+}
+
+func (s *tempUnschedCacheStub) DeleteOpenAIRefreshCooldownIfObserved(ctx context.Context, accountID int64, until time.Time, reason string) error {
+	s.conditionalCalls++
+	if s.lastState != nil && *s.lastState == (TempUnschedState{UntilUnix: until.Unix(), ErrorMessage: reason}) {
+		return s.DeleteTempUnsched(ctx, accountID)
+	}
 	return nil
 }
 
@@ -1241,6 +1282,127 @@ func TestTokenRefreshService_PersistedSuccessCrossingAttemptDeadlineStaysSuccess
 	require.False(t, state.isTripped(), "a durable success must not count toward the provider breaker")
 	require.Equal(t, "provider-refresh", repo.accountsByID[account.ID].GetGrokRefreshToken())
 	require.Equal(t, 1, scheduler.setAccountCalls)
+}
+
+func TestTokenRefreshService_OpenAIRotationCooldown(t *testing.T) {
+	const auth = "OAuth 401: expired"
+	const stream = `{"matched_keyword":"stream_timeout"}`
+	for _, unified := range []bool{true, false} {
+		for _, tc := range []struct {
+			name, initial, during, phase string
+			extend, clear, dbError       bool
+		}{
+			{name: "new stream cooldown", during: stream},
+			{name: "new credential cooldown", during: auth},
+			{name: "extended credential cooldown", initial: auth, during: auth, extend: true},
+			{name: "replaced reason at same deadline", initial: auth, during: stream},
+			{name: "existing stream cooldown", initial: stream},
+			{name: "unchanged credential cooldown", initial: auth, clear: true},
+			{name: "cooldown after credential publication", during: stream, phase: "invalidate"},
+			{name: "reason replaced at DB clear", initial: auth, during: stream, phase: "clear"},
+			{name: "deadline extended at DB clear", initial: auth, during: auth, extend: true, phase: "clear"},
+			{name: "new cooldown after DB clear", initial: auth, during: stream, phase: "after clear"},
+			{name: "new runtime block before DB write", initial: auth, phase: "runtime", clear: true},
+			{name: "DB clear fails", initial: auth, dbError: true},
+			{name: "401 without upstream message", initial: "Authentication failed (401): invalid or expired credentials", clear: true},
+			{name: "refresh retry cooldown", initial: "token refresh retry exhausted: timeout", clear: true},
+		} {
+			t.Run(fmt.Sprintf("unified=%t/%s", unified, tc.name), func(t *testing.T) {
+				row := openAIRefreshTestAccount()
+				until := time.Now().UTC().Add(time.Hour).Truncate(time.Microsecond)
+				if tc.initial != "" {
+					row.TempUnschedulableUntil, row.TempUnschedulableReason = &until, tc.initial
+				}
+				repo := &tokenRefreshAccountRepo{snapshotReads: true}
+				repo.accountsByID = map[int64]*Account{row.ID: row}
+				if tc.dbError {
+					repo.clearCooldownErr = errors.New("outbox write failed")
+				}
+				scheduler, temp, tokens := &tokenRefreshSchedulerCache{}, &tempUnschedCacheStub{}, &tokenCacheInvalidatorStub{}
+				// The real repository publishes from both successful writes, including the clear.
+				repo.onOpenAIStateWrite = func(account *Account) {
+					require.NoError(t, scheduler.SetAccount(context.Background(), account))
+				}
+				blocker := &OpenAIGatewayService{}
+				if tc.initial != "" {
+					blocker.BlockAccountScheduling(row, until.Add(-120*time.Nanosecond), tc.initial)
+					temp.lastState = &TempUnschedState{UntilUnix: until.Unix(), ErrorMessage: tc.initial}
+				}
+				svc := &TokenRefreshService{accountRepo: repo, schedulerCache: scheduler, tempUnschedCache: temp, cacheInvalidator: tokens, runtimeBlocker: blocker}
+				if unified {
+					svc.refreshAPI = NewOAuthRefreshAPI(repo, nil)
+				}
+				// The candidate and stored row must not alias: real repository reads are snapshots.
+				candidate := snapshotOAuthRefreshAccount(row)
+				end := until
+				if tc.extend {
+					end = end.Add(time.Hour)
+				}
+				applyCooldown := func() {
+					if tc.during != "" {
+						row.TempUnschedulableUntil, row.TempUnschedulableReason = &end, tc.during
+						blocker.BlockAccountScheduling(row, end.Add(120*time.Nanosecond), tc.during)
+						repo.onOpenAIStateWrite(row)
+					}
+					temp.lastState = &TempUnschedState{UntilUnix: end.Unix(), ErrorMessage: row.TempUnschedulableReason}
+				}
+				refresher := &refreshAPIExecutorStub{
+					needsRefresh: true,
+					credentials:  map[string]any{"access_token": "rotated-access", "refresh_token": "rotated-refresh"},
+				}
+				switch tc.phase {
+				case "runtime":
+					refresher.onRefresh = func() {
+						blocker.BlockAccountScheduling(row, until.Add(-120*time.Nanosecond), stream)
+					}
+				case "invalidate":
+					tokens.onInvalidate = applyCooldown
+				case "clear":
+					repo.beforeOpenAICooldownClear = applyCooldown
+				case "after clear":
+					publish := repo.onOpenAIStateWrite
+					repo.onOpenAIStateWrite = func(account *Account) {
+						publish(account)
+						if account.TempUnschedulableUntil == nil {
+							repo.onOpenAIStateWrite = publish
+							applyCooldown()
+						}
+					}
+				default:
+					refresher.onRefresh = applyCooldown
+				}
+				require.NoError(t, svc.refreshWithRetry(context.Background(), candidate, refresher, refresher, time.Hour))
+				require.Equal(t, 1, refresher.refreshCalls)
+				require.Equal(t, 1, tokens.calls)
+				require.NotNil(t, scheduler.lastAccount)
+				for _, account := range []*Account{row, scheduler.lastAccount} {
+					require.Equal(t, "rotated-refresh", account.GetOpenAIRefreshToken())
+					if tc.clear {
+						require.Nil(t, account.TempUnschedulableUntil)
+						require.Empty(t, account.TempUnschedulableReason)
+					} else {
+						require.Equal(t, &end, account.TempUnschedulableUntil)
+						require.Equal(t, firstNonEmpty(tc.during, tc.initial), account.TempUnschedulableReason)
+					}
+				}
+				if tc.clear {
+					require.Equal(t, tc.phase == "runtime", blocker.isOpenAIAccountRuntimeBlocked(row))
+					require.Nil(t, temp.lastState)
+				} else {
+					if tc.phase == "after clear" {
+						require.Equal(t, 1, repo.clearTempCalls)
+					} else {
+						require.Zero(t, repo.clearTempCalls)
+						require.Zero(t, temp.conditionalCalls, "a failed or skipped DB clear must not ask Redis to delete")
+					}
+					require.True(t, blocker.isOpenAIAccountRuntimeBlocked(row))
+					require.Zero(t, temp.deleteCalls)
+					require.NotNil(t, temp.lastState)
+					require.Equal(t, row.TempUnschedulableReason, temp.lastState.ErrorMessage)
+				}
+			})
+		}
+	}
 }
 
 func TestTokenRefreshService_OpenAIRotationSurvivesAttemptDeadline(t *testing.T) {

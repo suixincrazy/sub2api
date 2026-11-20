@@ -2,14 +2,15 @@ package service
 
 import (
 	"context"
-	"slices"
 	"strings"
 )
 
 func (s *GatewayService) ExpandAnthropicLongContextModels(ctx context.Context, group *Group, models []string) []string {
 	var accounts []Account
 	var err error
+	var governedAccountIDs map[int64]struct{}
 	if group != nil {
+		governedAccountIDs = group.GetRoutingGovernedAccountIDs()
 		accounts, err = s.accountRepo.ListSchedulableByGroupID(ctx, group.ID)
 	} else {
 		accounts, err = s.accountRepo.ListSchedulable(ctx)
@@ -32,7 +33,7 @@ func (s *GatewayService) ExpandAnthropicLongContextModels(ctx context.Context, g
 		}
 		for _, account := range accounts {
 			if !account.IsAnthropic() || !account.IsModelSupported(model) ||
-				(len(routedAccountIDs) > 0 && !slices.Contains(routedAccountIDs, account.ID)) {
+				!modelRoutingAllowsAccount(routedAccountIDs, governedAccountIDs, account.ID) {
 				continue
 			}
 			metadata, ok := account.GetUpstreamModelMetadata(account.GetMappedModel(model))

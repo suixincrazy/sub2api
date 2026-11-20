@@ -119,6 +119,90 @@ func codexOAuthToolSearchAccount() *Account {
 	}
 }
 
+func countMessagesToolSearch(t *testing.T, account *Account, body, fallbackModel string, status int, reply string) (*httpUpstreamRecorder, int64) {
+	t.Helper()
+	upstream := &httpUpstreamRecorder{resp: &http.Response{
+		StatusCode: status, Header: http.Header{"Content-Type": {"application/json"}},
+		Body: io.NopCloser(strings.NewReader(reply)),
+	}}
+	svc := &OpenAIGatewayService{cfg: rawChatCompletionsTestConfig(), httpUpstream: upstream}
+	rec := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(rec)
+	c.Request = httptest.NewRequest(http.MethodPost, "/v1/messages/count_tokens", strings.NewReader(body))
+	require.NoError(t, svc.ForwardCountTokensAsAnthropic(c.Request.Context(), c, account, []byte(body), fallbackModel))
+	require.Equal(t, http.StatusOK, rec.Code, rec.Body.String())
+	require.Len(t, upstream.requests, 1)
+	tokens := gjson.GetBytes(rec.Body.Bytes(), "input_tokens")
+	require.Equal(t, gjson.Number, tokens.Type)
+	return upstream, tokens.Int()
+}
+
+func TestCountTokensMatchesMessagesToolSearch(t *testing.T) {
+	for _, tc := range []struct {
+		name, target, forced string
+		apiKey, native       bool
+	}{
+		{name: "mapped model with native search", target: "gpt-6-astra", native: true},
+		{name: "mapped model without native search", target: "gpt-5.4"},
+		{name: "non-Codex API key", target: "gpt-6-astra", apiKey: true},
+		{name: "forced deferred tool", target: "gpt-6-astra", forced: "WebFetch"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			account := codexOAuthToolSearchAccount()
+			countURL := openaiPlatformAPIInputTokensURL
+			if tc.apiKey {
+				account = rawChatCompletionsTestAccount()
+				countURL = "http://upstream.example/v1/responses/input_tokens"
+			}
+			account.Credentials["model_mapping"] = map[string]any{"public-alias": tc.target}
+			body := strings.Replace(messagesToolSearchBody, `"model":"gpt-6-astra"`, `"model":"public-alias"`, 1)
+			if tc.forced != "" {
+				body = strings.Replace(body, `"tools":[`, `"tool_choice":{"type":"tool","name":"`+tc.forced+`"},"tools":[`, 1)
+			}
+			generation, _ := forwardMessagesToolSearch(t, account, body, toolSearchNoopSSE, "gpt-6.2-sol")
+			count, tokens := countMessagesToolSearch(t, account, body, "gpt-6.2-sol", http.StatusOK, `{"input_tokens":42}`)
+			require.EqualValues(t, 42, tokens)
+			require.Equal(t, countURL, count.lastReq.URL.String())
+			for _, payload := range [][]byte{generation.lastBody, count.lastBody} {
+				require.Equal(t, tc.target, gjson.GetBytes(payload, "model").String())
+				if tc.forced != "" {
+					require.Equal(t, tc.forced, gjson.GetBytes(payload, "tool_choice.name").String())
+				}
+				tools := gjson.GetBytes(payload, "tools")
+				require.Equal(t, tc.native, tools.Get(`#(type=="tool_search")`).Exists())
+				require.Equal(t, !tc.native, tools.Get(`#(name=="WebFetch")`).Exists())
+				input := gjson.GetBytes(payload, "input")
+				require.Equal(t, tc.native, input.Get(`#(type=="tool_search_call")`).Exists())
+				require.Equal(t, tc.native, input.Get(`#(type=="tool_search_output").tools.#(name=="WebFetch")`).Exists())
+			}
+		})
+	}
+}
+
+func TestCountTokensToolSearchLocalFallback(t *testing.T) {
+	account := codexOAuthToolSearchAccount()
+	estimate := func(body string) int64 {
+		_, tokens := countMessagesToolSearch(t, account, body, "", http.StatusForbidden,
+			`{"error":{"code":"missing_scope","message":"Missing scopes: api.responses.write"}}`)
+		require.Greater(t, tokens, int64(1))
+		return tokens
+	}
+	// Keep the history and top-level tools fixed while varying a deferred schema.
+	withoutReveal := strings.Replace(messagesToolSearchBody, `"tool_name":"WebFetch"`, `"tool_name":"Other"`, 1)
+	largerSchema := func(body string) string {
+		return strings.Replace(body, `"description":"fetch a url"`, `"description":"`+strings.Repeat("additional details ", 100)+`"`, 1)
+	}
+	require.Equal(t, estimate(withoutReveal), estimate(largerSchema(withoutReveal)))
+	require.Greater(t, estimate(largerSchema(messagesToolSearchBody)), estimate(messagesToolSearchBody))
+
+	// An object-valued tool_search_call must not make the estimator count an accompanying image as raw base64.
+	withImage := func(data string) string {
+		return strings.Replace(messagesToolSearchBody, `"content":"fetch the page"`,
+			`"content":[{"type":"image","source":{"type":"base64","media_type":"image/png","data":"`+data+`"}}]`, 1)
+	}
+	require.Equal(t, estimate(withImage("AAAA")), estimate(withImage(strings.Repeat("AAAA", 256))))
+}
+
 const toolSearchNoopSSE = "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_noop\",\"status\":\"completed\",\"output\":[],\"usage\":{\"input_tokens\":5,\"output_tokens\":2,\"total_tokens\":7}}}\n\n"
 
 // A revealed tool is declared in tool_search_output and replayed as a

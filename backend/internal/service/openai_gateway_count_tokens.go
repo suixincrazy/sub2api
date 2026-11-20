@@ -446,11 +446,10 @@ func prepareOpenAIInputTokensCountRequest(
 	billingModel := resolveOpenAIForwardModel(account, normalizedModel, strings.TrimSpace(defaultMappedModel))
 	upstreamModel := normalizeOpenAIModelForUpstream(account, billingModel)
 
-	responsesReq, err := apicompat.AnthropicToResponsesWithOptions(&anthropicReq, apicompat.AnthropicToResponsesOptions{
-		DeferReasoningEffortValidation: true,
-	})
+	anthropicReq.Model = upstreamModel
+	responsesReq, err := convertOpenAIMessagesToResponses(account, &anthropicReq, 0)
 	if err != nil {
-		return nil, fmt.Errorf("convert anthropic request to responses: %w", err)
+		return nil, err
 	}
 
 	return &openAIInputTokensCountPrepared{
@@ -662,6 +661,25 @@ func estimateOpenAIInputTokens(req openAIInputTokensCountRequest) (int, error) {
 	return total, nil
 }
 
+// Native search calls have object arguments, and search outputs carry revealed schemas.
+// Keep their JSON for estimation so ordinary items still use the text/image counting rules.
+type openAIInputTokensItem struct {
+	apicompat.ResponsesInputItem
+	nativeToolSearch string
+}
+
+func (item *openAIInputTokensItem) UnmarshalJSON(raw []byte) error {
+	switch gjson.GetBytes(raw, "type").String() {
+	case "tool_search_call", "tool_search_output":
+		compacted, err := compactOpenAIInputTokensJSON(raw)
+		item.nativeToolSearch = compacted
+		return err
+	default:
+		item.nativeToolSearch = ""
+		return item.ResponsesInputItem.UnmarshalJSON(raw)
+	}
+}
+
 func estimateOpenAIInputTokensForInput(codec tokenizer.Codec, raw json.RawMessage) (int, error) {
 	if len(bytes.TrimSpace(raw)) == 0 {
 		return 0, nil
@@ -672,7 +690,7 @@ func estimateOpenAIInputTokensForInput(codec tokenizer.Codec, raw json.RawMessag
 		return codec.Count(plainText)
 	}
 
-	var items []apicompat.ResponsesInputItem
+	var items []openAIInputTokensItem
 	if err := json.Unmarshal(raw, &items); err == nil {
 		return estimateOpenAIInputTokensForInputItems(codec, items)
 	}
@@ -684,7 +702,7 @@ func estimateOpenAIInputTokensForInput(codec tokenizer.Codec, raw json.RawMessag
 	return codec.Count(compacted)
 }
 
-func estimateOpenAIInputTokensForInputItems(codec tokenizer.Codec, items []apicompat.ResponsesInputItem) (int, error) {
+func estimateOpenAIInputTokensForInputItems(codec tokenizer.Codec, items []openAIInputTokensItem) (int, error) {
 	total := 0
 	countText := func(text string) error {
 		text = strings.TrimSpace(text)
@@ -701,6 +719,12 @@ func estimateOpenAIInputTokensForInputItems(codec tokenizer.Codec, items []apico
 
 	for _, item := range items {
 		total += openAIResponsesInputItemTokenOverhead
+		if item.nativeToolSearch != "" {
+			if err := countText(item.nativeToolSearch); err != nil {
+				return 0, err
+			}
+			continue
+		}
 		if err := countText(item.Role); err != nil {
 			return 0, err
 		}

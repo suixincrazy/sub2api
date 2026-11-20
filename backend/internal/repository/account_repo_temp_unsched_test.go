@@ -12,8 +12,73 @@ import (
 
 	sqlmock "github.com/DATA-DOG/go-sqlmock"
 	"github.com/Wei-Shaw/sub2api/internal/service"
+	"github.com/alicebob/miniredis/v2"
+	"github.com/redis/go-redis/v9"
 	"github.com/stretchr/testify/require"
 )
+
+func TestAccountRepository_ClearOpenAIRefreshCooldownIfObserved(t *testing.T) {
+	until := time.Now().UTC().Add(time.Hour).Truncate(time.Microsecond)
+	const reason = "OAuth 401: expired"
+	for _, tc := range []struct {
+		name    string
+		rows    rowsAffectedResult
+		err     error
+		cleared bool
+	}{
+		{name: "matched", rows: 1, cleared: true},
+		{name: "concurrent change"},
+		{name: "outbox failure", err: errors.New("outbox unavailable")},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			exec := &recordingSQLExecutor{result: tc.rows, err: tc.err}
+			repo := newAccountRepositoryWithSQL(nil, exec, nil)
+			cleared, err := repo.ClearOpenAIRefreshCooldownIfObserved(context.Background(), 42, until, reason)
+			require.ErrorIs(t, err, tc.err)
+			require.Equal(t, tc.cleared, cleared)
+			require.Len(t, exec.execQueries, 1)
+			query := normalizeSQLWhitespace(exec.execQueries[0])
+			require.Contains(t, query, "SET temp_unschedulable_until = NULL, temp_unschedulable_reason = NULL")
+			require.Contains(t, query, "WHERE id = $1 AND deleted_at IS NULL AND platform = $2 AND type = $3 AND parent_account_id IS NULL")
+			require.Contains(t, query, "AND temp_unschedulable_until = $4 AND temp_unschedulable_reason = $5 RETURNING id ) INSERT INTO scheduler_outbox")
+			require.Contains(t, query, "SELECT $6, id, NULL, NULL FROM cleared")
+			require.Equal(t, []any{int64(42), service.PlatformOpenAI, service.AccountTypeOAuth, until, reason, service.SchedulerOutboxEventAccountChanged}, exec.execArgs[0])
+		})
+	}
+}
+
+func TestDeleteOpenAIRefreshCooldownIfObserved(t *testing.T) {
+	server := miniredis.RunT(t)
+	client := redis.NewClient(&redis.Options{Addr: server.Addr()})
+	t.Cleanup(func() { _ = client.Close() })
+	store := NewTempUnschedCache(client).(*tempUnschedCache)
+	ctx := context.Background()
+	until := time.Now().Add(time.Hour)
+	observed := service.TempUnschedState{UntilUnix: until.Unix(), ErrorMessage: "OAuth 401: expired"}
+	for _, tc := range []struct {
+		name    string
+		current service.TempUnschedState
+		cleared bool
+	}{
+		{name: "unchanged", current: observed, cleared: true},
+		{name: "extended", current: service.TempUnschedState{UntilUnix: until.Unix() + 1, ErrorMessage: observed.ErrorMessage}},
+		{name: "replaced", current: service.TempUnschedState{UntilUnix: until.Unix(), ErrorMessage: "stream timeout"}},
+		{name: "different rule", current: service.TempUnschedState{UntilUnix: until.Unix(), ErrorMessage: observed.ErrorMessage, RuleIndex: 3}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			server.FlushAll()
+			require.NoError(t, store.SetTempUnsched(ctx, 42, &tc.current))
+			require.NoError(t, store.DeleteOpenAIRefreshCooldownIfObserved(ctx, 42, until, observed.ErrorMessage))
+			state, err := store.GetTempUnsched(ctx, 42)
+			require.NoError(t, err)
+			if tc.cleared {
+				require.Nil(t, state)
+			} else {
+				require.Equal(t, &tc.current, state)
+			}
+		})
+	}
+}
 
 func TestAccountRepository_SetTempUnschedulable_NoRowsAffectedDoesNotWriteOutbox(t *testing.T) {
 	exec := &recordingSQLExecutor{result: rowsAffectedResult(0)}

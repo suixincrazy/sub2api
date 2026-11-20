@@ -2712,6 +2712,33 @@ func (r *accountRepository) SetGrokCredentialTempUnschedulableIfMatch(
 	return true, nil
 }
 
+// ClearOpenAIRefreshCooldownIfObserved clears only the cooldown seen by the
+// refresh attempt. A concurrent extension or replacement produces no outbox event.
+func (r *accountRepository) ClearOpenAIRefreshCooldownIfObserved(ctx context.Context, id int64, until time.Time, reason string) (bool, error) {
+	if scoped := r.accountTransactionScope(ctx); scoped != r {
+		return scoped.ClearOpenAIRefreshCooldownIfObserved(ctx, id, until, reason)
+	}
+	result, err := r.sql.ExecContext(ctx, `
+		WITH cleared AS (
+			UPDATE accounts SET temp_unschedulable_until = NULL, temp_unschedulable_reason = NULL, updated_at = NOW()
+			WHERE id = $1 AND deleted_at IS NULL AND platform = $2 AND type = $3 AND parent_account_id IS NULL
+				AND temp_unschedulable_until = $4 AND temp_unschedulable_reason = $5
+			RETURNING id
+		)
+		INSERT INTO scheduler_outbox (event_type, account_id, group_id, payload)
+		SELECT $6, id, NULL, NULL FROM cleared
+	`, id, service.PlatformOpenAI, service.AccountTypeOAuth, until, reason, service.SchedulerOutboxEventAccountChanged)
+	if err != nil {
+		return false, err
+	}
+	affected, err := result.RowsAffected()
+	if err != nil || affected == 0 {
+		return false, err
+	}
+	r.syncSchedulerAccountSnapshotDetached(ctx, id)
+	return true, nil
+}
+
 func (r *accountRepository) ClearTempUnschedulable(ctx context.Context, id int64) error {
 	if scoped := r.accountTransactionScope(ctx); scoped != r {
 		return scoped.ClearTempUnschedulable(ctx, id)

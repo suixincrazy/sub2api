@@ -21,6 +21,25 @@ import (
 	"go.uber.org/zap"
 )
 
+// Generation and token counting both use the selected account and its final upstream model
+// to decide whether deferred tools belong in the top-level tools or in tool_search_output.
+func convertOpenAIMessagesToResponses(account *Account, req *apicompat.AnthropicRequest, minOutputTokens int) (*apicompat.ResponsesRequest, error) {
+	out, err := apicompat.AnthropicToResponsesWithOptions(req, apicompat.AnthropicToResponsesOptions{
+		MinOutputTokens:                minOutputTokens,
+		DeferReasoningEffortValidation: true,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("convert anthropic to responses: %w", err)
+	}
+	if account.UsesOpenAICodexProtocol() && account.Platform != PlatformGrok &&
+		string(accountCodexToolCapabilities(account, req.Model)["supports_search_tool"]) == "true" {
+		if err := apicompat.ApplyNativeToolSearch(req, out); err != nil {
+			return nil, fmt.Errorf("apply native tool_search: %w", err)
+		}
+	}
+	return out, nil
+}
+
 // ForwardAsAnthropic accepts an Anthropic Messages request body, converts it
 // to OpenAI Responses API format, forwards to the OpenAI upstream, and converts
 // the response back to Anthropic Messages format. This enables Claude Code
@@ -167,12 +186,9 @@ func (s *OpenAIGatewayService) forwardAsAnthropicOnce(
 
 	// 3. Convert Anthropic → Responses after compatibility-only replay guard.
 	anthropicReq.Model = upstreamModel
-	responsesReq, err := apicompat.AnthropicToResponsesWithOptions(&anthropicReq, apicompat.AnthropicToResponsesOptions{
-		MinOutputTokens:                configuredMinOutputTokens(s.cfg),
-		DeferReasoningEffortValidation: true,
-	})
+	responsesReq, err := convertOpenAIMessagesToResponses(account, &anthropicReq, configuredMinOutputTokens(s.cfg))
 	if err != nil {
-		return nil, fmt.Errorf("convert anthropic to responses: %w", err)
+		return nil, err
 	}
 
 	// Upstream always uses streaming (upstream may not support sync mode).
@@ -185,17 +201,6 @@ func (s *OpenAIGatewayService) forwardAsAnthropicOnce(
 		responsesReq.ServiceTier = "priority"
 	}
 
-	// 3c. ChatGPT/Codex accounts whose model supports tool_search get Claude
-	// Code's ToolSearch as the native protocol, keeping deferred tools out of
-	// the top-level tools.
-	if account.UsesOpenAICodexProtocol() && account.Platform != PlatformGrok &&
-		string(accountCodexToolCapabilities(account, upstreamModel)["supports_search_tool"]) == "true" {
-		if err := apicompat.ApplyNativeToolSearch(&anthropicReq, responsesReq); err != nil {
-			return nil, fmt.Errorf("apply native tool_search: %w", err)
-		}
-	}
-
-	responsesReq.Model = upstreamModel
 	if responsesReq.Reasoning != nil {
 		responsesReq.Reasoning.Effort = openAICompatAnthropicReasoningEffort(&anthropicReq, upstreamModel, responsesReq.Reasoning.Effort)
 	}
