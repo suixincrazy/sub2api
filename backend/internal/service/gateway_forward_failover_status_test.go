@@ -33,13 +33,17 @@ func TestGatewayServiceShouldFailoverUpstreamError_Whitelist(t *testing.T) {
 	}
 }
 
-// 两条链路各有一份独立白名单，必须逐码一致，否则同一个上游状态码在
-// Anthropic 侧和 OpenAI 侧会得到相反的处理。
-func TestShouldFailoverUpstreamError_AnthropicAndOpenAIAgree(t *testing.T) {
+// OpenAI retries upstream 408s; all other status classifications stay aligned.
+func TestShouldFailoverUpstreamError_AnthropicAndOpenAIAgreeExceptRequestTimeout(t *testing.T) {
 	gw := &GatewayService{}
 	oa := &OpenAIGatewayService{}
 
 	for code := 200; code <= 599; code++ {
+		if code == http.StatusRequestTimeout {
+			assert.True(t, oa.shouldFailoverUpstreamError(code))
+			assert.False(t, gw.shouldFailoverUpstreamError(code))
+			continue
+		}
 		assert.Equal(t, oa.shouldFailoverUpstreamError(code), gw.shouldFailoverUpstreamError(code),
 			"status %d classified differently by the two gateways", code)
 	}

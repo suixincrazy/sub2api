@@ -61,6 +61,19 @@ func TestPairCodexContextCallOutputsDesktopShape(t *testing.T) {
 	require.True(t, service.AnalyzeToolCallOutputContextCoverageBytes(got).ContextCoversAllCallIDs)
 }
 
+func TestPairCodexContextCallOutputsKeepsIDEContextInToolRole(t *testing.T) {
+	body := codexContextBody(`{"type":"function_call_output","namespace":"agent","name":"ide_context","output":"Active file: main.go"}`, codexUserItem)
+	got, paired := pairCodexContextCallOutputs(body)
+	require.Equal(t, 1, paired)
+	input := gjson.GetBytes(got, "input").Array()
+	require.Len(t, input, 3)
+	require.Equal(t, "ide_context", input[0].Get("name").String())
+	require.Equal(t, "function_call_output", input[1].Get("type").String())
+	require.Equal(t, "Active file: main.go", input[1].Get("output").String())
+	require.Equal(t, input[0].Get("call_id").String(), input[1].Get("call_id").String())
+	require.True(t, service.AnalyzeToolCallOutputContextCoverageBytes(got).ContextCoversAllCallIDs)
+}
+
 func TestPairCodexContextCallOutputsDeterministicAndIdempotent(t *testing.T) {
 	body := codexContextBody(codexOpenPageItem, codexSelectedPageItem, codexUserItem)
 	first, paired := pairCodexContextCallOutputs(body)

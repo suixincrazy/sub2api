@@ -60,7 +60,7 @@ func (s *GatewayService) shouldRetryUpstreamError(account *Account, statusCode i
 //   - 402：中转站欠费 / 额度耗尽，纯账号级状态。
 //
 // 400/404 保持终态：它们由请求本身决定，换号只会把同一个错误重放 N 遍。
-// 这份名单必须与 OpenAIGatewayService.shouldFailoverUpstreamError 一致——两条链路
+// 除 OpenAI 对上游 408 单独换号外，其余状态与 OpenAIGatewayService 保持一致。两条链路
 // 各有一份独立白名单，历史上就是因为只补了 OpenAI 侧，Anthropic 侧的 405 一直落到
 // handleErrorResponse 返回裸 error，handler 的 errors.As 匹配不到 UpstreamFailoverError，
 // 账号既不进 FailedAccountIDs 也不推进 SwitchCount，于是低优先级档永远轮不到。
