@@ -51,7 +51,8 @@ func TestDeleteOpenAIRefreshCooldownIfObserved(t *testing.T) {
 	server := miniredis.RunT(t)
 	client := redis.NewClient(&redis.Options{Addr: server.Addr()})
 	t.Cleanup(func() { _ = client.Close() })
-	store := NewTempUnschedCache(client).(*tempUnschedCache)
+	store, ok := NewTempUnschedCache(client).(*tempUnschedCache)
+	require.True(t, ok)
 	ctx := context.Background()
 	until := time.Now().Add(time.Hour)
 	observed := service.TempUnschedState{UntilUnix: until.Unix(), ErrorMessage: "OAuth 401: expired"}

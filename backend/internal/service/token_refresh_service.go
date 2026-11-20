@@ -851,6 +851,8 @@ func (s *TokenRefreshService) refreshWithRetryWithRateGate(
 ) error {
 	var lastErr error
 	maxRetries := s.maxRetries()
+	// Lock acquisition and retries can reread a cooldown installed after this refresh began.
+	originalCooldown := credentialCooldownBeforeRefresh(account)
 	var originalBlock openAIAccountRuntimeBlockSnapshot
 	if blocker, ok := s.runtimeBlocker.(openAIRefreshRuntimeBlocker); ok && account.IsOpenAIOAuth() {
 		originalBlock = blocker.peekOpenAIAccountRuntimeBlock(account)
@@ -914,7 +916,6 @@ func (s *TokenRefreshService) refreshWithRetryWithRateGate(
 		} else {
 			// 降级：直接调用 refresher（兼容旧路径）
 			attemptedAccount := snapshotOAuthRefreshAccount(account)
-			attemptedCooldown = credentialCooldownBeforeRefresh(attemptedAccount)
 			releaseRate := func() {}
 			if acquireRate != nil {
 				releaseRate, err = acquireRate(attemptCtx)
@@ -927,6 +928,7 @@ func (s *TokenRefreshService) refreshWithRetryWithRateGate(
 			}
 			attemptTimedOut := errors.Is(attemptCtx.Err(), context.DeadlineExceeded) && ctx.Err() == nil
 			if err == nil && hasOpenAIRefreshCredentials(attemptedAccount, newCredentials) {
+				attemptedCooldown = credentialCooldownBeforeRefresh(attemptedAccount)
 				var durableAccount *Account
 				durableAccount, credentialsPersisted, err = persistOpenAIRefreshCredentials(attemptCtx, s.accountRepo, attemptedAccount, newCredentials)
 				if err == nil {
@@ -978,6 +980,9 @@ func (s *TokenRefreshService) refreshWithRetryWithRateGate(
 				// evidence. Publish cache state with a fresh cleanup context and stop.
 				s.postRefreshStateSyncWithCleanup(ctx, account)
 				return nil
+			}
+			if !originalCooldown.matches(account) {
+				attemptedCooldown = refreshCredentialCooldown{}
 			}
 			s.postRefreshActions(ctx, account, attemptedCooldown, originalBlock)
 			return nil

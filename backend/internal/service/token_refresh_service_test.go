@@ -1295,6 +1295,8 @@ func TestTokenRefreshService_OpenAIRotationCooldown(t *testing.T) {
 			{name: "new stream cooldown", during: stream},
 			{name: "new credential cooldown", during: auth},
 			{name: "extended credential cooldown", initial: auth, during: auth, extend: true},
+			{name: "new credential cooldown before locked reread", during: auth, phase: "before reread"},
+			{name: "credential cooldown extended during failed attempt", initial: auth, during: auth, extend: true, phase: "retry"},
 			{name: "replaced reason at same deadline", initial: auth, during: stream},
 			{name: "existing stream cooldown", initial: stream},
 			{name: "unchanged credential cooldown", initial: auth, clear: true},
@@ -1351,6 +1353,18 @@ func TestTokenRefreshService_OpenAIRotationCooldown(t *testing.T) {
 					credentials:  map[string]any{"access_token": "rotated-access", "refresh_token": "rotated-refresh"},
 				}
 				switch tc.phase {
+				case "before reread":
+					applyCooldown()
+				case "retry":
+					svc.cfg = &config.TokenRefreshConfig{MaxRetries: 2}
+					refresher.onRefresh = func() {
+						if refresher.refreshCalls == 1 {
+							applyCooldown()
+							refresher.err = errors.New("temporary refresh failure")
+						} else {
+							refresher.err = nil
+						}
+					}
 				case "runtime":
 					refresher.onRefresh = func() {
 						blocker.BlockAccountScheduling(row, until.Add(-120*time.Nanosecond), stream)
@@ -1372,7 +1386,11 @@ func TestTokenRefreshService_OpenAIRotationCooldown(t *testing.T) {
 					refresher.onRefresh = applyCooldown
 				}
 				require.NoError(t, svc.refreshWithRetry(context.Background(), candidate, refresher, refresher, time.Hour))
-				require.Equal(t, 1, refresher.refreshCalls)
+				wantCalls := 1
+				if tc.phase == "retry" {
+					wantCalls = 2
+				}
+				require.Equal(t, wantCalls, refresher.refreshCalls)
 				require.Equal(t, 1, tokens.calls)
 				require.NotNil(t, scheduler.lastAccount)
 				for _, account := range []*Account{row, scheduler.lastAccount} {
