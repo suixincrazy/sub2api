@@ -1913,9 +1913,10 @@ func (s *AccountUsageService) estimateSetupTokenUsage(account *Account) *UsageIn
 		}
 
 		info.FiveHour = &UsageProgress{
-			Utilization:      utilization,
-			ResetsAt:         account.SessionWindowEnd,
-			RemainingSeconds: remaining,
+			Utilization:        utilization,
+			UtilizationUnknown: !found,
+			ResetsAt:           account.SessionWindowEnd,
+			RemainingSeconds:   remaining,
 		}
 
 		// 窗口已过期（resetAt 在 now 之前）→ 额度已重置，归零；

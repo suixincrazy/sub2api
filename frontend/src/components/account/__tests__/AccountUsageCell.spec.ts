@@ -893,6 +893,30 @@ describe('AccountUsageCell', () => {
     expect(wrapper.text()).toContain('7d|36|900')
   })
 
+  it('only publishes the latest passive sample when the older request finishes last', async () => {
+    const sample = (utilization: number) => ({ five_hour: { utilization, resets_at: null, remaining_seconds: 0 } })
+    let finishOld!: (usage: AccountUsageInfo) => void
+    getUsage.mockReturnValueOnce(new Promise<AccountUsageInfo>(resolve => { finishOld = resolve }))
+      .mockResolvedValueOnce(sample(35))
+    const account = makeAccount({ id: 96763, platform: 'anthropic', type: 'setup-token' })
+    const newer = { ...account, extra: { session_window_utilization: 0.35 } }
+    const mountCell = (value: Account) => mount(AccountUsageCell, {
+      props: { account: value },
+      global: { stubs: { UsageProgressBar: { props: ['utilization'], template: '<div class="sample">{{ utilization }}</div>' }, ClaudeResetCreditsCell: true } }
+    })
+    const wrapper = mountCell(account)
+    await flushPromises()
+    await wrapper.setProps({ account: newer })
+    await flushPromises()
+    expect(wrapper.get('.sample').text()).toBe('35')
+    finishOld(sample(10))
+    await flushPromises()
+    expect(wrapper.get('.sample').text()).toBe('35')
+    expect(wrapper.emitted('usage-loaded')).toEqual([[sample(35)]])
+    expect(getUsage).toHaveBeenCalledTimes(2)
+    wrapper.unmount()
+  })
+
   it.each(['oauth', 'setup-token'] as const)('Claude %s 分别估算 5h 和 7d，不混用模型专属窗口费用', async (type) => {
     getUsage.mockResolvedValue({
       five_hour: {

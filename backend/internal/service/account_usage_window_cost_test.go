@@ -64,6 +64,18 @@ func TestAccountUsageService_ClaudeWindowCosts(t *testing.T) {
 	}
 }
 
+func TestClaudeWindowStatusWithoutUtilizationDoesNotProjectSpend(t *testing.T) {
+	reset := time.Now().UTC().Add(time.Hour)
+	acct := &Account{ID: 8513, Platform: PlatformAnthropic, Type: AccountTypeSetupToken, SessionWindowEnd: &reset, SessionWindowStatus: "allowed_warning"}
+	svc := &AccountUsageService{usageLogRepo: &windowCostRepo{}, cache: NewUsageCache()}
+	usage := svc.estimateSetupTokenUsage(acct)
+	svc.addWindowStats(t.Context(), acct, usage)
+	require.True(t, usage.FiveHour.UtilizationUnknown)
+	require.Equal(t, 1.0, usage.FiveHour.WindowStats.Cost)
+	acct.Extra = map[string]any{"session_window_utilization": 0.0}
+	require.False(t, svc.estimateSetupTokenUsage(acct).FiveHour.UtilizationUnknown)
+}
+
 func TestAccountUsageService_ClaudeWindowCostsMissingOrExpired(t *testing.T) {
 	now := time.Now()
 	expired, futureStart := now.Add(-time.Hour), now.Add(8*24*time.Hour)

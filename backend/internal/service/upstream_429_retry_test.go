@@ -240,6 +240,34 @@ func TestForward429RetriesSixTimesBeforeFreeze(t *testing.T) {
 	}
 }
 
+func TestOpenAIForward429Then408UsesFinalResponseWithoutFreezing(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		repo := &anthropicWindowLimitRepo{}
+		account := &Account{ID: 909, Platform: PlatformOpenAI, Type: AccountTypeAPIKey, Status: StatusActive, Schedulable: true, Concurrency: 1,
+			Credentials: map[string]any{"api_key": "test", "base_url": "https://api.example.invalid"}}
+		upstream := &retry429Upstream{t: t, repo: repo, accountID: account.ID, respond: func(call int, _ *http.Request) *http.Response {
+			status, message := http.StatusRequestTimeout, `{"error":{"message":"Request Timeout"}}`
+			if call == 1 {
+				status, message = http.StatusTooManyRequests, `{"error":{"type":"rate_limit_error","message":"slow down"}}`
+			}
+			return &http.Response{StatusCode: status, Header: make(http.Header), Body: io.NopCloser(strings.NewReader(message))}
+		}}
+		cfg := &config.Config{}
+		rl := NewRateLimitService(repo, nil, cfg, nil, nil)
+		svc := &OpenAIGatewayService{cfg: cfg, httpUpstream: upstream, rateLimitService: rl}
+		rl.SetAccountRuntimeBlocker(svc)
+		c, _ := newTransportFailoverTestContext(t)
+		_, err := svc.Forward(t.Context(), c, account, []byte(`{"model":"gpt-5.4","input":"hello","stream":false}`))
+		var failure *UpstreamFailoverError
+		require.ErrorAs(t, err, &failure)
+		require.Equal(t, http.StatusRequestTimeout, failure.StatusCode)
+		require.True(t, failure.ShouldRetryNextAccount())
+		require.Equal(t, 2, upstream.calls)
+		require.Zero(t, repo.rateLimitCalls)
+		require.False(t, svc.isOpenAIAccountRuntimeBlocked(account))
+	})
+}
+
 func TestForward429QuotaAndModelPoliciesAreDeferred(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	for _, scenario := range []string{"openai_quota", "anthropic_quota", "openai_temp_model", "anthropic_fable", "openai_spark", "openai_sse"} {
