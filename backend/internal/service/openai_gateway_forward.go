@@ -1079,6 +1079,7 @@ func (s *OpenAIGatewayService) forwardOnce(ctx context.Context, c *gin.Context, 
 	}
 
 	httpInvalidEncryptedContentRetryTried := false
+	multimodalSchemaRetryTried := false
 	compactModelFallbackRetried := false
 	agentTaskRecoveryTried := false
 	rejectedFieldRetryState := openAIResponsesRejectedFieldRetryStateForRequest(c, body)
@@ -1149,6 +1150,16 @@ func (s *OpenAIGatewayService) forwardOnce(ctx context.Context, c *gin.Context, 
 			upstreamMsg := strings.TrimSpace(extractUpstreamErrorMessage(respBody))
 			upstreamMsg = sanitizeUpstreamErrorMessage(upstreamMsg)
 			upstreamCode := extractUpstreamErrorCode(respBody)
+			if !multimodalSchemaRetryTried {
+				if retryBody, ok := prepareOpenAIMultimodalSchemaRetry(c, resp.StatusCode, body, respBody); ok {
+					multimodalSchemaRetryTried = true
+					body = retryBody
+					requestView = newOpenAIRequestView(body)
+					reqBody = nil
+					logger.LegacyPrintf("service.openai_gateway", "[OpenAI] Retrying tool schema multimodal false positive once (account_id=%d)", account.ID)
+					continue
+				}
+			}
 			if !agentTaskRecoveryTried && s.isAgentIdentityAccount(ctx, account) && isAgentIdentityTaskInvalidHTTPResponse(resp.StatusCode, respBody) {
 				agentTaskRecoveryTried = true
 				expectedTaskID := account.GetCredential("task_id")

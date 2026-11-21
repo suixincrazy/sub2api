@@ -14,6 +14,7 @@ type ResponsesClientToolMapping struct {
 	CustomTools    map[string]bool
 	ToolSearch     bool
 	NamespaceTools map[string]ResponsesNamespaceName
+	FieldAliases   ResponsesToolFieldAliases
 }
 
 // AdaptResponsesClientTools lowers Codex client-only tools in req to
@@ -473,11 +474,20 @@ func RestoreResponsesClientToolPayload(payload []byte, mapping ResponsesClientTo
 	if len(payload) == 0 {
 		return payload, false, nil
 	}
+	if !json.Valid(payload) {
+		return payload, false, fmt.Errorf("invalid Responses client tool payload")
+	}
 	var value any
-	if err := json.Unmarshal(payload, &value); err != nil {
+	decoder := json.NewDecoder(bytes.NewReader(payload))
+	decoder.UseNumber()
+	if err := decoder.Decode(&value); err != nil {
+		return payload, false, err
+	}
+	if err := restoreToolFieldValue(value, mapping.FieldAliases); err != nil {
 		return payload, false, err
 	}
 	changed := restoreClientToolValue(value, &mapping)
+	changed = changed || len(mapping.FieldAliases) > 0
 	if !changed {
 		if len(mapping.NamespaceTools) == 0 {
 			return payload, false, nil
@@ -539,11 +549,12 @@ func restoreClientToolValue(value any, adapter *ResponsesClientToolMapping) bool
 // It is intentionally stateful because custom tools need their function
 // arguments buffered until the upstream signals the call is complete.
 type ResponsesClientToolStreamRestorer struct {
-	adapter  ResponsesClientToolMapping
-	nextSeq  int
-	seenSeq  bool
-	calls    map[string]*responsesClientToolStreamCall
-	byOutput map[int]*responsesClientToolStreamCall
+	adapter    ResponsesClientToolMapping
+	nextSeq    int
+	seenSeq    bool
+	calls      map[string]*responsesClientToolStreamCall
+	byOutput   map[int]*responsesClientToolStreamCall
+	aliasCalls map[string]*responsesFieldAliasStreamCall
 }
 
 type responsesClientToolStreamCall struct {
@@ -659,6 +670,26 @@ func (r *ResponsesClientToolStreamRestorer) Restore(event ResponsesStreamEvent) 
 // completions can expand to multiple payloads and proxy argument deltas can be
 // intentionally dropped, hence the slice return value.
 func (r *ResponsesClientToolStreamRestorer) RestoreEvent(payload []byte) ([][]byte, bool, error) {
+	if len(r.adapter.FieldAliases) == 0 {
+		return r.restoreEvent(payload)
+	}
+	payloads, changed, err := r.restoreFieldAliasEvent(payload)
+	if err != nil {
+		return nil, false, err
+	}
+	var result [][]byte
+	for _, item := range payloads {
+		restored, itemChanged, err := r.restoreEvent(item)
+		if err != nil {
+			return nil, false, err
+		}
+		changed = changed || itemChanged
+		result = append(result, restored...)
+	}
+	return result, changed, nil
+}
+
+func (r *ResponsesClientToolStreamRestorer) restoreEvent(payload []byte) ([][]byte, bool, error) {
 	if len(payload) == 0 {
 		return nil, false, nil
 	}
@@ -764,7 +795,9 @@ func (r *ResponsesClientToolStreamRestorer) resequenceRaw(payload []byte, sequen
 		return [][]byte{payload}, false, nil
 	}
 	var raw map[string]any
-	if err := json.Unmarshal(payload, &raw); err != nil {
+	decoder := json.NewDecoder(bytes.NewReader(payload))
+	decoder.UseNumber()
+	if err := decoder.Decode(&raw); err != nil {
 		return nil, false, err
 	}
 	raw["sequence_number"] = r.nextSeq

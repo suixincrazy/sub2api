@@ -29,7 +29,7 @@ import (
 const openAIResponsesClientToolMappingContextKey = "openai_responses_client_tool_mapping"
 
 func hasOpenAIResponsesClientToolMapping(mapping apicompat.ResponsesClientToolMapping) bool {
-	return len(mapping.CustomTools) > 0 || mapping.ToolSearch || len(mapping.NamespaceTools) > 0
+	return hasResponsesClientToolMapping(mapping)
 }
 
 func adaptOpenAIResponsesClientTools(body []byte) ([]byte, apicompat.ResponsesClientToolMapping, error) {
@@ -351,6 +351,7 @@ func (s *OpenAIGatewayService) forwardOpenAIPassthrough(
 
 	agentTaskRecoveryTried := false
 	compactModelFallbackRetried := false
+	multimodalSchemaRetryTried := false
 	rejectedFieldRetryState := openAIResponsesRejectedFieldRetryStateForRequest(c, body)
 	var resp *http.Response
 	var usage *OpenAIUsage
@@ -386,6 +387,14 @@ func (s *OpenAIGatewayService) forwardOpenAIPassthrough(
 			probeBody := s.readUpstreamErrorBody(resp)
 			_ = resp.Body.Close()
 			resp.Body = io.NopCloser(bytes.NewReader(probeBody))
+			if !multimodalSchemaRetryTried {
+				if retryBody, ok := prepareOpenAIMultimodalSchemaRetry(c, resp.StatusCode, body, probeBody); ok {
+					multimodalSchemaRetryTried = true
+					body = retryBody
+					logger.LegacyPrintf("service.openai_gateway", "[OpenAI] Retrying tool schema multimodal false positive once (account_id=%d)", account.ID)
+					continue
+				}
+			}
 			if retryBody, reason, changed, retryErr := normalizeOpenAIResponsesRejectedFieldRetryBody(resp.StatusCode, body, probeBody); retryErr != nil {
 				return nil, fmt.Errorf("normalize passthrough rejected Responses field retry body: %w", retryErr)
 			} else if changed && rejectedFieldRetryState.Allow(retryBody) {
@@ -2415,16 +2424,16 @@ func (s *OpenAIGatewayService) handleNonStreamingResponsePassthrough(
 	if originalModel != "" && mappedModel != "" && originalModel != mappedModel {
 		body = s.replaceModelInResponseBody(body, mappedModel, originalModel)
 	}
+	body, err = restoreOpenAIResponsesClientToolPayload(c, body)
+	if err != nil {
+		return nil, fmt.Errorf("restore OpenAI Responses client tools: %w", err)
+	}
 	body, err = restoreOpenAIResponsesNamespacePayload(c, body)
 	if err != nil {
 		return nil, fmt.Errorf("restore OpenAI passthrough namespace response: %w", err)
 	}
 	body = restoreCodexToolNamesFromContext(c, body)
 	body = restoreOpenAIResponsesInstructionsEchoInResponse(c, body)
-	body, err = restoreOpenAIResponsesClientToolPayload(c, body)
-	if err != nil {
-		return nil, fmt.Errorf("restore OpenAI Responses client tools: %w", err)
-	}
 	if !writeOpenAICompactSSEBridge(c, resp.StatusCode, body) {
 		c.Data(resp.StatusCode, contentType, body)
 	}
