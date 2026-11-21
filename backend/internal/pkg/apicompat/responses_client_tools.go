@@ -700,7 +700,8 @@ func (r *ResponsesClientToolStreamRestorer) restoreEvent(payload []byte) ([][]by
 	if err := json.Unmarshal(payload, &wire); err != nil {
 		return nil, false, err
 	}
-	if isResponsesClientToolTerminalEvent(wire.Type) {
+	if isResponsesClientToolTerminalEvent(wire.Type) ||
+		(len(r.adapter.FieldAliases) > 0 && (wire.Type == "response.created" || wire.Type == "response.in_progress")) {
 		restored, changed, err := RestoreResponsesClientToolPayload(payload, r.adapter)
 		if err != nil {
 			return nil, false, err

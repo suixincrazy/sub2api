@@ -132,3 +132,14 @@ func TestOpenAIMultimodalSchemaCompatNamespacesAndMapping(t *testing.T) {
 	_, ok = openAIResponsesClientToolMapping(c)
 	require.False(t, ok)
 }
+
+func TestOpenAIMultimodalSchemaCompatRestoresToolsOnlyResponse(t *testing.T) {
+	body := []byte(`{"tools":[{"type":"function","name":"configure","parameters":{"type":"object","properties":{"audio":{"type":"string"}}}}]}`)
+	c := newOpenAIRejectedFieldTestContext(body)
+	adapted, ok := prepareOpenAIMultimodalSchemaRetry(c, 400, body, []byte(multimodalSchemaError))
+	require.True(t, ok)
+	restored, err := restoreOpenAIResponsesClientToolPayload(c, adapted)
+	require.NoError(t, err)
+	require.NotContains(t, string(restored), "__s2a_audio")
+	require.Equal(t, "string", gjson.GetBytes(restored, "tools.0.parameters.properties.audio.type").String())
+}

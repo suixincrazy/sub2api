@@ -269,20 +269,27 @@ func renameToolArguments(arguments string, names map[string]string) (string, err
 }
 
 func (a ResponsesToolFieldAliases) restore(name, arguments string) (string, error) {
-	names := a[name]
-	if len(names) == 0 {
+	if len(a[name]) == 0 {
 		return arguments, nil
 	}
+	return renameToolArguments(arguments, a.reverse(name))
+}
+
+func (a ResponsesToolFieldAliases) reverse(name string) map[string]string {
+	names := a[name]
 	reverse := make(map[string]string, len(names))
 	for original, alias := range names {
 		reverse[alias] = original
 	}
-	return renameToolArguments(arguments, reverse)
+	return reverse
 }
 
 func restoreToolFieldValue(value any, aliases ResponsesToolFieldAliases) error {
 	switch v := value.(type) {
 	case map[string]any:
+		if stringValue(v["type"]) == "function" && aliases[stringValue(v["name"])] != nil {
+			renameToolSchema(v["parameters"], aliases.reverse(stringValue(v["name"])))
+		}
 		if stringValue(v["type"]) == "function_call" && aliases[stringValue(v["name"])] != nil {
 			arguments, err := aliases.restore(stringValue(v["name"]), stringValue(v["arguments"]))
 			if err != nil {

@@ -121,3 +121,21 @@ func TestResponsesToolFieldAliasesRejectMalformedAndAmbiguousArguments(t *testin
 	require.NoError(t, err)
 	require.Equal(t, `{"__s2a_audio":"1"}`, value)
 }
+
+func TestResponsesToolFieldAliasesRestoreEchoedDeclarations(t *testing.T) {
+	mapping := ResponsesClientToolMapping{FieldAliases: ResponsesToolFieldAliases{"configure": {"audio": "__s2a_audio"}}}
+	response := `{"status":"completed","tools":[{"type":"function","name":"configure","parameters":{"type":"object","properties":{"__s2a_audio":{"type":"string"}},"required":["__s2a_audio"]}}],"output":[],"opaque":9007199254740993}`
+	restored, _, err := RestoreResponsesClientToolPayload([]byte(response), mapping)
+	require.NoError(t, err)
+	require.NotContains(t, string(restored), "__s2a_audio")
+	require.Contains(t, string(restored), "9007199254740993")
+	restorer := NewResponsesClientToolStreamRestorer(mapping)
+	for index, typ := range []string{"response.created", "response.in_progress", "response.completed"} {
+		payload := `{"type":"` + typ + `","sequence_number":` + strconv.Itoa(index) + `,"response":` + response + `}`
+		out, _, err := restorer.RestoreEvent([]byte(payload))
+		require.NoError(t, err)
+		require.Len(t, out, 1)
+		require.NotContains(t, string(out[0]), "__s2a_audio")
+		require.Contains(t, string(out[0]), "9007199254740993")
+	}
+}

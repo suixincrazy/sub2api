@@ -117,7 +117,7 @@ func clearOpenAIResponsesClientToolMapping(c *gin.Context) {
 
 func restoreOpenAIResponsesClientToolPayload(c *gin.Context, payload []byte) ([]byte, error) {
 	mapping, ok := openAIResponsesClientToolMapping(c)
-	if !ok || !bytes.Contains(payload, []byte(`"function_call"`)) || !json.Valid(payload) {
+	if !ok || (len(mapping.FieldAliases) == 0 && !bytes.Contains(payload, []byte(`"function_call"`))) || !json.Valid(payload) {
 		return payload, nil
 	}
 	restored, _, err := apicompat.RestoreResponsesClientToolPayload(payload, mapping)
