@@ -22,6 +22,10 @@ func prepareOpenAIMultimodalSchemaRetry(c *gin.Context, status int, body, failur
 	if !json.Valid(body) || decoder.Decode(&req) != nil {
 		return nil, false
 	}
+	// Compacted conversations can carry tool declarations in input items.
+	if _, err := liftResponsesAdditionalTools(req); err != nil {
+		return nil, false
+	}
 	// Flatten namespaces before building aliases so same-named tools in
 	// different namespaces retain separate reversible identities.
 	mapping, _, err := apicompat.AdaptResponsesClientTools(req)

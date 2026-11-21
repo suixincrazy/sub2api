@@ -143,3 +143,84 @@ func TestOpenAIMultimodalSchemaCompatRestoresToolsOnlyResponse(t *testing.T) {
 	require.NotContains(t, string(restored), "__s2a_audio")
 	require.Equal(t, "string", gjson.GetBytes(restored, "tools.0.parameters.properties.audio.type").String())
 }
+
+func TestOpenAIMultimodalSchemaCompatAdditionalToolsNamespaces(t *testing.T) {
+	body := []byte(`{"tools":[{"type":"custom","name":"exec"}],"input":[{"type":"additional_tools","role":"developer","tools":[{"type":"namespace","name":"browser","tools":[{"type":"function","name":"configure","parameters":{"type":"object","properties":{"audio":{"type":"string"}}}}]}]},{"type":"function_call","namespace":"browser","name":"configure","arguments":"{\"audio\":\"0\"}"}]}`)
+	c := newOpenAIRejectedFieldTestContext(body)
+	adapted, ok := prepareOpenAIMultimodalSchemaRetry(c, 400, body, []byte(multimodalSchemaError))
+	require.True(t, ok)
+	require.Len(t, gjson.GetBytes(adapted, "input").Array(), 1)
+	name := gjson.GetBytes(adapted, "tools.1.name").String()
+	require.NotEqual(t, "configure", name)
+	require.Equal(t, name, gjson.GetBytes(adapted, "input.0.name").String())
+	require.JSONEq(t, `{"__s2a_audio":"0"}`, gjson.GetBytes(adapted, "input.0.arguments").String())
+	response, err := sjson.Set(`{"output":[{"type":"function_call","name":"placeholder","arguments":"{\"__s2a_audio\":\"1\"}"},{"type":"function_call","name":"exec","arguments":"{\"input\":\"pwd\"}"}]}`, "output.0.name", name)
+	require.NoError(t, err)
+	restored, err := restoreOpenAIResponsesClientToolPayload(c, []byte(response))
+	require.NoError(t, err)
+	require.Equal(t, "browser", gjson.GetBytes(restored, "output.0.namespace").String())
+	require.Equal(t, "configure", gjson.GetBytes(restored, "output.0.name").String())
+	require.JSONEq(t, `{"audio":"1"}`, gjson.GetBytes(restored, "output.0.arguments").String())
+	require.Equal(t, "custom_tool_call", gjson.GetBytes(restored, "output.1.type").String())
+}
+
+func TestOpenAIMultimodalSchemaCompatAdditionalToolsGuards(t *testing.T) {
+	for _, body := range []string{
+		`{"input":[{"type":"additional_tools","tools":{}}],"tools":[{"type":"function","name":"f","parameters":{"properties":{"audio":{"type":"string"}}}}]}`,
+		`{"input":[{"type":"additional_tools","tools":[{"type":"function","name":"f","parameters":{"properties":{"audio":{"type":"string"}}}}]},{"role":"user","content":[{"type":"input_audio","input_audio":{"data":"AAAA","format":"wav"}}]}]}`,
+	} {
+		_, ok := prepareOpenAIMultimodalSchemaRetry(newOpenAIRejectedFieldTestContext([]byte(body)), 400, []byte(body), []byte(multimodalSchemaError))
+		require.False(t, ok)
+	}
+}
+
+func TestOpenAIMultimodalSchemaCompatConversationAndAdditionalTools(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	for _, carrier := range []bool{false, true} {
+		for _, passthrough := range []bool{false, true} {
+			for _, stream := range []bool{false, true} {
+				t.Run(fmt.Sprintf("additional_tools=%v/passthrough=%v/stream=%v", carrier, passthrough, stream), func(t *testing.T) {
+					body := []byte(fmt.Sprintf(`{"model":"test-model","stream":%v,"input":[{"role":"user","content":"Earlier logs mention __s2a_audio. Configure audio."},{"type":"function_call","name":"configure","call_id":"old","arguments":"{\"audio\":\"0\"}"},{"type":"function_call_output","call_id":"old","output":"Diagnostic: __s2a_audio"}],"tools":[{"type":"function","name":"configure","parameters":{"type":"object","properties":{"audio":{"type":"string"}}}}]}`, stream))
+					if carrier {
+						var err error
+						declaration := `{"type":"additional_tools","role":"developer","tools":` + gjson.GetBytes(body, "tools").Raw + `}`
+						body, err = sjson.SetRawBytes(body, "input.-1", []byte(declaration))
+						require.NoError(t, err)
+						body, err = sjson.DeleteBytes(body, "tools")
+						require.NoError(t, err)
+					}
+
+					response := `{"id":"resp_compat","status":"completed","output":[{"type":"function_call","id":"fc_new","call_id":"new","name":"configure","arguments":"{\"__s2a_audio_2\":\"1\"}"}],"usage":{"input_tokens":1,"output_tokens":1}}`
+					contentType := "application/json"
+					if stream {
+						contentType = "text/event-stream"
+						response = "data: {\"type\":\"response.completed\",\"response\":" + response + "}\n\n"
+					}
+					upstream := &httpUpstreamRecorder{responses: []*http.Response{
+						{StatusCode: 400, Header: http.Header{"Content-Type": {"application/json"}}, Body: io.NopCloser(strings.NewReader(multimodalSchemaError))},
+						{StatusCode: 200, Header: http.Header{"Content-Type": {contentType}}, Body: io.NopCloser(strings.NewReader(response))},
+					}}
+					svc := openAIClientToolsTestService(upstream)
+					recorder := httptest.NewRecorder()
+					c, _ := gin.CreateTestContext(recorder)
+					c.Request = httptest.NewRequest(http.MethodPost, "/v1/responses", bytes.NewReader(body))
+					var err error
+					if passthrough {
+						account := &Account{ID: 81234, Platform: PlatformOpenAI, Type: AccountTypeAPIKey, Credentials: map[string]any{"api_key": "test-key"}}
+						_, err = svc.forwardOpenAIPassthrough(context.Background(), c, account, body, body, "test-model", false, nil, stream, time.Now())
+					} else {
+						_, err = svc.Forward(context.Background(), c, newOpenAIRejectedFieldTestAccount(), body)
+					}
+					require.NoError(t, err)
+					require.Len(t, upstream.bodies, 2)
+					require.Equal(t, "string", gjson.GetBytes(upstream.bodies[1], "tools.0.parameters.properties.__s2a_audio_2.type").String())
+					require.Equal(t, "Diagnostic: __s2a_audio", gjson.GetBytes(upstream.bodies[1], "input.2.output").String())
+					require.JSONEq(t, `{"__s2a_audio_2":"0"}`, gjson.GetBytes(upstream.bodies[1], "input.1.arguments").String())
+					require.Equal(t, http.StatusOK, recorder.Code)
+					require.NotContains(t, recorder.Body.String(), "__s2a_audio_2")
+					require.Contains(t, recorder.Body.String(), `\"audio\":\"1\"`)
+				})
+			}
+		}
+	}
+}

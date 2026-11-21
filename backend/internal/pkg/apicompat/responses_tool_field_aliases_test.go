@@ -52,7 +52,6 @@ func TestResponsesToolFieldAliasesDeclinesUnsafeSchemas(t *testing.T) {
 		`"$ref":"https://example.com/schema"`,
 		`"$dynamicRef":"#node"`,
 		`"$id":"https://example.com/schema"`,
-		`"description":"reserved __s2a_audio"`,
 	} {
 		req := decodeAliasTest(t, `{"tools":[{"type":"function","name":"f","parameters":{"type":"object","properties":{"audio":{"type":"string"}},`+extra+`}}]}`)
 		before, _ := json.Marshal(req)
@@ -138,4 +137,36 @@ func TestResponsesToolFieldAliasesRestoreEchoedDeclarations(t *testing.T) {
 		require.NotContains(t, string(out[0]), "__s2a_audio")
 		require.Contains(t, string(out[0]), "9007199254740993")
 	}
+}
+
+func TestResponsesToolFieldAliasesAvoidExistingRequestContent(t *testing.T) {
+	for _, input := range []string{
+		`"Earlier diagnostics mentioned __s2a_audio and __s2a_video."`,
+		`[{"type":"function_call","name":"configure","arguments":"{\"__s2a_audio\":\"keep\",\"audio\":\"__s2a_audio\"}"},{"type":"function_call_output","output":"__s2a_video"}]`,
+	} {
+		req := decodeAliasTest(t, `{"tools":[{"type":"function","name":"configure","parameters":{"type":"object","properties":{"audio":{"type":"string"},"__s2a_audio":{"type":"string"}},"required":["audio","__s2a_audio"],"description":"__s2a_audio is a literal field"}}],"input":`+input+`}`)
+		before, err := json.Marshal(req)
+		require.NoError(t, err)
+		aliases, changed, err := AliasResponsesToolMediaFields(req)
+		require.NoError(t, err)
+		require.True(t, changed, "existing alias text must not disable compatibility")
+		require.Equal(t, "__s2a_audio_2", aliases["configure"]["audio"])
+		encoded, err := json.Marshal(req)
+		require.NoError(t, err)
+		require.Contains(t, string(encoded), `"__s2a_audio_2":{"type":"string"}`)
+		require.Contains(t, string(encoded), `"__s2a_audio":{"type":"string"}`)
+		require.NoError(t, restoreToolFieldValue(req, aliases))
+		restored, err := json.Marshal(req)
+		require.NoError(t, err)
+		require.JSONEq(t, string(before), string(restored))
+	}
+}
+
+func TestResponsesToolFieldAliasesAvoidSeveralReservedNames(t *testing.T) {
+	req := decodeAliasTest(t, `{"input":"__s2a_audio __s2a_audio_2 __s2a_audio_3 __s2a_video","tools":[{"type":"function","name":"f","parameters":{"properties":{"audio":{"type":"string"},"video":{"type":"string"}}}}]}`)
+	aliases, changed, err := AliasResponsesToolMediaFields(req)
+	require.NoError(t, err)
+	require.True(t, changed)
+	require.Equal(t, "__s2a_audio_4", aliases["f"]["audio"])
+	require.Equal(t, "__s2a_video_2", aliases["f"]["video"])
 }

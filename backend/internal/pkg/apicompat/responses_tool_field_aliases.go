@@ -50,14 +50,21 @@ func AliasResponsesToolMediaFields(req map[string]any) (ResponsesToolFieldAliase
 	if len(aliases) == 0 {
 		return nil, false, nil
 	}
-	// A reserved alias anywhere in this request is ambiguous, including inside
-	// string-encoded historical arguments. Fail closed rather than overwrite.
+	// Conversation text can mention aliases from earlier diagnostics. Choose
+	// unused names across the request, including string-encoded arguments, so
+	// existing text and fields never disable the retry or get overwritten.
 	encoded, err := json.Marshal(req)
 	if err != nil {
 		return nil, false, err
 	}
-	if bytes.Contains(encoded, []byte("__s2a_audio")) || bytes.Contains(encoded, []byte("__s2a_video")) {
-		return nil, false, nil
+	for _, names := range aliases {
+		for original, base := range names {
+			candidate := base
+			for suffix := 2; bytes.Contains(encoded, []byte(candidate)); suffix++ {
+				candidate = fmt.Sprintf("%s_%d", base, suffix)
+			}
+			names[original] = candidate
+		}
 	}
 	for _, tool := range declarations {
 		if names := aliases[stringValue(tool["name"])]; names != nil {
